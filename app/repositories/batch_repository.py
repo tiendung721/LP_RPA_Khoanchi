@@ -14,7 +14,7 @@ from app.models import BatchMetadata, BatchStatus, ValidationSummary
 _UPDATABLE_COLUMNS = frozenset(
     {
         "source_filename",
-        "source_inbox_path",
+        "source_output_path",
         "original_archive_path",
         "working_path",
         "ready_path",
@@ -50,7 +50,7 @@ class BatchRepository:
         self,
         *,
         source_filename: str,
-        source_inbox_path: str | Path | None,
+        source_output_path: str | Path | None,
         original_archive_path: str | Path,
         working_path: str | Path,
         sha256: str,
@@ -65,14 +65,14 @@ class BatchRepository:
             cursor = connection.execute(
                 """
                 INSERT INTO batches (
-                    source_filename, source_inbox_path, original_archive_path,
+                    source_filename, source_output_path, original_archive_path,
                     working_path, ready_path, sha256, status, received_at,
                     last_error
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     source_filename,
-                    _path_text(source_inbox_path),
+                    _path_text(source_output_path),
                     _path_text(original_archive_path),
                     _path_text(working_path),
                     _path_text(ready_path),
@@ -341,12 +341,12 @@ class BatchRepository:
 
     @staticmethod
     def _to_metadata(row: sqlite3.Row) -> BatchMetadata:
-        source_path = row["source_inbox_path"]
+        source_path = row["source_output_path"]
         ready_path = row["ready_path"]
         return BatchMetadata(
             id=int(row["id"]),
             source_filename=str(row["source_filename"]),
-            source_inbox_path=Path(source_path) if source_path else None,
+            source_output_path=Path(source_path) if source_path else None,
             original_archive_path=Path(row["original_archive_path"]),
             working_path=Path(row["working_path"]),
             ready_path=Path(ready_path) if ready_path else None,

@@ -5,8 +5,9 @@ from typing import Any
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QMessageBox
 
+from app.ui.edit_row_dialog import EditRowDialog
 from app.ui.review_window import ReviewWindow
-from app.ui.review_table_model import ReviewRow
+from app.ui.review_table_model import ReviewRow, ReviewTableModel
 
 
 def _review_payload() -> dict[str, Any]:
@@ -99,6 +100,139 @@ def test_editing_row_updates_status_and_dirty_state(qtbot) -> None:
         assert window.model.dirty
         assert window.model.stats.error == 1
         assert not window.confirm_button.isEnabled()
+    finally:
+        window.model.mark_clean()
+        window.close()
+
+
+def test_review_table_hides_only_the_four_redundant_columns(qtbot) -> None:
+    window = ReviewWindow(_review_payload())
+    qtbot.addWidget(window)
+
+    try:
+        hidden_columns = {
+            ReviewTableModel.COLUMN_FEE,
+            ReviewTableModel.COLUMN_RULE,
+            ReviewTableModel.COLUMN_RULE_NAME,
+            ReviewTableModel.COLUMN_STATUS,
+        }
+
+        assert {
+            column
+            for column in range(window.model.columnCount())
+            if window.table.isColumnHidden(column)
+        } == hidden_columns
+        assert window.status_filter.isVisibleTo(window)
+        assert window.status_value.text() == "Đang kiểm tra"
+    finally:
+        window.close()
+
+
+def test_review_window_uses_compact_balanced_layout(qtbot) -> None:
+    window = ReviewWindow(_review_payload())
+    qtbot.addWidget(window)
+
+    assert window.minimumWidth() == 920
+    assert window.minimumHeight() == 600
+    assert window.width() == 1120
+    assert window.height() == 720
+
+    window.show()
+    qtbot.wait(20)
+
+    try:
+        assert window.add_button.geometry().top() > window.search_edit.geometry().bottom()
+        assert window.table.columnWidth(ReviewTableModel.COLUMN_CONT) == 140
+        assert window.table.columnWidth(ReviewTableModel.COLUMN_BL) == 130
+        assert window.table.columnWidth(ReviewTableModel.COLUMN_AMOUNT) == 185
+        assert abs(
+            window.table.columnWidth(ReviewTableModel.COLUMN_FEE_NAME)
+            - window.table.columnWidth(ReviewTableModel.COLUMN_MESSAGES)
+        ) <= 1
+    finally:
+        window.close()
+
+
+def test_edit_dialog_hides_rule_but_preserves_its_value(qtbot) -> None:
+    dialog = EditRowDialog(
+        ReviewRow("DRYU3026167", None, "VTN", "CV", 13_554_000)
+    )
+    qtbot.addWidget(dialog)
+    dialog.show()
+
+    try:
+        assert not dialog.rule_combo.isVisible()
+        assert not hasattr(dialog, "amount_unknown")
+
+        dialog.amount_edit.setText("13.555.000")
+        edited = dialog.row_data()
+
+        assert edited.rule == "CV"
+        assert edited.amount == 13_555_000
+
+        dialog.amount_edit.clear()
+        assert dialog.row_data().amount is None
+        assert any(
+            "Số tiền chưa xác định" in message
+            for message in dialog._last_validation.warnings
+        )
+    finally:
+        dialog.close()
+
+
+def test_add_dialog_keeps_rule_selector(qtbot) -> None:
+    dialog = EditRowDialog()
+    qtbot.addWidget(dialog)
+    dialog.show()
+
+    try:
+        assert dialog.rule_combo.isVisible()
+        assert not hasattr(dialog, "amount_unknown")
+    finally:
+        dialog.close()
+
+
+def test_combined_button_saves_and_confirms_dirty_document(
+    qtbot, monkeypatch
+) -> None:
+    saved: list[tuple[int, Any]] = []
+    confirmed: list[tuple[int, Any]] = []
+
+    def save(batch_id: int, document: Any) -> None:
+        saved.append((batch_id, document))
+
+    def confirm(batch_id: int, document: Any) -> None:
+        confirmed.append((batch_id, document))
+
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Ok,
+    )
+    window = ReviewWindow(
+        _review_payload(),
+        save_handler=save,
+        confirm_handler=confirm,
+    )
+    qtbot.addWidget(window)
+    window.model.update_row(
+        0,
+        ReviewRow("DRYU3026167", None, "VTN", "CV", 13_554_001),
+    )
+    window.show()
+
+    try:
+        assert window.confirm_button.text() == "Lưu và xác nhận hoàn tất"
+        assert not hasattr(window, "save_button")
+
+        qtbot.mouseClick(window.confirm_button, Qt.MouseButton.LeftButton)
+
+        assert saved[0][0] == 7
+        assert saved[0][1].rows[0].amount == 13_554_001
+        assert confirmed[0][0] == 7
+        assert confirmed[0][1].rows[0].amount == 13_554_001
+        assert window.status_value.text() == "Đã xác nhận"
+        assert not window.model.dirty
     finally:
         window.model.mark_clean()
         window.close()

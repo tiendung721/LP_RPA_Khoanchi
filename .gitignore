@@ -6,8 +6,6 @@ __pycache__/
 htmlcov/
 .venv/
 venv/
-build/
-dist/
-*.spec.bak
 .codex-temp/
 *.log
+Output/

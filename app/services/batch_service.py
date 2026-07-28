@@ -11,7 +11,7 @@ import stat
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from app.config import AppPaths, AppSettings
 from app.constants import CANONICAL_JSON_FILENAME, DEFAULT_MAX_FILE_SIZE_BYTES
@@ -72,6 +72,7 @@ class BatchService:
         validation_service: ValidationService | None = None,
         validator: ValidationService | None = None,
         max_file_size_bytes: int | None = None,
+        output_write_callback: Callable[[Path], None] | None = None,
     ) -> None:
         # Hỗ trợ cả BatchService(paths, repo) và BatchService(repo, paths).
         if isinstance(paths, BatchRepository):
@@ -104,6 +105,31 @@ class BatchService:
         )
         if self.max_file_size_bytes <= 0:
             raise ValueError("Giới hạn kích thước file phải lớn hơn 0.")
+        self._output_write_callback = output_write_callback
+        self._current_output_batch_id = self._find_current_output_batch_id()
+
+    def set_output_write_callback(
+        self, callback: Callable[[Path], None] | None
+    ) -> None:
+        self._output_write_callback = callback
+
+    def update_paths(self, paths: AppPaths) -> None:
+        paths.ensure_directories()
+        output_changed = self._path_key(paths.output_dir) != self._path_key(
+            self.paths.output_dir
+        )
+        self.paths = paths
+        if output_changed:
+            self._current_output_batch_id = self._find_current_output_batch_id()
+            self.repository.set_active_batch_id(self._current_output_batch_id)
+
+    @property
+    def current_output_batch_id(self) -> int | None:
+        return self._current_output_batch_id
+
+    def get_current_output_batch(self) -> BatchMetadata | None:
+        batch_id = self._current_output_batch_id
+        return self.repository.get_by_id(batch_id) if batch_id is not None else None
 
     @staticmethod
     def _coerce_paths(
@@ -116,7 +142,7 @@ class BatchService:
         return AppPaths.from_data_root(value)
 
     def receive_file(self, path: str | Path) -> ReceiveResult:
-        """Tiếp nhận một file ổn định; tuyệt đối không sửa file Inbox."""
+        """Tiếp nhận file ổn định từ Output và giữ bản gốc trong Archive."""
 
         source = Path(path)
         LOGGER.info("Bắt đầu tiếp nhận file: %s", source.name)
@@ -134,6 +160,12 @@ class BatchService:
             raise BatchServiceError(
                 "File vượt giới hạn kích thước đã cấu hình."
             )
+        if self._is_output_candidate(source) and not self._is_latest_output_candidate(
+            source
+        ):
+            raise BatchServiceError(
+                "Đã bỏ qua file cũ vì Output có một file kết quả mới hơn."
+            )
 
         try:
             sha256 = calculate_sha256(source)
@@ -142,6 +174,13 @@ class BatchService:
         LOGGER.info("SHA-256 file %s: %s", source.name, sha256)
         duplicate = self.repository.get_by_sha256(sha256)
         if duplicate is not None:
+            canonical_source = self._promote_output_file(source)
+            duplicate = self.repository.update_batch(
+                duplicate.id,
+                source_filename=canonical_source.name,
+                source_output_path=canonical_source,
+            )
+            self._current_output_batch_id = duplicate.id
             LOGGER.info(
                 "File trùng SHA-256 với batch %s; không tạo batch mới",
                 duplicate.id,
@@ -157,7 +196,7 @@ class BatchService:
         try:
             batch = self.repository.create_batch(
                 source_filename=source.name,
-                source_inbox_path=source,
+                source_output_path=source,
                 original_archive_path=self.paths.archive_original_dir / ".pending",
                 working_path=placeholder,
                 sha256=sha256,
@@ -197,9 +236,12 @@ class BatchService:
             self._mark_read_only(archive_path)
             batch = self.repository.update_batch(
                 batch.id,
+                source_filename=CANONICAL_JSON_FILENAME,
+                source_output_path=self._promote_output_file(source),
                 original_archive_path=archive_path,
                 working_path=working_path,
             )
+            self._current_output_batch_id = batch.id
             LOGGER.info(
                 "Đã tạo archive %s và working copy %s",
                 archive_path,
@@ -257,6 +299,7 @@ class BatchService:
         validation = self.validation_service.validate_document(document)
         batch = self.repository.update_batch(
             batch.id,
+            last_saved_at=local_now_iso(),
             row_count=validation.summary.total_rows,
             valid_count=validation.summary.valid_count,
             warning_count=validation.summary.warning_count,
@@ -315,7 +358,8 @@ class BatchService:
             total_amount=validation.summary.total_amount,
             last_error=None,
         )
-        self.repository.set_active_batch_id(batch_id)
+        if batch_id == self._current_output_batch_id:
+            self.repository.set_active_batch_id(batch_id)
         return BatchReview(metadata, document, validation)
 
     open_batch = load_batch
@@ -349,7 +393,9 @@ class BatchService:
             status=BatchStatus.REVIEWING,
             error_count=revalidation.error_count,
         )
-        self.repository.set_active_batch_id(batch_id)
+        if batch_id == self._current_output_batch_id:
+            self.repository.set_active_batch_id(batch_id)
+        self._sync_active_batch_to_output(batch_id, metadata.working_path)
         LOGGER.info("Đã lưu working file batch %s bằng phép ghi nguyên tử", batch_id)
         return BatchReview(metadata, reloaded, revalidation)
 
@@ -424,7 +470,8 @@ class BatchService:
                 last_opened_at=local_now_iso(),
             )
             review = BatchReview(metadata, review.document, review.validation)
-        self.repository.set_active_batch_id(batch_id)
+        if batch_id == self._current_output_batch_id:
+            self.repository.set_active_batch_id(batch_id)
         return review
 
     def restore_active_batch(self) -> BatchReview | None:
@@ -484,16 +531,9 @@ class BatchService:
             self.repository.database.close()
 
     def _activate_if_appropriate(self, new_batch: BatchMetadata) -> None:
-        active_id = self.repository.get_active_batch_id()
-        if active_id is None:
-            self.repository.set_active_batch_id(new_batch.id)
-            return
-        active = self.repository.get_by_id(active_id)
-        if active is None or active.status not in {
-            BatchStatus.RECEIVED,
-            BatchStatus.REVIEWING,
-        }:
-            self.repository.set_active_batch_id(new_batch.id)
+        # File Output mới luôn là phiên bản hiện hành. Cửa sổ review cũ vẫn giữ
+        # working copy riêng và không được đồng bộ ngược ra Output.
+        self.repository.set_active_batch_id(new_batch.id)
 
     def _require_batch(self, batch_id: int) -> BatchMetadata:
         metadata = self.repository.get_by_id(batch_id)
@@ -531,6 +571,111 @@ class BatchService:
     def _safe_filename(filename: str) -> str:
         safe = _UNSAFE_FILENAME_RE.sub("_", Path(filename).name).strip(" .")
         return safe or CANONICAL_JSON_FILENAME
+
+    def _promote_output_file(self, source: Path) -> Path:
+        """Chỉ giữ candidate mới và chuẩn hóa tên trong thư mục Output."""
+
+        try:
+            in_output = source.resolve().parent == self.paths.output_dir.resolve()
+        except OSError:
+            in_output = False
+        if not in_output:
+            return source
+
+        canonical = self.paths.output_dir / CANONICAL_JSON_FILENAME
+        for candidate in self.paths.output_dir.glob("ket_qua_boc_tach*.json"):
+            try:
+                same_as_source = candidate.resolve() == source.resolve()
+            except OSError:
+                same_as_source = candidate == source
+            if same_as_source:
+                continue
+            try:
+                candidate.unlink(missing_ok=True)
+                LOGGER.info("Đã dọn file Output cũ: %s", candidate)
+            except OSError as exc:
+                raise BatchServiceError(
+                    f"Không thể xóa file Output cũ đang bị khóa: {candidate.name}"
+                ) from exc
+
+        if source != canonical:
+            try:
+                os.replace(source, canonical)
+            except OSError as exc:
+                raise BatchServiceError(
+                    f"Không thể chuẩn hóa file Output thành {CANONICAL_JSON_FILENAME}."
+                ) from exc
+        self._notify_output_written(canonical)
+        return canonical
+
+    def _find_current_output_batch_id(self) -> int | None:
+        canonical = self.paths.output_dir / CANONICAL_JSON_FILENAME
+        try:
+            if not canonical.is_file():
+                return None
+            sha256 = calculate_sha256(canonical)
+        except OSError:
+            LOGGER.warning(
+                "Không thể nhận diện batch tương ứng với Output hiện hành: %s",
+                canonical,
+            )
+            return None
+        metadata = self.repository.get_by_sha256(sha256)
+        return metadata.id if metadata is not None else None
+
+    def _is_output_candidate(self, source: Path) -> bool:
+        try:
+            return source.resolve().parent == self.paths.output_dir.resolve()
+        except OSError:
+            return False
+
+    def _is_latest_output_candidate(self, source: Path) -> bool:
+        try:
+            candidates = [
+                candidate
+                for candidate in self.paths.output_dir.glob(
+                    "ket_qua_boc_tach*.json"
+                )
+                if candidate.is_file()
+            ]
+            latest = max(
+                candidates,
+                key=lambda candidate: (
+                    candidate.stat().st_mtime_ns,
+                    candidate.name.casefold(),
+                ),
+            )
+        except (OSError, ValueError):
+            return True
+        return self._path_key(latest) == self._path_key(source)
+
+    def _sync_active_batch_to_output(self, batch_id: int, working_path: Path) -> None:
+        if self._current_output_batch_id != batch_id:
+            LOGGER.info(
+                "Batch %s không còn là Output hiện hành; chỉ lưu working copy.",
+                batch_id,
+            )
+            return
+        output_path = self.paths.output_dir / CANONICAL_JSON_FILENAME
+        self._copy_file_atomic(working_path, output_path)
+        self._notify_output_written(output_path)
+        self.repository.update_batch(
+            batch_id,
+            source_filename=CANONICAL_JSON_FILENAME,
+            source_output_path=output_path,
+        )
+
+    def _notify_output_written(self, path: Path) -> None:
+        callback = self._output_write_callback
+        if callback is not None:
+            try:
+                callback(path)
+            except Exception:
+                LOGGER.exception("Không đánh dấu được file Output do ứng dụng ghi.")
+
+    @staticmethod
+    def _path_key(path: str | Path) -> str:
+        return os.path.normcase(os.path.abspath(os.fspath(path)))
 
     @staticmethod
     def _copy_file_atomic(source: Path, target: Path) -> None:

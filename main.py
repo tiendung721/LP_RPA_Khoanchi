@@ -12,6 +12,7 @@ from PySide6.QtCore import QLockFile
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from app.application import ApplicationRuntime, configured_data_root
+from app.config import AppPaths
 from app.constants import APP_NAME
 from app.logging_setup import install_exception_hook
 from app.ui.main_window import MainWindow
@@ -24,12 +25,12 @@ APP_VERSION = "1.0.0"
 def _parse_arguments(arguments: Sequence[str]) -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(
         prog=Path(arguments[0]).name if arguments else "main.py",
-        description="Trợ lý kiểm tra và duyệt JSON quyết toán.",
+        description="Trợ lý kiểm tra và duyệt JSON quyết toán từ thư mục Output.",
     )
     parser.add_argument(
         "--data-root",
         help=(
-            "Thư mục gốc chứa Config, Database, Logs, Archive, Workspace và Ready. "
+            "Thư mục gốc chứa Config, Database, Logs và Output\\_system. "
             "Có thể dùng biến môi trường TRO_LY_DATA_ROOT thay thế."
         ),
     )
@@ -58,11 +59,13 @@ def run(arguments: Sequence[str] | None = None) -> int:
     lock: QLockFile | None = None
     try:
         data_root = configured_data_root(options.data_root)
-        runtime = ApplicationRuntime(data_root)
-        install_exception_hook(_show_unhandled_error)
-        LOGGER.info("Khởi động %s %s", APP_NAME, APP_VERSION)
-
-        lock_path = runtime.paths.config_dir / "application.lock"
+        bootstrap_paths = (
+            AppPaths.from_data_root(data_root)
+            if data_root is not None
+            else AppPaths.defaults()
+        )
+        bootstrap_paths.config_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = bootstrap_paths.config_dir / "application.lock"
         lock = QLockFile(str(lock_path))
         lock.setStaleLockTime(30_000)
         if not lock.tryLock(200):
@@ -72,8 +75,11 @@ def run(arguments: Sequence[str] | None = None) -> int:
                 "Đã có một cửa sổ Trợ lý Dữ liệu Quyết toán đang chạy "
                 "trên cùng thư mục dữ liệu.",
             )
-            runtime.close()
             return 2
+
+        runtime = ApplicationRuntime(data_root)
+        install_exception_hook(_show_unhandled_error)
+        LOGGER.info("Khởi động %s %s", APP_NAME, APP_VERSION)
 
         window = MainWindow(controller=runtime)
         application.aboutToQuit.connect(runtime.close)

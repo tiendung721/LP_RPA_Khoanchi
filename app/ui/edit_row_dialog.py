@@ -9,12 +9,10 @@ from typing import Any
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
-    QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -103,6 +101,8 @@ class EditRowDialog(QDialog):
         self.setWindowTitle(title or ("Thêm dòng dữ liệu" if row is None else "Sửa dòng dữ liệu"))
         self.setModal(True)
         self.resize(610, 480)
+        self._editing = row is not None
+        self._original_rule: Any = None
         self._validator = validator
         self._result_row: ReviewRow | None = None
         self._last_validation = RowValidation()
@@ -161,21 +161,17 @@ class EditRowDialog(QDialog):
             prefix = "null" if code is None else code
             self.rule_combo.addItem(f"{prefix} – {name}", code)
         form.addRow("Quy tắc tiền:", self.rule_combo)
+        form.setRowVisible(self.rule_combo, not self._editing)
 
         amount_box = QVBoxLayout()
         amount_box.setContentsMargins(0, 0, 0, 0)
         amount_box.setSpacing(5)
-        amount_line = QHBoxLayout()
-        amount_line.setContentsMargins(0, 0, 0, 0)
         self.amount_edit = QLineEdit()
         self.amount_edit.setObjectName("amountEdit")
         self.amount_edit.setPlaceholderText("Ví dụ: 13.554.000")
         self.amount_edit.setMaxLength(30)
         self.amount_edit.setAlignment(Qt.AlignmentFlag.AlignRight)
-        self.amount_unknown = QCheckBox("Không xác định")
-        amount_line.addWidget(self.amount_edit, 1)
-        amount_line.addWidget(self.amount_unknown)
-        amount_box.addLayout(amount_line)
+        amount_box.addWidget(self.amount_edit)
         amount_hint = QLabel("Lưu dưới dạng số nguyên VND; không nhập ký hiệu tiền tệ hoặc số âm.")
         amount_hint.setProperty("muted", True)
         amount_box.addWidget(amount_hint)
@@ -212,7 +208,6 @@ class EditRowDialog(QDialog):
         self.rule_combo.currentIndexChanged.connect(self._validate_realtime)
         self.amount_edit.textChanged.connect(self._validate_realtime)
         self.amount_edit.editingFinished.connect(self._format_amount_on_finish)
-        self.amount_unknown.toggled.connect(self._amount_unknown_changed)
         self.button_box.accepted.connect(self._accept_row)
         self.button_box.rejected.connect(self.reject)
 
@@ -221,13 +216,13 @@ class EditRowDialog(QDialog):
         self.container_edit.setText(value.cont if isinstance(value.cont, str) else "")
         self.bl_edit.setText(value.bl if isinstance(value.bl, str) else "")
         self._select_combo_data(self.fee_combo, value.fee)
+        self._original_rule = value.rule
         self._select_combo_data(self.rule_combo, value.rule)
         valid_amount = (
             value.amount
             if isinstance(value.amount, int) and not isinstance(value.amount, bool) and value.amount >= 0
             else None
         )
-        self.amount_unknown.setChecked(value.amount is None)
         self.amount_edit.setText(format_amount(valid_amount))
         self._validate_realtime()
 
@@ -240,15 +235,7 @@ class EditRowDialog(QDialog):
             index = 0
         combo.setCurrentIndex(max(index, 0))
 
-    def _amount_unknown_changed(self, checked: bool) -> None:
-        self.amount_edit.setEnabled(not checked)
-        if checked:
-            self.amount_edit.clear()
-        self._validate_realtime()
-
     def _format_amount_on_finish(self) -> None:
-        if self.amount_unknown.isChecked():
-            return
         try:
             self.amount_edit.setText(format_amount(parse_amount(self.amount_edit.text())))
         except ValueError:
@@ -257,16 +244,15 @@ class EditRowDialog(QDialog):
     def _collect_row(self) -> tuple[ReviewRow, str | None]:
         amount_error: str | None = None
         amount: int | None = None
-        if not self.amount_unknown.isChecked():
-            try:
-                amount = parse_amount(self.amount_edit.text())
-            except ValueError as exc:
-                amount_error = str(exc)
+        try:
+            amount = parse_amount(self.amount_edit.text())
+        except ValueError as exc:
+            amount_error = str(exc)
         row = ReviewRow(
             cont=normalize_container(self.container_edit.text()),
             bl=normalize_bl(self.bl_edit.text()),
             fee=self.fee_combo.currentData(),
-            rule=self.rule_combo.currentData(),
+            rule=self._original_rule if self._editing else self.rule_combo.currentData(),
             amount=amount,
         )
         return row, amount_error

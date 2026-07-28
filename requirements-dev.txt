@@ -1,5 +1,0 @@
--r requirements.txt
-
-pyinstaller>=6.10,<7
-pytest>=8.2,<10
-pytest-qt>=4.4,<5

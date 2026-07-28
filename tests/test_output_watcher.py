@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 from typing import Any
 
 from watchdog.events import FileCreatedEvent
 
-from app.services.inbox_watcher import InboxWatcher
+from app.services.output_watcher import OutputWatcher
 
 
 class FakeObserver:
@@ -36,13 +37,13 @@ class FakeObserver:
 
 
 def make_watcher(
-    inbox: Path,
+    output: Path,
     observer: FakeObserver,
     *,
     max_size_bytes: int = 1024,
-) -> InboxWatcher:
-    return InboxWatcher(
-        inbox,
+) -> OutputWatcher:
+    return OutputWatcher(
+        output,
         file_pattern="ket_qua_boc_tach*.json",
         stable_seconds=0,
         timeout_seconds=1,
@@ -53,7 +54,7 @@ def make_watcher(
 
 
 def test_filter_ignores_temporary_and_wrong_pattern(tmp_path: Path) -> None:
-    watcher = InboxWatcher(tmp_path)
+    watcher = OutputWatcher(tmp_path)
 
     assert watcher.accepts_path("ket_qua_boc_tach.json")
     assert watcher.accepts_path("KET_QUA_BOC_TACH (1).JSON")
@@ -111,6 +112,74 @@ def test_fake_watchdog_event_is_forwarded_and_duplicate_event_is_coalesced(
         watcher.stop()
 
 
+def test_startup_scan_only_queues_newest_matching_file(
+    tmp_path: Path,
+    qtbot: Any,
+) -> None:
+    older = tmp_path / "ket_qua_boc_tach.json"
+    newer = tmp_path / "ket_qua_boc_tach (1).json"
+    older.write_text('{"v":1,"d":[]}', encoding="utf-8")
+    newer.write_text('{"v":1,"d":[]}', encoding="utf-8")
+    os.utime(older, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(newer, ns=(2_000_000_000, 2_000_000_000))
+    observer = FakeObserver()
+    watcher = make_watcher(tmp_path, observer)
+
+    try:
+        with qtbot.waitSignal(watcher.file_ready, timeout=2_000) as signal:
+            watcher.start()
+        assert Path(signal.args[0]) == newer
+    finally:
+        watcher.stop()
+
+
+def test_ready_event_for_older_file_is_ignored_when_newer_exists(
+    tmp_path: Path,
+) -> None:
+    older = tmp_path / "ket_qua_boc_tach.json"
+    newer = tmp_path / "ket_qua_boc_tach (1).json"
+    older.write_text('{"v":1,"d":[]}', encoding="utf-8")
+    newer.write_text('{"v":1,"d":[]}', encoding="utf-8")
+    os.utime(older, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(newer, ns=(2_000_000_000, 2_000_000_000))
+    observer = FakeObserver()
+    processed: list[Path] = []
+    watcher = OutputWatcher(
+        tmp_path,
+        stable_seconds=0,
+        timeout_seconds=1,
+        poll_interval=0.01,
+        observer_factory=lambda: observer,
+        on_file_ready=lambda path: processed.append(path),
+    )
+
+    try:
+        watcher.start()
+        generation = watcher._generation
+        watcher._deliver_ready(str(older), object(), generation)
+        watcher._deliver_ready(str(newer), object(), generation)
+    finally:
+        watcher.stop()
+
+    assert processed == [newer]
+
+
+def test_mark_handled_prevents_app_write_from_becoming_new_batch(
+    tmp_path: Path,
+) -> None:
+    observer = FakeObserver()
+    watcher = make_watcher(tmp_path, observer)
+
+    try:
+        watcher.start()
+        source = tmp_path / "ket_qua_boc_tach.json"
+        source.write_text('{"v":1,"d":[]}', encoding="utf-8")
+        watcher.mark_handled(source)
+        assert watcher.enqueue(source) is False
+    finally:
+        watcher.stop()
+
+
 def test_startup_scan_rejects_file_over_size_limit(
     tmp_path: Path,
     qtbot: Any,
@@ -133,29 +202,25 @@ def test_startup_scan_rejects_file_over_size_limit(
 def test_update_settings_rebuilds_checker_and_restarts_observer(
     tmp_path: Path,
 ) -> None:
-    old_inbox = tmp_path / "old"
-    new_inbox = tmp_path / "new"
+    old_output = tmp_path / "old"
+    new_output = tmp_path / "new"
     observer = FakeObserver()
-    watcher = make_watcher(old_inbox, observer)
+    watcher = make_watcher(old_output, observer)
 
     try:
         assert watcher.start() is True
         assert watcher.update_settings(
             {
-                "inbox_dir": new_inbox,
-                "file_pattern": "gpt_*.json",
-                "stable_seconds": 0.2,
-                "stability_timeout_seconds": 2.0,
-                "max_file_size_mb": 2,
+                "output_dir": new_output,
             }
         )
 
         assert watcher.is_running is True
-        assert watcher.inbox_dir == new_inbox
-        assert watcher.file_patterns == ("gpt_*.json",)
-        assert watcher.stable_seconds == 0.2
-        assert watcher.timeout_seconds == 2.0
-        assert watcher.max_size_bytes == 2 * 1024 * 1024
-        assert observer.directory == str(new_inbox)
+        assert watcher.output_dir == new_output
+        assert watcher.file_patterns == ("ket_qua_boc_tach*.json",)
+        assert watcher.stable_seconds == 0
+        assert watcher.timeout_seconds == 1
+        assert watcher.max_size_bytes == 1024
+        assert observer.directory == str(new_output)
     finally:
         watcher.stop()

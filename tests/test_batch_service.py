@@ -1,22 +1,27 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 
 from app.config import AppSettings
 from app.models import BatchDocument, BatchStatus, DataRow
-from app.services.batch_service import BatchService, BatchValidationError
+from app.services.batch_service import (
+    BatchService,
+    BatchServiceError,
+    BatchValidationError,
+)
 from app.services.reviewed_batch_provider import ReviewedBatchProvider
+
+FIXTURE = Path(__file__).parent / "fixtures" / "ket_qua_boc_tach.json"
 
 
 def _settings(tmp_path: Path) -> AppSettings:
     return AppSettings(
         data_root=tmp_path / "runtime",
-        inbox_dir=tmp_path / "Inbox",
-        stable_seconds=0,
-        stability_timeout_seconds=1,
+        output_dir=tmp_path / "Output",
     )
 
 
@@ -40,7 +45,7 @@ def test_receive_archives_original_and_creates_independent_working_copy(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
-    source = _write_json(settings.inbox_dir / "ket_qua_boc_tach.json", _valid_rows())
+    source = _write_json(settings.output_dir / "ket_qua_boc_tach.json", _valid_rows())
     original_payload = source.read_bytes()
     service = BatchService(settings)
 
@@ -54,30 +59,50 @@ def test_receive_archives_original_and_creates_independent_working_copy(
     assert result.batch.working_path != source
     assert source.read_bytes() == original_payload
     assert result.batch.row_count == 2
+    assert result.batch.last_saved_at
+    assert result.batch.source_output_path == source
+    service.close()
+
+
+def test_receive_real_fixture_records_all_47_rows(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    source = settings.output_dir / "ket_qua_boc_tach.json"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(FIXTURE.read_bytes())
+    service = BatchService(settings)
+
+    result = service.receive_file(source)
+
+    assert result.review is not None
+    assert result.batch.row_count == 47
+    assert len(result.review.document.rows) == 47
     service.close()
 
 
 def test_same_hash_does_not_create_second_batch(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
-    first = _write_json(settings.inbox_dir / "ket_qua_boc_tach.json", _valid_rows())
-    second = _write_json(
-        settings.inbox_dir / "ket_qua_boc_tach (1).json", _valid_rows()
-    )
+    first = _write_json(settings.output_dir / "ket_qua_boc_tach.json", _valid_rows())
     service = BatchService(settings)
 
     created = service.receive_file(first)
+    second = _write_json(
+        settings.output_dir / "ket_qua_boc_tach (1).json", _valid_rows()
+    )
     duplicate = service.receive_file(second)
 
     assert not duplicate.created
     assert duplicate.duplicate
     assert duplicate.batch.id == created.batch.id
     assert len(service.list_batches()) == 1
+    assert sorted(path.name for path in settings.output_dir.glob("*.json")) == [
+        "ket_qua_boc_tach.json"
+    ]
     service.close()
 
 
 def test_invalid_root_is_recorded_and_copied_to_rejected(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
-    source = settings.inbox_dir / "ket_qua_boc_tach.json"
+    source = settings.output_dir / "ket_qua_boc_tach.json"
     source.parent.mkdir(parents=True)
     source.write_text('{"v":1,"rows":[]}', encoding="utf-8")
     service = BatchService(settings)
@@ -91,11 +116,174 @@ def test_invalid_root_is_recorded_and_copied_to_rejected(tmp_path: Path) -> None
     service.close()
 
 
+def test_invalid_new_download_still_replaces_old_output(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    service = BatchService(settings)
+    old = _write_json(
+        settings.output_dir / "ket_qua_boc_tach.json", _valid_rows()
+    )
+    service.receive_file(old)
+    incoming = settings.output_dir / "ket_qua_boc_tach (1).json"
+    incoming.write_text('{"v":1,"rows":[]}', encoding="utf-8")
+
+    result = service.receive_file(incoming)
+    canonical = settings.output_dir / "ket_qua_boc_tach.json"
+
+    assert result.batch.status is BatchStatus.INVALID
+    assert result.batch.last_saved_at is None
+    assert canonical.read_text(encoding="utf-8") == '{"v":1,"rows":[]}'
+    assert not incoming.exists()
+    service.close()
+
+
+def test_saving_superseded_batch_does_not_overwrite_new_output(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    service = BatchService(settings)
+    first = service.receive_file(
+        _write_json(
+            settings.output_dir / "ket_qua_boc_tach.json",
+            [["DRYU3026167", None, "VTN", "CV", 1]],
+        )
+    )
+    second = service.receive_file(
+        _write_json(
+            settings.output_dir / "ket_qua_boc_tach (1).json",
+            [["GAOU2112422", None, "VTN", "CV", 2]],
+        )
+    )
+    service.save_working(
+        first.batch.id,
+        BatchDocument(rows=[DataRow("DRYU3026167", None, "VTN", "CV", 99)]),
+    )
+
+    output = json.loads(
+        (settings.output_dir / "ket_qua_boc_tach.json").read_text(encoding="utf-8")
+    )
+    assert second.batch.id != first.batch.id
+    assert output["d"][0][-1] == 2
+    assert sorted(path.name for path in settings.output_dir.glob("*.json")) == [
+        "ket_qua_boc_tach.json"
+    ]
+    service.close()
+
+
+def test_reapplying_same_output_keeps_review_sync_enabled(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    service = BatchService(settings)
+    received = service.receive_file(
+        _write_json(
+            settings.output_dir / "ket_qua_boc_tach.json",
+            [["DRYU3026167", None, "VTN", "CV", 1]],
+        )
+    )
+
+    service.update_paths(settings.paths)
+    service.save_working(
+        received.batch.id,
+        BatchDocument(
+            rows=[DataRow("DRYU3026167", None, "VTN", "CV", 88)]
+        ),
+    )
+
+    output = json.loads(
+        (settings.output_dir / "ket_qua_boc_tach.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert output["d"][0][-1] == 88
+    service.close()
+
+
+def test_changing_to_empty_output_clears_current_batch(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    service = BatchService(settings)
+    received = service.receive_file(
+        _write_json(
+            settings.output_dir / "ket_qua_boc_tach.json",
+            [["DRYU3026167", None, "VTN", "CV", 1]],
+        )
+    )
+    assert service.current_output_batch_id == received.batch.id
+
+    empty_output = tmp_path / "Output mới"
+    service.update_paths(
+        AppSettings(
+            data_root=settings.data_root,
+            output_dir=empty_output,
+        ).paths
+    )
+
+    assert service.current_output_batch_id is None
+    assert service.get_current_output_batch() is None
+    assert service.get_active_batch() is None
+    service.close()
+
+
+def test_restart_identifies_current_output_before_watcher_scan(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    first_service = BatchService(settings)
+    received = first_service.receive_file(
+        _write_json(
+            settings.output_dir / "ket_qua_boc_tach.json",
+            [["DRYU3026167", None, "VTN", "CV", 1]],
+        )
+    )
+    first_service.close()
+
+    restarted = BatchService(settings)
+
+    assert restarted.current_output_batch_id == received.batch.id
+    current = restarted.get_current_output_batch()
+    assert current is not None
+    assert current.id == received.batch.id
+    restarted.save_working(
+        received.batch.id,
+        BatchDocument(
+            rows=[DataRow("DRYU3026167", None, "VTN", "CV", 77)]
+        ),
+    )
+    output = json.loads(
+        (settings.output_dir / "ket_qua_boc_tach.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert output["d"][0][-1] == 77
+    restarted.close()
+
+
+def test_older_candidate_is_rejected_when_newer_download_exists(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    older = _write_json(
+        settings.output_dir / "ket_qua_boc_tach.json",
+        [["DRYU3026167", None, "VTN", "CV", 1]],
+    )
+    newer = _write_json(
+        settings.output_dir / "ket_qua_boc_tach (1).json",
+        [["GAOU2112422", None, "VTN", "CV", 2]],
+    )
+    older_mtime = newer.stat().st_mtime_ns - 1_000_000
+    os.utime(older, ns=(older_mtime, older_mtime))
+    service = BatchService(settings)
+
+    with pytest.raises(BatchServiceError, match="file cũ"):
+        service.receive_file(older)
+
+    assert newer.is_file()
+    assert service.list_batches() == []
+    service.close()
+
+
 def test_save_is_atomic_and_confirmation_creates_ready_snapshot(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
-    source = _write_json(settings.inbox_dir / "ket_qua_boc_tach.json", _valid_rows())
+    source = _write_json(settings.output_dir / "ket_qua_boc_tach.json", _valid_rows())
     service = BatchService(settings)
     received = service.receive_file(source)
     edited = BatchDocument(
@@ -113,6 +301,9 @@ def test_save_is_atomic_and_confirmation_creates_ready_snapshot(
         row.to_list() for row in edited.rows
     ]
     assert saved.metadata.working_path.with_suffix(".json.bak").is_file()
+    assert json.loads(
+        (settings.output_dir / "ket_qua_boc_tach.json").read_text(encoding="utf-8")
+    ) == saved.document.to_dict()
     assert ready.metadata.status is BatchStatus.READY
     assert ready.metadata.ready_path is not None
     assert ready.metadata.ready_path.is_file()
@@ -125,7 +316,7 @@ def test_save_is_atomic_and_confirmation_creates_ready_snapshot(
 def test_blocking_validation_prevents_confirmation(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     source = _write_json(
-        settings.inbox_dir / "ket_qua_boc_tach.json",
+        settings.output_dir / "ket_qua_boc_tach.json",
         [["DRYU3026167", None, "CB", "CV", 1]],
     )
     service = BatchService(settings)
@@ -142,7 +333,7 @@ def test_ready_batch_can_be_reopened_and_confirmed_to_new_snapshot(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
-    source = _write_json(settings.inbox_dir / "ket_qua_boc_tach.json", _valid_rows())
+    source = _write_json(settings.output_dir / "ket_qua_boc_tach.json", _valid_rows())
     service = BatchService(settings)
     received = service.receive_file(source)
     first = service.confirm_batch(received.batch.id)
@@ -160,7 +351,7 @@ def test_ready_batch_can_be_reopened_and_confirmed_to_new_snapshot(
 
 def test_restart_restores_active_reviewing_batch(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
-    source = _write_json(settings.inbox_dir / "ket_qua_boc_tach.json", _valid_rows())
+    source = _write_json(settings.output_dir / "ket_qua_boc_tach.json", _valid_rows())
     first_service = BatchService(settings)
     received = first_service.receive_file(source)
     first_service.load_batch(received.batch.id)

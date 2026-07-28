@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from PySide6.QtWidgets import QAbstractButton, QLabel, QLineEdit
+
 from app.application import ApplicationRuntime, configured_data_root
-from app.constants import APP_STATE_LAST_INBOX_SCAN
+from app.constants import APP_STATE_LAST_OUTPUT_SCAN
 from app.ui.main_window import MainWindow
 
 
@@ -23,9 +25,19 @@ def test_runtime_and_main_window_start_with_isolated_data_root(
         assert runtime.paths.database_path.is_file()
         assert runtime.paths.logs_dir.is_dir()
         assert window.pages.count() == 4
-        assert window.workflow_page.open_gpt_button.text() == "Mở trợ lý GPT"
-        runtime.record_inbox_scan(0)
-        assert runtime.repository.get_app_state(APP_STATE_LAST_INBOX_SCAN)
+        assert window.workflow_page.open_assistant_button.text() == "Mở Trợ lý ảo"
+        assert not hasattr(window.workflow_page, "open_inbox_button")
+        assert not hasattr(window.workflow_page, "choose_file_button")
+        assert len(window.settings_page.findChildren(QLineEdit)) == 2
+        visible_text = " ".join(
+            widget.text()
+            for widget_type in (QLabel, QAbstractButton)
+            for widget in window.findChildren(widget_type)
+        ).casefold()
+        assert "inbox" not in visible_text
+        assert "gpt" not in visible_text
+        runtime.record_output_scan(0)
+        assert runtime.repository.get_app_state(APP_STATE_LAST_OUTPUT_SCAN)
     finally:
         window.close()
         runtime.close()

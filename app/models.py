@@ -225,7 +225,7 @@ class ValidationResult:
 class BatchMetadata:
     id: int
     source_filename: str
-    source_inbox_path: Path | None
+    source_output_path: Path | None
     original_archive_path: Path
     working_path: Path
     ready_path: Path | None
@@ -313,7 +313,7 @@ def metadata_as_dict(metadata: BatchMetadata) -> Mapping[str, Any]:
     return {
         "id": metadata.id,
         "source_filename": metadata.source_filename,
-        "source_inbox_path": metadata.source_inbox_path,
+        "source_output_path": metadata.source_output_path,
         "original_archive_path": metadata.original_archive_path,
         "working_path": metadata.working_path,
         "ready_path": metadata.ready_path,

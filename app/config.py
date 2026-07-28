@@ -1,37 +1,37 @@
-"""Cấu hình và cây thư mục runtime, không phụ thuộc thư mục cài đặt."""
+"""Cấu hình ứng dụng và cây thư mục runtime."""
 
 from __future__ import annotations
 
+import filecmp
 import json
 import os
+import shutil
+import stat
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
-from app.constants import (
-    APP_SLUG,
-    APP_VENDOR,
-    DEFAULT_FILE_PATTERN,
-    DEFAULT_MAX_FILE_SIZE_BYTES,
-    DEFAULT_MAX_FILE_SIZE_MB,
-    DEFAULT_STABILITY_TIMEOUT_SECONDS,
-    DEFAULT_STABLE_SECONDS,
-)
+from app.constants import DEFAULT_MAX_FILE_SIZE_BYTES
 
-_BROWSER_PREFERENCES = frozenset({"auto", "chrome", "edge", "default"})
+
+def software_root() -> Path:
+    """Thư mục chứa source hoặc executable đang chạy."""
+
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
 
 
 def default_data_root() -> Path:
-    local_app_data = os.environ.get("LOCALAPPDATA")
-    base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
-    return base / APP_VENDOR / APP_SLUG
+    """Mặc định lưu dữ liệu cạnh source hoặc executable để bundle có tính di động."""
+
+    return software_root()
 
 
-def default_inbox_dir() -> Path:
-    user_profile = os.environ.get("USERPROFILE")
-    base = Path(user_profile) if user_profile else Path.home()
-    return base / "Documents" / APP_SLUG / "Inbox"
+def default_output_dir() -> Path:
+    return software_root() / "Output"
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +39,8 @@ class AppPaths:
     data_root: Path
     config_dir: Path
     settings_path: Path
-    inbox_dir: Path
+    output_dir: Path
+    system_dir: Path
     archive_original_dir: Path
     workspace_dir: Path
     ready_dir: Path
@@ -48,47 +49,38 @@ class AppPaths:
     database_path: Path
     logs_dir: Path
     log_path: Path
-    browser_profile_dir: Path
 
     @classmethod
     def from_data_root(
         cls,
         data_root: str | Path,
-        inbox_dir: str | Path | None = None,
-        browser_profile_dir: str | Path | None = None,
+        output_dir: str | Path | None = None,
     ) -> "AppPaths":
         root = Path(data_root).expanduser()
-        inbox = Path(inbox_dir).expanduser() if inbox_dir else root / "Inbox"
-        profile = (
-            Path(browser_profile_dir).expanduser()
-            if browser_profile_dir
-            else root / "BrowserProfile"
-        )
+        output = Path(output_dir).expanduser() if output_dir else default_output_dir()
         config_dir = root / "Config"
         database_dir = root / "Database"
         logs_dir = root / "Logs"
+        system_dir = output / "_system"
         return cls(
             data_root=root,
             config_dir=config_dir,
             settings_path=config_dir / "settings.json",
-            inbox_dir=inbox,
-            archive_original_dir=root / "Archive" / "Original",
-            workspace_dir=root / "Workspace",
-            ready_dir=root / "Ready",
-            rejected_dir=root / "Rejected",
+            output_dir=output,
+            system_dir=system_dir,
+            archive_original_dir=system_dir / "Archive" / "Original",
+            workspace_dir=system_dir / "Workspace",
+            ready_dir=system_dir / "Ready",
+            rejected_dir=system_dir / "Rejected",
             database_dir=database_dir,
             database_path=database_dir / "app_state.db",
             logs_dir=logs_dir,
             log_path=logs_dir / "app.log",
-            browser_profile_dir=profile,
         )
 
     @classmethod
     def defaults(cls) -> "AppPaths":
-        return cls.from_data_root(
-            default_data_root(),
-            inbox_dir=default_inbox_dir(),
-        )
+        return cls.from_data_root(default_data_root())
 
     def ensure_directories(self) -> None:
         for directory in self.directories:
@@ -99,17 +91,16 @@ class AppPaths:
         return (
             self.data_root,
             self.config_dir,
-            self.inbox_dir,
+            self.output_dir,
+            self.system_dir,
             self.archive_original_dir,
             self.workspace_dir,
             self.ready_dir,
             self.rejected_dir,
             self.database_dir,
             self.logs_dir,
-            self.browser_profile_dir,
         )
 
-    # Các alias giúp code UI đọc tự nhiên hơn.
     @property
     def archive_dir(self) -> Path:
         return self.archive_original_dir
@@ -118,92 +109,54 @@ class AppPaths:
     def db_path(self) -> Path:
         return self.database_path
 
+    @property
+    def legacy_runtime_rebases(self) -> tuple[tuple[Path, Path], ...]:
+        """Các cặp đường dẫn từ layout phẳng cũ sang ``Output/_system``."""
+
+        return (
+            (self.data_root / "Archive", self.system_dir / "Archive"),
+            (self.data_root / "Workspace", self.workspace_dir),
+            (self.data_root / "Ready", self.ready_dir),
+            (self.data_root / "Rejected", self.rejected_dir),
+        )
+
 
 @dataclass(slots=True)
 class AppSettings:
     data_root: Path = field(default_factory=default_data_root)
-    gpt_url: str = ""
-    browser_preference: str = "auto"
-    browser_executable: str = ""
-    browser_profile_dir: Path | None = None
-    inbox_dir: Path = field(default_factory=default_inbox_dir)
-    file_pattern: str = DEFAULT_FILE_PATTERN
-    stable_seconds: float = DEFAULT_STABLE_SECONDS
-    stability_timeout_seconds: float = DEFAULT_STABILITY_TIMEOUT_SECONDS
-    max_file_size_mb: int = DEFAULT_MAX_FILE_SIZE_MB
-    auto_open_review: bool = True
+    assistant_bat_path: str = ""
+    output_dir: Path = field(default_factory=default_output_dir)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.data_root, (str, os.PathLike)):
-            raise ValueError("Thư mục dữ liệu phải là một đường dẫn.")
-        if not isinstance(self.inbox_dir, (str, os.PathLike)):
-            raise ValueError("Thư mục Inbox phải là một đường dẫn.")
-        if not str(self.data_root).strip():
-            raise ValueError("Thư mục dữ liệu không được để trống.")
-        if not str(self.inbox_dir).strip():
-            raise ValueError("Thư mục Inbox không được để trống.")
-        self.data_root = Path(self.data_root).expanduser()
-        self.inbox_dir = Path(self.inbox_dir).expanduser()
-        if self.browser_profile_dir is None or not str(
-            self.browser_profile_dir
+        if not isinstance(self.data_root, (str, os.PathLike)) or not str(
+            self.data_root
         ).strip():
-            self.browser_profile_dir = self.data_root / "BrowserProfile"
-        else:
-            self.browser_profile_dir = Path(self.browser_profile_dir).expanduser()
-        if not isinstance(self.gpt_url, str):
-            raise ValueError("URL GPT phải là chuỗi.")
-        self.gpt_url = self.gpt_url.strip()
-        if isinstance(self.browser_executable, os.PathLike):
-            self.browser_executable = os.fspath(self.browser_executable)
-        if not isinstance(self.browser_executable, str):
-            raise ValueError("Đường dẫn trình duyệt phải là chuỗi.")
-        self.browser_executable = self.browser_executable.strip()
-        if not isinstance(self.browser_preference, str):
-            raise ValueError("Trình duyệt ưu tiên phải là chuỗi.")
-        self.browser_preference = self.browser_preference.strip().lower()
-        if self.browser_preference == "windows":
-            self.browser_preference = "default"
-        if self.browser_preference not in _BROWSER_PREFERENCES:
-            raise ValueError("Trình duyệt ưu tiên không hợp lệ.")
-        if not isinstance(self.file_pattern, str) or not self.file_pattern.strip():
-            raise ValueError("Pattern tên file không được để trống.")
-        self.file_pattern = self.file_pattern.strip()
-        if self.stable_seconds < 0:
-            raise ValueError("Số giây ổn định không được âm.")
-        if self.stability_timeout_seconds <= 0:
-            raise ValueError("Timeout chờ file phải lớn hơn 0.")
-        if self.stability_timeout_seconds < self.stable_seconds:
-            raise ValueError("Timeout phải lớn hơn hoặc bằng số giây ổn định.")
-        if self.max_file_size_mb <= 0:
-            raise ValueError("Kích thước file tối đa phải lớn hơn 0.")
-        if not isinstance(self.auto_open_review, bool):
-            raise ValueError("Tùy chọn tự mở review phải là true hoặc false.")
-
-    @property
-    def max_file_size_bytes(self) -> int:
-        return self.max_file_size_mb * 1024 * 1024
+            raise ValueError("Thư mục dữ liệu không hợp lệ.")
+        if not isinstance(self.output_dir, (str, os.PathLike)) or not str(
+            self.output_dir
+        ).strip():
+            raise ValueError("Thư mục Output không được để trống.")
+        if isinstance(self.assistant_bat_path, os.PathLike):
+            self.assistant_bat_path = os.fspath(self.assistant_bat_path)
+        if not isinstance(self.assistant_bat_path, str):
+            raise ValueError("Đường dẫn BAT phải là chuỗi.")
+        self.data_root = Path(self.data_root).expanduser()
+        self.output_dir = Path(self.output_dir).expanduser()
+        self.assistant_bat_path = self.assistant_bat_path.strip()
 
     @property
     def paths(self) -> AppPaths:
-        return AppPaths.from_data_root(
-            self.data_root,
-            inbox_dir=self.inbox_dir,
-            browser_profile_dir=self.browser_profile_dir,
-        )
+        return AppPaths.from_data_root(self.data_root, self.output_dir)
+
+    @property
+    def max_file_size_bytes(self) -> int:
+        return DEFAULT_MAX_FILE_SIZE_BYTES
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "data_root": str(self.data_root),
-            "gpt_url": self.gpt_url,
-            "browser_preference": self.browser_preference,
-            "browser_executable": self.browser_executable,
-            "browser_profile_dir": str(self.browser_profile_dir),
-            "inbox_dir": str(self.inbox_dir),
-            "file_pattern": self.file_pattern,
-            "stable_seconds": self.stable_seconds,
-            "stability_timeout_seconds": self.stability_timeout_seconds,
-            "max_file_size_mb": self.max_file_size_mb,
-            "auto_open_review": self.auto_open_review,
+            "assistant_bat_path": self.assistant_bat_path,
+            "output_dir": str(self.output_dir),
         }
 
     @classmethod
@@ -214,38 +167,11 @@ class AppSettings:
         fallback_paths: AppPaths | None = None,
     ) -> "AppSettings":
         fallback = fallback_paths or AppPaths.defaults()
-        known = {
-            "data_root": value.get("data_root", fallback.data_root),
-            "gpt_url": value.get("gpt_url", ""),
-            "browser_preference": value.get("browser_preference", "auto"),
-            "browser_executable": value.get("browser_executable", ""),
-            "browser_profile_dir": value.get(
-                "browser_profile_dir", fallback.browser_profile_dir
-            ),
-            "inbox_dir": value.get("inbox_dir", fallback.inbox_dir),
-            "file_pattern": value.get("file_pattern", DEFAULT_FILE_PATTERN),
-            "stable_seconds": value.get(
-                "stable_seconds",
-                value.get("file_stable_seconds", DEFAULT_STABLE_SECONDS),
-            ),
-            "stability_timeout_seconds": value.get(
-                "stability_timeout_seconds",
-                DEFAULT_STABILITY_TIMEOUT_SECONDS,
-            ),
-            "max_file_size_mb": value.get(
-                "max_file_size_mb", DEFAULT_MAX_FILE_SIZE_MB
-            ),
-            "auto_open_review": value.get("auto_open_review", True),
-        }
-        try:
-            known["stable_seconds"] = float(known["stable_seconds"])
-            known["stability_timeout_seconds"] = float(
-                known["stability_timeout_seconds"]
-            )
-            known["max_file_size_mb"] = int(known["max_file_size_mb"])
-        except (TypeError, ValueError) as exc:
-            raise ValueError("Cấu hình số giây hoặc kích thước file không hợp lệ.") from exc
-        return cls(**known)
+        return cls(
+            data_root=value.get("data_root", fallback.data_root),
+            assistant_bat_path=value.get("assistant_bat_path", ""),
+            output_dir=value.get("output_dir", fallback.output_dir),
+        )
 
 
 Settings = AppSettings
@@ -270,32 +196,61 @@ class ConfigManager:
             self._bootstrap_paths = AppPaths.from_data_root(data_root)
         else:
             self._bootstrap_paths = AppPaths.defaults()
+        self._relocated_from: Path | None = None
 
     @property
     def settings_path(self) -> Path:
         return self._bootstrap_paths.settings_path
 
+    @property
+    def relocated_from(self) -> Path | None:
+        """Gốc dữ liệu ghi trong settings trước khi bundle được chuyển vị trí."""
+
+        return self._relocated_from
+
     def load(self) -> AppSettings:
+        self._relocated_from = None
         self._bootstrap_paths.ensure_directories()
         if not self.settings_path.exists():
             settings = AppSettings(
                 data_root=self._bootstrap_paths.data_root,
-                inbox_dir=self._bootstrap_paths.inbox_dir,
-                browser_profile_dir=self._bootstrap_paths.browser_profile_dir,
+                output_dir=self._bootstrap_paths.output_dir,
             )
             self.save(settings)
             return settings
         try:
-            text = self.settings_path.read_text(encoding="utf-8-sig")
-            raw = json.loads(text)
+            raw = json.loads(self.settings_path.read_text(encoding="utf-8-sig"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise ValueError(
                 f"Không thể đọc cấu hình tại {self.settings_path}."
             ) from exc
         if not isinstance(raw, dict):
             raise ValueError("File cấu hình phải chứa một JSON object.")
-        settings = AppSettings.from_dict(raw, fallback_paths=self._bootstrap_paths)
+        effective = dict(raw)
+        stored_root = _coerce_path(raw.get("data_root"))
+        bootstrap_root = self._bootstrap_paths.data_root
+        if stored_root is not None and not _same_path(stored_root, bootstrap_root):
+            self._relocated_from = stored_root
+            stored_output = _coerce_path(raw.get("output_dir"))
+            if stored_output is not None:
+                rebased_output = _rebase_child_path(
+                    stored_output,
+                    old_root=stored_root,
+                    new_root=bootstrap_root,
+                )
+                if rebased_output is not None:
+                    effective["output_dir"] = str(rebased_output)
+        # Gốc đã dùng để tìm Config luôn là nguồn sự thật. Quy tắc này giúp
+        # toàn bộ bundle tiếp tục chạy khi được copy sang thư mục hoặc máy khác.
+        effective["data_root"] = str(bootstrap_root)
+        settings = AppSettings.from_dict(
+            effective,
+            fallback_paths=self._bootstrap_paths,
+        )
         settings.paths.ensure_directories()
+        # Ghi lại ngay để loại khóa cấu hình cũ và cố định vị trí bundle mới.
+        if raw != settings.to_dict():
+            self.save(settings)
         return settings
 
     def save(self, settings: AppSettings) -> Path:
@@ -307,7 +262,7 @@ class ConfigManager:
             indent=2,
             allow_nan=False,
         ).encode("utf-8")
-        temp_path: Path | None = None
+        temporary: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
                 mode="wb",
@@ -316,20 +271,85 @@ class ConfigManager:
                 dir=target.parent,
                 delete=False,
             ) as handle:
-                temp_path = Path(handle.name)
+                temporary = Path(handle.name)
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temp_path, target)
-            temp_path = None
+            os.replace(temporary, target)
+            temporary = None
         finally:
-            if temp_path is not None:
-                temp_path.unlink(missing_ok=True)
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
         settings.paths.ensure_directories()
         return target
 
-    load_settings = load
-    save_settings = save
+
+def _coerce_path(value: object) -> Path | None:
+    if not isinstance(value, (str, os.PathLike)) or not str(value).strip():
+        return None
+    return Path(value).expanduser()
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    return os.path.normcase(str(left.resolve(strict=False))) == os.path.normcase(
+        str(right.resolve(strict=False))
+    )
+
+
+def _rebase_child_path(
+    path: Path,
+    *,
+    old_root: Path,
+    new_root: Path,
+) -> Path | None:
+    try:
+        relative = path.resolve(strict=False).relative_to(
+            old_root.resolve(strict=False)
+        )
+    except ValueError:
+        return None
+    return new_root / relative
+
+
+def migrate_legacy_runtime_layout(paths: AppPaths) -> int:
+    """Gom dữ liệu của layout cũ vào ``Output/_system`` mà không ghi đè file."""
+
+    moved_roots = 0
+    for source, target in paths.legacy_runtime_rebases:
+        if not source.exists():
+            continue
+        if not source.is_dir():
+            raise ValueError(f"Đường dẫn dữ liệu cũ không phải thư mục: {source}")
+        _merge_directory(source, target)
+        moved_roots += 1
+    return moved_roots
+
+
+def _merge_directory(source: Path, target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    for child in tuple(source.iterdir()):
+        destination = target / child.name
+        if child.is_dir():
+            if destination.exists() and not destination.is_dir():
+                raise FileExistsError(
+                    f"Không thể di trú vì đích đã là file: {destination}"
+                )
+            _merge_directory(child, destination)
+            continue
+        if destination.exists():
+            if not destination.is_file() or not filecmp.cmp(
+                child,
+                destination,
+                shallow=False,
+            ):
+                raise FileExistsError(
+                    f"Không thể di trú vì file đích đã tồn tại: {destination}"
+                )
+            child.chmod(child.stat().st_mode | stat.S_IWRITE)
+            child.unlink()
+            continue
+        shutil.move(str(child), str(destination))
+    source.rmdir()
 
 
 def load_settings(data_root: str | Path | None = None) -> AppSettings:
@@ -340,9 +360,18 @@ def save_settings(
     settings: AppSettings,
     data_root: str | Path | None = None,
 ) -> Path:
-    manager = ConfigManager(data_root or settings.data_root)
-    return manager.save(settings)
+    return ConfigManager(data_root or settings.data_root).save(settings)
 
 
-def max_file_size_bytes(settings: AppSettings | None = None) -> int:
-    return settings.max_file_size_bytes if settings else DEFAULT_MAX_FILE_SIZE_BYTES
+__all__ = [
+    "AppPaths",
+    "AppSettings",
+    "ConfigManager",
+    "Settings",
+    "default_data_root",
+    "default_output_dir",
+    "load_settings",
+    "migrate_legacy_runtime_layout",
+    "save_settings",
+    "software_root",
+]

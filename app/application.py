@@ -9,9 +9,14 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
-from app.config import AppPaths, AppSettings, ConfigManager
+from app.config import (
+    AppPaths,
+    AppSettings,
+    ConfigManager,
+    migrate_legacy_runtime_layout,
+)
 from app.constants import (
-    APP_STATE_LAST_INBOX_SCAN,
+    APP_STATE_LAST_OUTPUT_SCAN,
     APP_STATE_LAST_PAGE,
     APP_STATE_MAIN_WINDOW_GEOMETRY,
 )
@@ -20,8 +25,8 @@ from app.logging_setup import setup_logging
 from app.repositories.batch_repository import BatchRepository
 from app.repositories.batch_repository import local_now_iso
 from app.services.batch_service import BatchService
-from app.services.browser_launcher import BrowserLauncher
-from app.services.inbox_watcher import InboxWatcher
+from app.services.assistant_bat_launcher import AssistantBatLauncher
+from app.services.output_watcher import OutputWatcher
 from app.services.json_codec import JsonCodec
 from app.services.reviewed_batch_provider import ReviewedBatchProvider
 from app.services.validation_service import ValidationService
@@ -44,10 +49,26 @@ class ApplicationRuntime:
         self.config_manager = ConfigManager(paths=bootstrap_paths)
         self.settings = self.config_manager.load()
         self.paths = self.settings.paths
+        moved_roots = migrate_legacy_runtime_layout(self.paths)
         self.paths.ensure_directories()
         self.log_path = setup_logging(self.paths)
 
         self.database = Database(self.paths.database_path)
+        changed_rows = 0
+        if self.config_manager.relocated_from is not None:
+            changed_rows += self.database.rebase_paths(
+                self.config_manager.relocated_from,
+                self.paths.data_root,
+            )
+        for old_root, new_root in self.paths.legacy_runtime_rebases:
+            changed_rows += self.database.rebase_paths(old_root, new_root)
+        if moved_roots or changed_rows:
+            LOGGER.info(
+                "Đã gom dữ liệu vào %s; chuyển %s thư mục và cập nhật %s batch",
+                self.paths.system_dir,
+                moved_roots,
+                changed_rows,
+            )
         self.repository = BatchRepository(self.database)
         self.validation_service = ValidationService()
         self.validator = self.validation_service
@@ -60,18 +81,20 @@ class ApplicationRuntime:
             max_file_size_bytes=self.settings.max_file_size_bytes,
         )
         self.reviewed_batch_provider = ReviewedBatchProvider(self.batch_service)
-        self.browser_launcher = BrowserLauncher(self.settings)
-        self.watcher = InboxWatcher(
+        self.assistant_launcher = AssistantBatLauncher(self.settings)
+        self.launcher = self.assistant_launcher
+        self.watcher = OutputWatcher(
             self.settings,
             on_file_ready=self._receive_watcher_file,
         )
-        self.inbox_watcher = self.watcher
+        self.output_watcher = self.watcher
+        self.batch_service.set_output_write_callback(self.watcher.mark_handled)
         self._close_lock = RLock()
         self._closed = False
         LOGGER.info(
-            "Khởi tạo runtime thành công; data_root=%s, inbox=%s",
+            "Khởi tạo runtime thành công; data_root=%s, output=%s",
             self.paths.data_root,
-            self.settings.inbox_dir,
+            self.settings.output_dir,
         )
 
     def _receive_watcher_file(self, path: Path) -> object:
@@ -96,14 +119,13 @@ class ApplicationRuntime:
         self.config_manager.save(settings)
         self.settings = settings
         self.paths = new_paths
+        self.batch_service.update_paths(new_paths)
         self.batch_service.max_file_size_bytes = settings.max_file_size_bytes
-        self.browser_launcher.update_settings(settings)
+        self.assistant_launcher.update_settings(settings)
         LOGGER.info(
-            "Đã áp dụng cấu hình; inbox=%s, pattern=%s, stable=%ss, max=%sMB",
-            settings.inbox_dir,
-            settings.file_pattern,
-            settings.stable_seconds,
-            settings.max_file_size_mb,
+            "Đã áp dụng cấu hình; bat=%s, output=%s",
+            settings.assistant_bat_path,
+            settings.output_dir,
         )
         return settings
 
@@ -137,10 +159,10 @@ class ApplicationRuntime:
 
     load_ui_state = restore_ui_state
 
-    def record_inbox_scan(self, _candidate_count: int = 0) -> None:
-        """Lưu thời điểm quét Inbox gần nhất để chẩn đoán/khôi phục trạng thái."""
+    def record_output_scan(self, _candidate_count: int = 0) -> None:
+        """Lưu thời điểm quét Output gần nhất để chẩn đoán/khôi phục trạng thái."""
 
-        self.repository.set_app_state(APP_STATE_LAST_INBOX_SCAN, local_now_iso())
+        self.repository.set_app_state(APP_STATE_LAST_OUTPUT_SCAN, local_now_iso())
 
     def close(self) -> None:
         with self._close_lock:

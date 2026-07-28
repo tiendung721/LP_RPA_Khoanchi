@@ -28,14 +28,15 @@ def test_parse_valid_json_object_keeps_row_order() -> None:
     assert list(document_to_dict(document)) == ["v", "d"]
 
 
-def test_parse_multiline_fixture() -> None:
+def test_parse_real_custom_assistant_fixture() -> None:
     raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
     document = parse_document(raw)
 
-    assert len(document.rows) == 5
+    assert len(document.rows) == 47
     assert document.rows[0].fee == "VTN"
-    assert document.rows[1].rule == "HD"
-    assert document.rows[3].amount is None
+    assert document.rows[0].rule == "CV"
+    assert document.rows[0].amount == 13_554_000
+    assert document.rows[-1].cont == "GAOU2196608"
 
 
 @pytest.mark.parametrize("raw", [[], None, "{}", 123])

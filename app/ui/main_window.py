@@ -11,7 +11,6 @@ from PySide6.QtCore import QByteArray, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
-    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -65,7 +64,7 @@ class MainWindow(QMainWindow):
     ``controller`` là tùy chọn. Từng dependency cũng có thể truyền trực tiếp,
     rất thuận tiện cho ``main.py`` và unit test:
 
-    ``MainWindow(batch_service=..., config_manager=..., browser_launcher=...,
+    ``MainWindow(batch_service=..., config_manager=..., assistant_launcher=...,
     watcher=..., validator=..., settings=...)``.
     """
 
@@ -82,7 +81,7 @@ class MainWindow(QMainWindow):
         batch_service: Any | None = None,
         config_manager: Any | None = None,
         settings_service: Any | None = None,
-        browser_launcher: Any | None = None,
+        assistant_launcher: Any | None = None,
         watcher: Any | None = None,
         validator: Any | None = None,
         settings: Any | None = None,
@@ -105,10 +104,10 @@ class MainWindow(QMainWindow):
         self._config_manager = config_manager or settings_service or _attribute(
             controller, "config_manager", "settings_service", "config"
         )
-        self._browser_launcher = browser_launcher or _attribute(
-            controller, "browser_launcher", "launcher"
+        self._assistant_launcher = assistant_launcher or _attribute(
+            controller, "assistant_launcher", "launcher"
         )
-        self._watcher = watcher or _attribute(controller, "watcher", "inbox_watcher")
+        self._watcher = watcher or _attribute(controller, "watcher", "output_watcher")
         self._validator = validator or _attribute(
             controller, "validation_service", "validator"
         )
@@ -141,13 +140,13 @@ class MainWindow(QMainWindow):
                 self._validator = ValidationService()
             except (ImportError, TypeError):
                 self._validator = None
-        if self._browser_launcher is None:
+        if self._assistant_launcher is None:
             try:
-                from app.services.browser_launcher import BrowserLauncher
+                from app.services.assistant_bat_launcher import AssistantBatLauncher
 
-                self._browser_launcher = BrowserLauncher(self._settings)
+                self._assistant_launcher = AssistantBatLauncher(self._settings)
             except (ImportError, TypeError):
-                self._browser_launcher = None
+                self._assistant_launcher = None
 
     def _load_settings_if_needed(self) -> None:
         if self._settings is not None:
@@ -217,20 +216,16 @@ class MainWindow(QMainWindow):
 
     def _connect_page_signals(self) -> None:
         self.navigation.currentRowChanged.connect(self._change_page)
-        self.workflow_page.open_gpt_requested.connect(self.open_gpt)
-        self.workflow_page.open_inbox_requested.connect(self.open_inbox)
-        self.workflow_page.choose_json_requested.connect(self.choose_json_file)
+        self.workflow_page.open_assistant_requested.connect(self.open_assistant)
         self.workflow_page.open_review_requested.connect(self.open_review)
-        self.workflow_page.reload_requested.connect(self.reload_batch)
 
         self.history_page.refresh_requested.connect(self.refresh_history)
         self.history_page.open_batch_requested.connect(self.open_review)
         self.history_page.open_path_requested.connect(self.open_containing_folder)
 
         self.settings_page.save_requested.connect(self.save_settings)
-        self.settings_page.test_gpt_requested.connect(self.test_gpt)
-        self.settings_page.detect_browser_requested.connect(self.detect_browser)
-        self.settings_page.open_inbox_requested.connect(self._open_directory)
+        self.settings_page.check_requested.connect(self.check_settings)
+        self.settings_page.open_output_requested.connect(self._open_directory)
 
     def _connect_service_signals(self) -> None:
         watcher = self._watcher
@@ -239,7 +234,7 @@ class MainWindow(QMainWindow):
             self._safe_connect(watcher, "watcher_error", self._watcher_error)
             self._safe_connect(watcher, "status_changed", self._watcher_status_changed)
             self._safe_connect(watcher, "started", lambda path: self._watcher_status_changed(True, f"Đang theo dõi: {path}"))
-            self._safe_connect(watcher, "stopped", lambda: self._watcher_status_changed(False, "Đã dừng theo dõi Inbox."))
+            self._safe_connect(watcher, "stopped", lambda: self._watcher_status_changed(False, "Đã dừng theo dõi Output."))
             self._safe_connect(watcher, "scan_completed", self._scan_completed)
             callback = getattr(watcher, "_on_file_ready_callback", None)
             if callback is not None and hasattr(watcher, "file_processed"):
@@ -272,6 +267,22 @@ class MainWindow(QMainWindow):
         if self._batch_service is None:
             self.workflow_page.clear_active_batch()
             return
+        current_output = getattr(
+            self._batch_service, "get_current_output_batch", None
+        )
+        if callable(current_output):
+            try:
+                batch = current_output()
+            except Exception as exc:
+                LOGGER.exception(
+                    "Không thể nhận diện batch Output hiện hành: %s", exc
+                )
+            else:
+                if batch is not None:
+                    self._set_active_batch(batch)
+                else:
+                    self.workflow_page.clear_active_batch()
+                return
         for name in ("restore_active_batch", "get_active_batch", "restore_last_batch"):
             method = getattr(self._batch_service, name, None)
             if not callable(method):
@@ -327,74 +338,51 @@ class MainWindow(QMainWindow):
             self.log_page.refresh()
 
     @Slot()
-    def open_gpt(self) -> None:
-        self._launch_gpt(self._settings)
+    def open_assistant(self) -> None:
+        self._launch_assistant(self._settings)
 
     @Slot(object)
-    def test_gpt(self, settings_data: Mapping[str, Any]) -> None:
-        self._launch_gpt(settings_data, testing=True)
+    def check_settings(self, settings_data: Mapping[str, Any]) -> None:
+        launcher = self._assistant_launcher
+        if launcher is None:
+            self.settings_page.show_check_result(
+                False, "Dịch vụ mở Trợ lý ảo chưa được khởi tạo."
+            )
+            return
+        try:
+            launcher.validate_configuration(
+                settings_data.get("assistant_bat_path"),
+                settings_data.get("output_dir"),
+            )
+            self.settings_page.show_check_result(True, "Cấu hình hợp lệ.")
+        except Exception as exc:
+            self.settings_page.show_check_result(False, str(exc))
 
-    def _launch_gpt(self, settings: Any, *, testing: bool = False) -> None:
-        launcher = self._browser_launcher
+    def _launch_assistant(self, settings: Any) -> None:
+        launcher = self._assistant_launcher
         if launcher is None:
             QMessageBox.warning(
                 self,
-                "Không có dịch vụ trình duyệt",
-                "Ứng dụng chưa khởi tạo được dịch vụ mở GPT.",
+                "Không có dịch vụ mở Trợ lý ảo",
+                "Ứng dụng chưa khởi tạo được dịch vụ mở Trợ lý ảo.",
             )
             return
-        url = _attribute(settings, "gpt_url", default="")
-        preference = _attribute(settings, "browser_preference", default="auto")
-        executable = _attribute(
-            settings, "browser_executable", "browser_executable_path", default=None
-        )
-        profile = _attribute(
-            settings, "browser_profile_dir", "browser_profile_path", default=None
-        )
-        if isinstance(settings, Mapping):
-            url = settings.get("gpt_url", url)
-            preference = settings.get("browser_preference", preference)
-            executable = settings.get("browser_executable", executable)
-            profile = settings.get("browser_profile_dir", profile)
         try:
             result = launcher.launch(
-                url=str(url or ""),
-                preference=str(preference or "auto"),
-                executable_path=executable,
-                profile_dir=profile,
+                bat_path=_attribute(settings, "assistant_bat_path", default=""),
+                output_dir=_attribute(settings, "output_dir", default=""),
             )
-            success = bool(_attribute(result, "success", default=result))
-            warning = _attribute(result, "warning")
-            message = str(
-                _attribute(
-                    result,
-                    "message",
-                    default="Đã gửi yêu cầu mở trợ lý GPT." if success else "Không thể mở GPT.",
-                )
+            self.statusBar().showMessage(
+                str(_attribute(result, "message", default="Đã mở Trợ lý ảo.")),
+                7000,
             )
-            if not success:
-                QMessageBox.warning(self, "Không mở được GPT", message)
-            elif warning:
-                QMessageBox.warning(self, "Đã dùng trình duyệt dự phòng", str(warning))
-            else:
-                self.statusBar().showMessage(
-                    "Kiểm tra mở GPT thành công." if testing else message,
-                    7000,
-                )
         except Exception as exc:
-            LOGGER.exception("Không mở được GPT: %s", exc)
+            LOGGER.exception("Không mở được Trợ lý ảo: %s", exc)
             QMessageBox.warning(
                 self,
-                "Không mở được GPT",
-                f"{exc}\nHãy kiểm tra URL và trình duyệt trong Cài đặt.",
+                "Không mở được Trợ lý ảo",
+                f"{exc}\nHãy kiểm tra file BAT và thư mục Output trong Cài đặt.",
             )
-
-    @Slot()
-    def open_inbox(self) -> None:
-        path = _attribute(self._settings, "inbox_dir", "inbox_path")
-        if path is None and isinstance(self._settings, Mapping):
-            path = self._settings.get("inbox_dir")
-        self._open_directory(path)
 
     @Slot(object)
     def _open_directory(self, path: Any) -> None:
@@ -402,7 +390,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Chưa cấu hình thư mục",
-                "Hãy chọn thư mục Inbox trong trang Cài đặt.",
+                "Hãy chọn thư mục Output trong trang Cài đặt.",
             )
             return
         directory = Path(path).expanduser()
@@ -421,18 +409,6 @@ class MainWindow(QMainWindow):
         candidate = Path(path).expanduser()
         directory = candidate if candidate.is_dir() else candidate.parent
         self._open_directory(directory)
-
-    @Slot()
-    def choose_json_file(self) -> None:
-        start = _attribute(self._settings, "inbox_dir", default="")
-        filename, _ = QFileDialog.getOpenFileName(
-            self,
-            "Chọn file JSON do GPT tải xuống",
-            str(start or ""),
-            "JSON (*.json);;Tất cả file (*)",
-        )
-        if filename:
-            self.receive_file(Path(filename), manual=True)
 
     @Slot(str)
     def _file_ready(self, raw_path: str) -> None:
@@ -476,7 +452,7 @@ class MainWindow(QMainWindow):
                 self,
                 "Không tiếp nhận được JSON",
                 f"Không thể xử lý {Path(path).name}: {exc}\n"
-                "File gốc không bị thay đổi. Hãy xem trang Nhật ký để biết thêm.",
+                "Hãy xem trang Nhật ký để biết thêm.",
             )
             return None
         finally:
@@ -491,31 +467,12 @@ class MainWindow(QMainWindow):
         batch = _attribute(result, "batch", "metadata", default=result)
         target = review or batch
 
-        current_id = _batch_id(self._active_batch)
-        dirty_batch_ids = {
-            identifier
-            for identifier, window in self._review_windows.items()
-            if window.model.dirty
-        }
-        preserve_current = (
-            bool(dirty_batch_ids)
-            and _batch_id(target) not in dirty_batch_ids
-        )
-        if not preserve_current and review is None and _batch_id(batch) is not None:
+        if review is None and _batch_id(batch) is not None:
             review = self._load_batch_review(_batch_id(batch), show_error=False)
             target = review or batch
-        if not preserve_current:
-            self._set_active_batch(target)
+        self._set_active_batch(target)
         self.refresh_history(silent=True)
-        if preserve_current:
-            QMessageBox.information(
-                self,
-                "Đã tiếp nhận một batch mới",
-                "Batch mới đã được lưu trong Lịch sử. Batch đang mở vẫn được giữ "
-                "nguyên vì còn thay đổi chưa lưu.",
-            )
-            return
-        if duplicate:
+        if duplicate and not automatic:
             QMessageBox.information(
                 self,
                 "File đã được tiếp nhận",
@@ -523,15 +480,13 @@ class MainWindow(QMainWindow):
             )
         else:
             self.statusBar().showMessage(
-                message or "Đã tiếp nhận và kiểm tra file JSON.",
+                (
+                    "File hiện hành đã được khôi phục."
+                    if duplicate
+                    else (message or "Đã tiếp nhận và kiểm tra file JSON.")
+                ),
                 8000,
             )
-
-        auto_open = bool(_attribute(self._settings, "auto_open_review", default=True))
-        if isinstance(self._settings, Mapping):
-            auto_open = bool(self._settings.get("auto_open_review", auto_open))
-        if auto_open and _status_code(target) != "INVALID":
-            self.open_review(target)
 
     @Slot(object)
     def open_review(self, batch: Any = None) -> ReviewWindow | None:
@@ -540,7 +495,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Chưa có batch",
-                "Hãy tải JSON vào Inbox hoặc chọn file thủ công trước.",
+                "Hãy tải file JSON từ Trợ lý ảo trước.",
             )
             return None
         batch_identifier = _batch_id(target)
@@ -578,7 +533,6 @@ class MainWindow(QMainWindow):
         window.show()
         window.raise_()
         window.activateWindow()
-        self._set_active_batch(review)
         return window
 
     def _load_batch_review(self, batch_identifier: Any, *, show_error: bool = True) -> Any:
@@ -626,7 +580,8 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _review_batch_updated(self, result: Any) -> None:
-        self._set_active_batch(result)
+        if _batch_id(result) == _batch_id(self._active_batch):
+            self._set_active_batch(result)
         self.refresh_history(silent=True)
 
     @Slot(object)
@@ -677,17 +632,7 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def save_settings(self, data: Mapping[str, Any]) -> None:
         try:
-            watcher_fields = (
-                "inbox_dir",
-                "file_pattern",
-                "stable_seconds",
-                "stability_timeout_seconds",
-                "max_file_size_mb",
-            )
-            old_watcher_values = tuple(
-                str(_attribute(self._settings, field, default=""))
-                for field in watcher_fields
-            )
+            old_output = str(_attribute(self._settings, "output_dir", default=""))
             new_settings = self._build_settings(data)
             result = self._persist_settings(new_settings)
             if result is not None and not isinstance(result, (str, Path, bool)):
@@ -696,7 +641,7 @@ class MainWindow(QMainWindow):
             self._paths = _attribute(new_settings, "paths", default=self._paths)
             self.settings_page.mark_saved(new_settings)
             self.workflow_page.set_configuration(new_settings)
-            update_launcher = getattr(self._browser_launcher, "update_settings", None)
+            update_launcher = getattr(self._assistant_launcher, "update_settings", None)
             if callable(update_launcher):
                 update_launcher(new_settings)
             if self._batch_service is not None and hasattr(
@@ -710,11 +655,8 @@ class MainWindow(QMainWindow):
                     max_bytes = max_megabytes * 1024 * 1024
                 self._batch_service.max_file_size_bytes = int(max_bytes)
 
-            new_watcher_values = tuple(
-                str(_attribute(new_settings, field, default=""))
-                for field in watcher_fields
-            )
-            if self._watcher is not None and old_watcher_values != new_watcher_values:
+            new_output = str(_attribute(new_settings, "output_dir", default=""))
+            if self._watcher is not None and old_output != new_output:
                 update_watcher = getattr(self._watcher, "update_settings", None) or getattr(
                     self._watcher, "configure", None
                 )
@@ -726,12 +668,14 @@ class MainWindow(QMainWindow):
                 else:
                     restart = getattr(self._watcher, "restart", None)
                     if callable(restart):
-                        restart(
-                            _attribute(new_settings, "inbox_dir", default=""),
-                            file_pattern=_attribute(
-                                new_settings, "file_pattern", default="ket_qua_boc_tach*.json"
-                            ),
-                        )
+                        restart(_attribute(new_settings, "output_dir", default=""))
+                current_output = getattr(
+                    self._batch_service, "get_current_output_batch", None
+                )
+                current_batch = (
+                    current_output() if callable(current_output) else None
+                )
+                self._set_active_batch(current_batch)
             self.settingsChanged.emit(new_settings)
             self.statusBar().showMessage("Đã lưu cấu hình.", 6000)
         except Exception as exc:
@@ -751,8 +695,6 @@ class MainWindow(QMainWindow):
         elif isinstance(current, Mapping):
             merged.update(current)
         merged.update(dict(data))
-        if merged.get("browser_executable") is None:
-            merged["browser_executable"] = ""
         try:
             from app.config import AppSettings
 
@@ -779,48 +721,17 @@ class MainWindow(QMainWindow):
                     return method(settings)
         raise RuntimeError("Chưa kết nối dịch vụ lưu cấu hình.")
 
-    @Slot()
-    def detect_browser(self) -> None:
-        launcher = self._browser_launcher
-        if launcher is None:
-            self.settings_page.set_detected_browser(None)
-            return
-        try:
-            detect = getattr(launcher, "detect_browsers", None) or getattr(
-                launcher, "detect", None
-            )
-            result = detect() if callable(detect) else {}
-            selected_path: Any = None
-            selected_name: str | None = None
-            preference = str(self.settings_page.browser_combo.currentData() or "auto")
-            if isinstance(result, Mapping):
-                if preference in result:
-                    selected_name, selected_path = preference, result[preference]
-                else:
-                    for name in ("chrome", "edge"):
-                        if name in result:
-                            selected_name, selected_path = name, result[name]
-                            break
-            elif result:
-                first = next(iter(result), result) if not isinstance(result, (str, Path)) else result
-                selected_path = _attribute(first, "path", default=first)
-                selected_name = str(_attribute(first, "name", default="")).lower() or None
-            self.settings_page.set_detected_browser(selected_path, selected_name)
-        except Exception as exc:
-            LOGGER.exception("Tự dò trình duyệt thất bại: %s", exc)
-            self.settings_page.set_detected_browser(None)
-
     def _start_watcher(self) -> None:
         watcher = self._watcher
         if watcher is None:
             self._watcher_status_changed(
-                False, "Bộ theo dõi Inbox chưa được khởi tạo."
+                False, "Bộ theo dõi Output chưa được khởi tạo."
             )
             return
         is_running = bool(_attribute(watcher, "is_running", default=False))
         if is_running:
-            inbox = _attribute(watcher, "inbox_dir", default="")
-            self._watcher_status_changed(True, f"Đang theo dõi: {inbox}")
+            output = _attribute(watcher, "output_dir", default="")
+            self._watcher_status_changed(True, f"Đang theo dõi: {output}")
             return
         start = getattr(watcher, "start", None)
         if callable(start):
@@ -830,11 +741,11 @@ class MainWindow(QMainWindow):
                     _attribute(watcher, "is_running", default=False)
                 ):
                     self._watcher_status_changed(
-                        False, "Không thể khởi động bộ theo dõi Inbox."
+                        False, "Không thể khởi động bộ theo dõi Output."
                     )
             except Exception as exc:
                 LOGGER.exception("Không khởi động được watcher: %s", exc)
-                self._watcher_status_changed(False, "Không thể theo dõi Inbox.")
+                self._watcher_status_changed(False, "Không thể theo dõi Output.")
 
     @Slot(bool, str)
     def _watcher_status_changed(self, running: bool, message: str) -> None:
@@ -850,7 +761,7 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(
             self,
             "Không thể tiếp nhận file",
-            f"{Path(path).name}: {message}\nHãy kiểm tra file hoặc chọn thủ công sau khi tải xong.",
+            f"{Path(path).name}: {message}\nHãy kiểm tra file vừa tải xuống.",
         )
 
     @Slot(str)
@@ -862,7 +773,7 @@ class MainWindow(QMainWindow):
     @Slot(int)
     def _scan_completed(self, count: int) -> None:
         recorder = (
-            getattr(self._controller, "record_inbox_scan", None)
+            getattr(self._controller, "record_output_scan", None)
             if self._controller is not None
             else None
         )
@@ -870,10 +781,10 @@ class MainWindow(QMainWindow):
             try:
                 recorder(count)
             except Exception:
-                LOGGER.exception("Không lưu được thời điểm quét Inbox.")
+                LOGGER.exception("Không lưu được thời điểm quét Output.")
         if count:
             self.statusBar().showMessage(
-                f"Đã tìm thấy {count} file phù hợp trong Inbox; đang kiểm tra độ ổn định.",
+                f"Đã tìm thấy {count} file phù hợp trong Output; đang kiểm tra độ ổn định.",
                 7000,
             )
 

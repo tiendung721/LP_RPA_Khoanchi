@@ -78,9 +78,9 @@ TEMPORARY_FILE_SUFFIXES: Final = (
 CONTAINER_PATTERN: Final = r"^[A-Z]{4}[0-9]{7}$"
 
 APP_STATE_ACTIVE_BATCH_ID: Final = "active_batch_id"
-APP_STATE_LAST_INBOX_SCAN: Final = "last_inbox_scan_at"
+APP_STATE_LAST_OUTPUT_SCAN: Final = "last_output_scan_at"
 APP_STATE_MAIN_WINDOW_GEOMETRY: Final = "main_window_geometry"
 APP_STATE_MAIN_WINDOW_STATE: Final = "main_window_state"
 APP_STATE_LAST_PAGE: Final = "last_page"
 
-SQLITE_SCHEMA_VERSION: Final = 1
+SQLITE_SCHEMA_VERSION: Final = 2

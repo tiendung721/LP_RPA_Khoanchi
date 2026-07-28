@@ -2,7 +2,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app.config import AppSettings, ConfigManager
+import json
+import sqlite3
+
+from app.config import (
+    AppPaths,
+    AppSettings,
+    ConfigManager,
+    default_data_root,
+    migrate_legacy_runtime_layout,
+    software_root,
+)
 from app.database import Database
 from app.models import BatchStatus
 from app.repositories.batch_repository import BatchRepository
@@ -18,21 +28,65 @@ def test_first_load_creates_settings_and_runtime_directories(tmp_path: Path) -> 
     assert all(path.is_dir() for path in settings.paths.directories)
 
 
+def test_default_data_root_is_the_portable_application_directory() -> None:
+    assert default_data_root() == software_root()
+
+
+def test_runtime_files_are_grouped_below_output_system(tmp_path: Path) -> None:
+    paths = AppPaths.from_data_root(tmp_path / "runtime", tmp_path / "Output")
+
+    assert paths.system_dir == tmp_path / "Output" / "_system"
+    assert paths.archive_original_dir == (
+        tmp_path / "Output" / "_system" / "Archive" / "Original"
+    )
+    assert paths.workspace_dir == tmp_path / "Output" / "_system" / "Workspace"
+    assert paths.ready_dir == tmp_path / "Output" / "_system" / "Ready"
+    assert paths.rejected_dir == tmp_path / "Output" / "_system" / "Rejected"
+
+
+def test_legacy_runtime_layout_is_moved_without_changing_files(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    paths = AppPaths.from_data_root(root, tmp_path / "Output")
+    legacy_files = {
+        root / "Archive" / "Original" / "original.json": b"original",
+        root / "Workspace" / "1" / "working.json": b"working",
+        root / "Ready" / "ready.json": b"ready",
+        root / "Rejected" / "bad.json": b"bad",
+    }
+    for path, content in legacy_files.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    paths.ensure_directories()
+
+    assert migrate_legacy_runtime_layout(paths) == 4
+
+    assert not (root / "Archive").exists()
+    assert not (root / "Workspace").exists()
+    assert not (root / "Ready").exists()
+    assert not (root / "Rejected").exists()
+    assert (paths.archive_original_dir / "original.json").read_bytes() == b"original"
+    assert (paths.workspace_dir / "1" / "working.json").read_bytes() == b"working"
+    assert (paths.ready_dir / "ready.json").read_bytes() == b"ready"
+    assert (paths.rejected_dir / "bad.json").read_bytes() == b"bad"
+
+
 def test_settings_round_trip_utf8(tmp_path: Path) -> None:
     root = tmp_path / "Dữ liệu quyết toán"
-    manager = ConfigManager(root)
+    paths = AppPaths.from_data_root(root, tmp_path / "Kết quả")
+    manager = ConfigManager(paths=paths)
     settings = AppSettings(
         data_root=root,
-        gpt_url="https://chatgpt.com/g/example",
-        inbox_dir=root / "Hộp nhận",
-        file_pattern="ket_qua_boc_tach*.json",
+        assistant_bat_path=str(root / "Mở trợ lý.bat"),
+        output_dir=tmp_path / "Kết quả",
     )
 
     manager.save(settings)
     loaded = manager.load()
 
-    assert loaded.gpt_url == settings.gpt_url
-    assert loaded.inbox_dir == settings.inbox_dir
+    assert loaded.assistant_bat_path == settings.assistant_bat_path
+    assert loaded.output_dir == settings.output_dir
     assert manager.settings_path.read_bytes().startswith(b"{")
 
 
@@ -48,7 +102,7 @@ def test_database_migration_and_active_batch_restore(tmp_path: Path) -> None:
 
     batch = repository.create_batch(
         source_filename="ket_qua_boc_tach.json",
-        source_inbox_path=tmp_path / "Inbox" / "ket_qua_boc_tach.json",
+        source_output_path=tmp_path / "Output" / "ket_qua_boc_tach.json",
         original_archive_path=original,
         working_path=working,
         sha256="a" * 64,
@@ -61,4 +115,114 @@ def test_database_migration_and_active_batch_restore(tmp_path: Path) -> None:
     assert restored is not None
     assert restored.id == batch.id
     assert repository.get_app_state("active_batch_id") == str(batch.id)
+    database.close()
+
+
+def test_legacy_settings_are_rewritten_without_browser_or_inbox_keys(
+    tmp_path: Path,
+) -> None:
+    paths = AppPaths.from_data_root(tmp_path / "runtime", tmp_path / "Output")
+    paths.ensure_directories()
+    paths.settings_path.write_text(
+        json.dumps(
+            {
+                "data_root": str(paths.data_root),
+                "gpt_url": "https://example.invalid",
+                "inbox_dir": str(tmp_path / "Inbox"),
+                "browser_executable": "chrome.exe",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = ConfigManager(paths=paths).load()
+    rewritten = json.loads(paths.settings_path.read_text(encoding="utf-8"))
+
+    assert loaded.assistant_bat_path == ""
+    assert loaded.output_dir == paths.output_dir
+    assert set(rewritten) == {"data_root", "assistant_bat_path", "output_dir"}
+
+
+def test_copied_settings_rebase_paths_inside_the_old_bundle(tmp_path: Path) -> None:
+    old_root = tmp_path / "old-bundle"
+    new_root = tmp_path / "new-bundle"
+    paths = AppPaths.from_data_root(new_root, new_root / "Output")
+    paths.ensure_directories()
+    paths.settings_path.write_text(
+        json.dumps(
+            {
+                "data_root": str(old_root),
+                "assistant_bat_path": str(tmp_path / "external" / "assistant.bat"),
+                "output_dir": str(old_root / "Output"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manager = ConfigManager(paths=paths)
+    loaded = manager.load()
+
+    assert manager.relocated_from == old_root
+    assert loaded.data_root == new_root
+    assert loaded.output_dir == new_root / "Output"
+    assert loaded.assistant_bat_path == str(tmp_path / "external" / "assistant.bat")
+
+
+def test_database_v1_renames_source_path_and_scan_state(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "CREATE TABLE batches (id INTEGER PRIMARY KEY, source_inbox_path TEXT)"
+    )
+    connection.execute("CREATE TABLE app_state (key TEXT PRIMARY KEY, value TEXT)")
+    connection.execute(
+        "INSERT INTO app_state(key, value) VALUES ('last_inbox_scan_at', 'old-time')"
+    )
+    connection.execute("PRAGMA user_version = 1")
+    connection.commit()
+    connection.close()
+
+    database = Database(path)
+    columns = {
+        row["name"] for row in database.query_all("PRAGMA table_info(batches)")
+    }
+
+    assert "source_output_path" in columns
+    assert "source_inbox_path" not in columns
+    assert database.query_one(
+        "SELECT value FROM app_state WHERE key = 'last_output_scan_at'"
+    )["value"] == "old-time"
+    assert database.query_one(
+        "SELECT value FROM app_state WHERE key = 'last_inbox_scan_at'"
+    ) is None
+    database.close()
+
+
+def test_database_rebases_only_paths_inside_the_old_root(tmp_path: Path) -> None:
+    old_root = tmp_path / "old-bundle"
+    new_root = tmp_path / "new-bundle"
+    external_output = tmp_path / "shared-output" / "ket_qua_boc_tach.json"
+    database = Database(tmp_path / "app_state.db")
+    repository = BatchRepository(database)
+    batch = repository.create_batch(
+        source_filename="ket_qua_boc_tach.json",
+        source_output_path=external_output,
+        original_archive_path=old_root / "Archive" / "Original" / "original.json",
+        working_path=old_root / "Workspace" / "1" / "ket_qua_boc_tach.json",
+        ready_path=old_root / "Ready" / "ready.json",
+        sha256="b" * 64,
+    )
+
+    assert database.rebase_paths(old_root, new_root) == 1
+    moved = repository.get_by_id(batch.id)
+
+    assert moved is not None
+    assert moved.source_output_path == external_output
+    assert moved.original_archive_path == (
+        new_root / "Archive" / "Original" / "original.json"
+    )
+    assert moved.working_path == (
+        new_root / "Workspace" / "1" / "ket_qua_boc_tach.json"
+    )
+    assert moved.ready_path == new_root / "Ready" / "ready.json"
     database.close()

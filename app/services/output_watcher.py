@@ -1,4 +1,4 @@
-"""Theo dõi Inbox và chuyển sự kiện watchdog sang Qt một cách an toàn."""
+"""Theo dõi Output và chuyển sự kiện watchdog sang Qt một cách an toàn."""
 
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ class _QtWatchdogBridge(QObject):
     path_observed = Signal(str)
 
 
-class _InboxEventHandler(FileSystemEventHandler):
+class _OutputEventHandler(FileSystemEventHandler):
     def __init__(self, bridge: _QtWatchdogBridge) -> None:
         super().__init__()
         self._bridge = bridge
@@ -68,7 +68,7 @@ class _InboxEventHandler(FileSystemEventHandler):
             self._bridge.path_observed.emit(os.fsdecode(event.src_path))
 
 
-class InboxWatcher(QObject):
+class OutputWatcher(QObject):
     """Watchdog service phát file JSON sau khi file đã ghi xong.
 
     Watchdog chạy trong thread riêng. Sự kiện thô được đưa qua
@@ -93,7 +93,7 @@ class InboxWatcher(QObject):
 
     def __init__(
         self,
-        inbox_dir: str | Path | object,
+        output_dir: str | Path | object,
         *,
         file_pattern: str | Iterable[str] | None = None,
         pattern: str | Iterable[str] | None = None,
@@ -108,20 +108,20 @@ class InboxWatcher(QObject):
         on_file_ready: Callable[[Path], object] | None = None,
         callback: Callable[[Path], object] | None = None,
         observer_factory: Callable[[], Any] = Observer,
-        max_workers: int = 2,
+        max_workers: int = 1,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
 
         settings = (
-            inbox_dir
-            if not isinstance(inbox_dir, (str, bytes, os.PathLike))
+            output_dir
+            if not isinstance(output_dir, (str, bytes, os.PathLike))
             else None
         )
-        configured_inbox = self._read_setting(
-            settings, "inbox_dir", default=inbox_dir
+        configured_output = self._read_setting(
+            settings, "output_dir", default=output_dir
         )
-        self._inbox_dir = Path(os.fsdecode(configured_inbox)).expanduser()
+        self._output_dir = Path(os.fsdecode(configured_output)).expanduser()
 
         configured_pattern = self._read_setting(
             settings,
@@ -204,7 +204,7 @@ class InboxWatcher(QObject):
         self._generation = 0
 
         self._bridge = _QtWatchdogBridge(self)
-        self._event_handler = _InboxEventHandler(self._bridge)
+        self._event_handler = _OutputEventHandler(self._bridge)
         self._bridge.path_observed.connect(
             self._on_watchdog_path, Qt.ConnectionType.QueuedConnection
         )
@@ -219,8 +219,8 @@ class InboxWatcher(QObject):
         )
 
     @property
-    def inbox_dir(self) -> Path:
-        return self._inbox_dir
+    def output_dir(self) -> Path:
+        return self._output_dir
 
     @property
     def file_patterns(self) -> tuple[str, ...]:
@@ -250,18 +250,18 @@ class InboxWatcher(QObject):
         return self._event_handler
 
     def start(self) -> bool:
-        """Khởi động observer và quét các file đã tồn tại trong Inbox."""
+        """Khởi động observer và quét file mới nhất đã có trong Output."""
 
         with self._state_lock:
             if self._running:
                 return False
 
         try:
-            self._inbox_dir.mkdir(parents=True, exist_ok=True)
+            self._output_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             message = (
-                f"Không thể tạo hoặc truy cập thư mục nhận file: "
-                f"{self._inbox_dir}"
+                f"Không thể tạo hoặc truy cập thư mục Output: "
+                f"{self._output_dir}"
             )
             LOGGER.exception("%s (%s)", message, exc)
             self.watcher_error.emit(message)
@@ -271,7 +271,7 @@ class InboxWatcher(QObject):
         cancel_event = threading.Event()
         executor = ThreadPoolExecutor(
             max_workers=self._max_workers,
-            thread_name_prefix="inbox-stability",
+            thread_name_prefix="output-stability",
         )
         observer = self._observer_factory()
 
@@ -286,7 +286,7 @@ class InboxWatcher(QObject):
 
         try:
             observer.schedule(
-                self._event_handler, str(self._inbox_dir), recursive=False
+                self._event_handler, str(self._output_dir), recursive=False
             )
             observer.start()
         except Exception as exc:
@@ -305,20 +305,20 @@ class InboxWatcher(QObject):
                     exc_info=True,
                 )
             executor.shutdown(wait=True, cancel_futures=True)
-            message = f"Không thể theo dõi thư mục nhận file: {self._inbox_dir}"
+            message = f"Không thể theo dõi thư mục Output: {self._output_dir}"
             LOGGER.exception("%s (%s)", message, exc)
             self.watcher_error.emit(message)
             self.status_changed.emit(False, message)
             return False
 
         LOGGER.info(
-            "Watcher bắt đầu: inbox=%s, pattern=%s, max_size=%d",
-            self._inbox_dir,
+            "Watcher bắt đầu: output=%s, pattern=%s, max_size=%d",
+            self._output_dir,
             ", ".join(self._patterns),
             self._max_size_bytes,
         )
-        self.started.emit(str(self._inbox_dir))
-        self.status_changed.emit(True, f"Đang theo dõi: {self._inbox_dir}")
+        self.started.emit(str(self._output_dir))
+        self.status_changed.emit(True, f"Đang theo dõi: {self._output_dir}")
         self.scan_existing(generation=generation)
         return True
 
@@ -357,9 +357,9 @@ class InboxWatcher(QObject):
         with self._state_lock:
             self._pending.clear()
 
-        LOGGER.info("Watcher đã dừng: %s", self._inbox_dir)
+        LOGGER.info("Watcher đã dừng: %s", self._output_dir)
         self.stopped.emit()
-        self.status_changed.emit(False, "Đã dừng theo dõi thư mục nhận file.")
+        self.status_changed.emit(False, "Đã dừng theo dõi thư mục Output.")
         return True
 
     # Tên gọi phổ biến trong lifecycle của controller.
@@ -368,15 +368,15 @@ class InboxWatcher(QObject):
 
     def restart(
         self,
-        inbox_dir: str | Path | None = None,
+        output_dir: str | Path | None = None,
         *,
         file_pattern: str | Iterable[str] | None = None,
     ) -> bool:
         """Dừng watcher cũ và theo dõi thư mục/cấu hình mới."""
 
         self.stop()
-        if inbox_dir is not None:
-            self._inbox_dir = Path(inbox_dir).expanduser()
+        if output_dir is not None:
+            self._output_dir = Path(output_dir).expanduser()
         if file_pattern is not None:
             self._patterns = self._normalize_patterns(file_pattern)
         with self._state_lock:
@@ -396,53 +396,17 @@ class InboxWatcher(QObject):
         thể chủ động gọi :meth:`start` sau đó.
         """
 
-        new_inbox = Path(
+        new_output = Path(
             os.fsdecode(
                 self._read_setting(
-                    settings, "inbox_dir", default=self._inbox_dir
+                    settings, "output_dir", default=self._output_dir
                 )
             )
         ).expanduser()
-        new_patterns = self._normalize_patterns(
-            self._read_setting(
-                settings,
-                "file_pattern",
-                "pattern",
-                default=self._patterns,
-            )
-        )
-        new_stable_seconds = float(
-            self._read_setting(
-                settings,
-                "stable_seconds",
-                default=self._stable_seconds,
-            )
-        )
-        new_timeout_seconds = float(
-            self._read_setting(
-                settings,
-                "stability_timeout_seconds",
-                "timeout_seconds",
-                default=self._timeout_seconds,
-            )
-        )
-        configured_max_bytes = self._read_setting(
-            settings,
-            "max_file_size_bytes",
-            "max_size_bytes",
-            default=None,
-        )
-        if configured_max_bytes is None:
-            configured_max_mb = float(
-                self._read_setting(
-                    settings,
-                    "max_file_size_mb",
-                    default=self._max_size_bytes / (1024 * 1024),
-                )
-            )
-            new_max_size_bytes = int(configured_max_mb * 1024 * 1024)
-        else:
-            new_max_size_bytes = int(configured_max_bytes)
+        new_patterns = self._patterns
+        new_stable_seconds = self._stable_seconds
+        new_timeout_seconds = self._timeout_seconds
+        new_max_size_bytes = self._max_size_bytes
 
         # Khởi tạo trước để validation thất bại không làm mất watcher hiện tại.
         new_checker = FileStabilityChecker(
@@ -454,7 +418,7 @@ class InboxWatcher(QObject):
 
         self.stop()
         with self._state_lock:
-            self._inbox_dir = new_inbox
+            self._output_dir = new_output
             self._patterns = new_patterns
             self._stable_seconds = new_stable_seconds
             self._timeout_seconds = new_timeout_seconds
@@ -463,9 +427,9 @@ class InboxWatcher(QObject):
             self._handled_signatures.clear()
 
         LOGGER.info(
-            "Đã cập nhật watcher: inbox=%s, pattern=%s, stable=%.3fs, "
+            "Đã cập nhật watcher: output=%s, pattern=%s, stable=%.3fs, "
             "timeout=%.3fs, max_size=%d",
-            self._inbox_dir,
+            self._output_dir,
             ", ".join(self._patterns),
             self._stable_seconds,
             self._timeout_seconds,
@@ -488,19 +452,21 @@ class InboxWatcher(QObject):
             paths = sorted(
                 (
                     path
-                    for path in self._inbox_dir.iterdir()
+                    for path in self._output_dir.iterdir()
                     if path.is_file() and self.accepts_path(path)
                 ),
-                key=lambda path: path.name.casefold(),
+                key=lambda path: (path.stat().st_mtime_ns, path.name.casefold()),
+                reverse=True,
             )
         except OSError as exc:
-            message = f"Không thể quét thư mục nhận file: {self._inbox_dir}"
+            message = f"Không thể quét thư mục Output: {self._output_dir}"
             LOGGER.exception("%s (%s)", message, exc)
             self.watcher_error.emit(message)
             return 0
 
         queued = 0
-        for path in paths:
+        # Chỉ file mới nhất được tiếp nhận; BatchService sẽ dọn các bản cũ.
+        for path in paths[:1]:
             if self.enqueue(path, generation=generation):
                 queued += 1
         self._scan_finished.emit(queued, generation)
@@ -678,6 +644,13 @@ class InboxWatcher(QObject):
         if not self._is_current_generation(generation):
             return
         path = Path(raw_path)
+        latest = self._latest_candidate()
+        if latest is None or self._path_key(latest) != self._path_key(path):
+            LOGGER.info(
+                "Bỏ qua candidate cũ vì Output đã có file mới hơn: %s",
+                path,
+            )
+            return
         LOGGER.info("File đã ổn định và sẵn sàng tiếp nhận: %s", path)
         self.file_ready.emit(raw_path)
         if self._on_file_ready_callback is None:
@@ -686,8 +659,7 @@ class InboxWatcher(QObject):
             callback_result = self._on_file_ready_callback(path)
         except Exception as exc:
             message = (
-                "Không thể tiếp nhận file JSON. "
-                "Hãy xem Nhật ký và thử chọn file thủ công."
+                "Không thể tiếp nhận file JSON. Hãy xem Nhật ký để biết chi tiết."
             )
             LOGGER.exception(
                 "Callback tiếp nhận file thất bại, file=%s: %s", path, exc
@@ -713,7 +685,7 @@ class InboxWatcher(QObject):
     @Slot(int, int)
     def _deliver_scan_completed(self, count: int, generation: int) -> None:
         if self._is_current_generation(generation):
-            LOGGER.info("Quét Inbox hoàn tất: %d file được xếp hàng.", count)
+            LOGGER.info("Quét Output hoàn tất: %d file được xếp hàng.", count)
             self.scan_completed.emit(count)
 
     def _is_current_generation(self, generation: int) -> bool:
@@ -779,18 +751,46 @@ class InboxWatcher(QObject):
             return None
         return stat_result.st_size, stat_result.st_mtime_ns
 
+    def _latest_candidate(self) -> Path | None:
+        try:
+            candidates = [
+                path
+                for path in self._output_dir.iterdir()
+                if path.is_file() and self.accepts_path(path)
+            ]
+            return max(
+                candidates,
+                key=lambda path: (
+                    path.stat().st_mtime_ns,
+                    path.name.casefold(),
+                ),
+                default=None,
+            )
+        except OSError:
+            return None
+
     @staticmethod
     def _format_size(size: int) -> str:
         return f"{size / (1024 * 1024):g} MB"
 
 
-# Tên đầy đủ hơn cho những nơi muốn thể hiện rõ đây là service.
-InboxWatcherService = InboxWatcher
+    def mark_handled(self, path: str | Path) -> None:
+        """Bỏ qua đúng phiên bản file vừa được chính ứng dụng ghi."""
+
+        candidate = Path(path)
+        signature = self._safe_signature(candidate)
+        if signature is None:
+            return
+        with self._state_lock:
+            self._handled_signatures[self._path_key(candidate)] = signature
+
+
+OutputWatcherService = OutputWatcher
 
 __all__ = [
     "DEFAULT_FILE_PATTERN",
     "DEFAULT_MAX_SIZE_BYTES",
-    "InboxWatcher",
-    "InboxWatcherService",
+    "OutputWatcher",
+    "OutputWatcherService",
     "TEMPORARY_SUFFIXES",
 ]
