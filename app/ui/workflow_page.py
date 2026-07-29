@@ -1,4 +1,4 @@
-"""Trang Quy trình cho luồng Trợ lý ảo -> Output -> kiểm tra JSON."""
+"""Trang Quy trình cho luồng Trợ lý ảo -> Output -> kiểm tra JSON -> Excel."""
 
 from __future__ import annotations
 
@@ -49,6 +49,11 @@ def _saved_text(value: Any) -> str:
 class WorkflowPage(QWidget):
     open_assistant_requested = Signal()
     open_review_requested = Signal(object)
+    sync_daily_requested = Signal()
+    post_expenses_requested = Signal()
+
+    SYNC_OPERATION = "sync"
+    POSTING_OPERATION = "posting"
 
     def __init__(
         self,
@@ -64,6 +69,8 @@ class WorkflowPage(QWidget):
         self.review_button.clicked.connect(
             lambda: self.open_review_requested.emit(self._batch)
         )
+        self.sync_daily_button.clicked.connect(self.sync_daily_requested)
+        self.post_expenses_button.clicked.connect(self.post_expenses_requested)
         self.set_configuration(settings)
         self.set_active_batch(active_batch)
 
@@ -153,6 +160,60 @@ class WorkflowPage(QWidget):
         actions2.addWidget(self.review_button)
         step2.addLayout(actions2)
         layout.addWidget(self.step2_card)
+
+        self.step3_card = QFrame()
+        self.step3_card.setObjectName("excelWorkflowCard")
+        self.step3_card.setProperty("card", True)
+        step3 = QVBoxLayout(self.step3_card)
+        step3.setContentsMargins(18, 15, 18, 16)
+        step3.setSpacing(10)
+
+        name3 = QLabel("Bước 3 – Xử lý dữ liệu Excel")
+        name3.setStyleSheet("font-size: 13pt; font-weight: 700;")
+        step3.addWidget(name3)
+
+        guide3 = QLabel(
+            "Đồng bộ dữ liệu từ file Hàng ngày hoặc nhập các khoản chi đã xác nhận "
+            "vào file BK Tổng hợp."
+        )
+        guide3.setWordWrap(True)
+        guide3.setProperty("muted", True)
+        step3.addWidget(guide3)
+
+        self.sync_status_label = QLabel("Đồng bộ gần nhất: —")
+        self.sync_status_label.setObjectName("dailySyncStatusLabel")
+        self.sync_status_label.setWordWrap(True)
+        self.sync_status_label.setProperty("muted", True)
+        self.posting_status_label = QLabel("Nhập khoản chi gần nhất: —")
+        self.posting_status_label.setObjectName("expensePostingStatusLabel")
+        self.posting_status_label.setWordWrap(True)
+        self.posting_status_label.setProperty("muted", True)
+        actions3 = QHBoxLayout()
+        self.sync_daily_button = QPushButton("Đồng bộ dữ liệu Hàng ngày")
+        self.sync_daily_button.setObjectName("syncDailyWorkbookButton")
+        self.sync_daily_button.setProperty("primary", True)
+        self.post_expenses_button = QPushButton("Nhập khoản chi vào BK")
+        self.post_expenses_button.setObjectName("postExpensesWorkbookButton")
+        self.post_expenses_button.setProperty("primary", True)
+        actions3.addWidget(self.sync_daily_button)
+        actions3.addWidget(self.post_expenses_button)
+        actions3.addStretch()
+        step3.addLayout(actions3)
+        step3.addWidget(self.sync_status_label)
+        step3.addWidget(self.posting_status_label)
+        layout.addWidget(self.step3_card)
+
+        # Aliases có chủ ý để lớp điều phối có thể dùng cách đặt tên theo nghiệp vụ
+        # mà không tạo thêm widget/nút chính.
+        self.daily_sync_button = self.sync_daily_button
+        self.expense_posting_button = self.post_expenses_button
+        self.daily_sync_status_label = self.sync_status_label
+        self.expense_posting_status_label = self.posting_status_label
+        self._excel_running_operation: str | None = None
+        self._excel_button_texts = {
+            self.SYNC_OPERATION: self.sync_daily_button.text(),
+            self.POSTING_OPERATION: self.post_expenses_button.text(),
+        }
         layout.addStretch(1)
 
     def set_configuration(self, settings: Any | None) -> None:
@@ -212,10 +273,12 @@ class WorkflowPage(QWidget):
             "color: #15803D; background: #ECFDF3; border-radius: 5px; "
             "padding: 4px 8px; font-weight: 600;"
         )
+        saved_at = _get(metadata, "last_saved_at", "saved_at")
         self.file_note_label.setText(
             "Đã lưu dữ liệu bóc tách JSON sau khi kiểm tra."
+            if saved_at
+            else "Đã nhận file mới; hãy kiểm tra và lưu dữ liệu."
         )
-        saved_at = _get(metadata, "last_saved_at", "saved_at")
         self.saved_label.setText(
             f"Lưu thành công lần cuối: {_saved_text(saved_at)}"
         )
@@ -223,6 +286,88 @@ class WorkflowPage(QWidget):
 
     def clear_active_batch(self) -> None:
         self.set_active_batch(None)
+
+    @staticmethod
+    def _excel_operation(operation: Any) -> str:
+        value = str(getattr(operation, "value", operation) or "").casefold()
+        if value in {"sync", "daily_sync", "sync_daily", "daily"}:
+            return WorkflowPage.SYNC_OPERATION
+        if value in {
+            "posting",
+            "post",
+            "expense_posting",
+            "post_expenses",
+            "expenses",
+        }:
+            return WorkflowPage.POSTING_OPERATION
+        raise ValueError(f"Nghiệp vụ Excel không hợp lệ: {operation!r}")
+
+    def set_excel_running(self, operation: Any, message: str = "") -> None:
+        """Hiển thị tiến độ và khóa đồng thời cả hai thao tác Excel."""
+
+        normalized = self._excel_operation(operation)
+        self._excel_running_operation = normalized
+        self.sync_daily_button.setEnabled(False)
+        self.post_expenses_button.setEnabled(False)
+        if normalized == self.SYNC_OPERATION:
+            self.sync_daily_button.setText("Đang đồng bộ…")
+            self.sync_status_label.setText(
+                f"Đồng bộ: {message or 'Đang phân tích dữ liệu…'}"
+            )
+        else:
+            self.post_expenses_button.setText("Đang nhập…")
+            self.posting_status_label.setText(
+                f"Nhập khoản chi: {message or 'Đang phân tích dữ liệu…'}"
+            )
+
+    def set_excel_progress(self, operation: Any, message: str) -> None:
+        normalized = self._excel_operation(operation)
+        if normalized == self.SYNC_OPERATION:
+            self.sync_status_label.setText(f"Đồng bộ: {message}")
+        else:
+            self.posting_status_label.setText(f"Nhập khoản chi: {message}")
+
+    def set_excel_result(self, operation: Any, result: Any = None) -> None:
+        """Cập nhật kết quả gần nhất từ dataclass, mapping hoặc chuỗi."""
+
+        normalized = self._excel_operation(operation)
+        if isinstance(result, str):
+            message = result
+        else:
+            message = str(
+                _get(result, "message", "summary", default="Hoàn tất.") or "Hoàn tất."
+            )
+        if normalized == self.SYNC_OPERATION:
+            self.sync_status_label.setText(f"Đồng bộ gần nhất: {message}")
+        else:
+            self.posting_status_label.setText(
+                f"Nhập khoản chi gần nhất: {message}"
+            )
+
+    def set_excel_idle(self, operation: Any | None = None) -> None:
+        """Khôi phục hai nút sau khi controller phát ``finished``."""
+
+        if operation is not None:
+            self._excel_operation(operation)
+        self._excel_running_operation = None
+        self.sync_daily_button.setText(
+            self._excel_button_texts[self.SYNC_OPERATION]
+        )
+        self.post_expenses_button.setText(
+            self._excel_button_texts[self.POSTING_OPERATION]
+        )
+        self.sync_daily_button.setEnabled(True)
+        self.post_expenses_button.setEnabled(True)
+
+    def set_excel_actions_enabled(self, enabled: bool) -> None:
+        if self._excel_running_operation is not None and enabled:
+            return
+        self.sync_daily_button.setEnabled(enabled)
+        self.post_expenses_button.setEnabled(enabled)
+
+    @property
+    def excel_running_operation(self) -> str | None:
+        return self._excel_running_operation
 
     @property
     def active_batch(self) -> Any | None:

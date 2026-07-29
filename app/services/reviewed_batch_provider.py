@@ -1,4 +1,4 @@
-"""Hợp đồng ổn định để giai đoạn Excel/RPA chỉ lấy snapshot đã duyệt."""
+"""Cung cấp file JSON hiện hành đã được người dùng xác nhận."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ class ReviewedBatchProvider:
     ) -> None:
         if isinstance(source, BatchService):
             self.repository = source.repository
-            inferred_root = source.paths.ready_dir
+            inferred_root = source.paths.output_dir
             self._owns_repository = False
         elif isinstance(source, BatchRepository):
             self.repository = source
@@ -65,11 +65,11 @@ class ReviewedBatchProvider:
             self.repository.database.close()
 
     def _usable_path(self, metadata: BatchMetadata) -> Path | None:
-        path = metadata.ready_path
+        path = metadata.source_output_path
         if path is None or not path.is_file():
             if path is not None:
                 LOGGER.warning(
-                    "Bỏ qua Ready bị thiếu của batch %s: %s",
+                    "Bỏ qua JSON hiện hành bị thiếu của batch %s: %s",
                     metadata.id,
                     path,
                 )
@@ -79,7 +79,7 @@ class ReviewedBatchProvider:
                 path.resolve().relative_to(self.ready_root.resolve())
             except (OSError, ValueError):
                 LOGGER.error(
-                    "Từ chối ready_path nằm ngoài thư mục Ready: %s",
+                    "Từ chối JSON nằm ngoài thư mục Output: %s",
                     path,
                 )
                 return None

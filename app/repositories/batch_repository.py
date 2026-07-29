@@ -28,6 +28,7 @@ _UPDATABLE_COLUMNS = frozenset(
         "error_count",
         "total_amount",
         "last_error",
+        "received_at",
     }
 )
 

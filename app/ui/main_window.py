@@ -7,10 +7,11 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QByteArray, Qt, QUrl, Signal, Slot
+from PySide6.QtCore import QByteArray, Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -29,6 +30,7 @@ from .log_page import LogPage
 from .review_window import ReviewWindow
 from .settings_page import SettingsPage
 from .workflow_page import WorkflowPage
+from .excel_dialogs import ConflictResolutionDialog, MonthSelectionDialog
 
 LOGGER = logging.getLogger(__name__)
 
@@ -88,6 +90,9 @@ class MainWindow(QMainWindow):
         paths: Any | None = None,
         log_path: str | Path | None = None,
         start_watcher: bool = True,
+        excel_task_controller: Any | None = None,
+        excel_configuration_service: Any | None = None,
+        excel_run_repository: Any | None = None,
     ) -> None:
         if isinstance(controller, QWidget) and parent is None:
             parent = controller
@@ -111,6 +116,18 @@ class MainWindow(QMainWindow):
         self._validator = validator or _attribute(
             controller, "validation_service", "validator"
         )
+        self._excel_tasks = excel_task_controller or _attribute(
+            controller, "excel_task_controller"
+        )
+        self._excel_configuration_service = (
+            excel_configuration_service
+            or _attribute(controller, "excel_configuration_service")
+        )
+        self._excel_run_repository = excel_run_repository or _attribute(
+            controller, "excel_run_repository"
+        )
+        self._excel_operation: str | None = None
+        self._excel_context: str | None = None
         self._paths = paths or _attribute(controller, "paths", "app_paths")
         self._settings = settings or _attribute(controller, "settings")
         self._active_batch: Any | None = None
@@ -218,6 +235,10 @@ class MainWindow(QMainWindow):
         self.navigation.currentRowChanged.connect(self._change_page)
         self.workflow_page.open_assistant_requested.connect(self.open_assistant)
         self.workflow_page.open_review_requested.connect(self.open_review)
+        self.workflow_page.sync_daily_requested.connect(self.start_daily_sync)
+        self.workflow_page.post_expenses_requested.connect(
+            self.start_expense_posting
+        )
 
         self.history_page.refresh_requested.connect(self.refresh_history)
         self.history_page.open_batch_requested.connect(self.open_review)
@@ -251,6 +272,17 @@ class MainWindow(QMainWindow):
             for signal_name in ("active_batch_changed", "activeBatchChanged"):
                 self._safe_connect(service, signal_name, self._external_batch_changed)
 
+        excel_tasks = self._excel_tasks
+        if excel_tasks is not None:
+            self._safe_connect(excel_tasks, "started", self._excel_started)
+            self._safe_connect(excel_tasks, "progress", self._excel_progress)
+            self._safe_connect(
+                excel_tasks, "analysis_ready", self._excel_analysis_ready
+            )
+            self._safe_connect(excel_tasks, "completed", self._excel_completed)
+            self._safe_connect(excel_tasks, "failed", self._excel_failed)
+            self._safe_connect(excel_tasks, "finished", self._excel_finished)
+
     @staticmethod
     def _safe_connect(owner: Any, signal_name: str, slot: Callable[..., Any]) -> bool:
         signal = getattr(owner, signal_name, None)
@@ -263,6 +295,7 @@ class MainWindow(QMainWindow):
     def _load_initial_data(self) -> None:
         self.workflow_page.set_configuration(self._settings)
         self.settings_page.set_settings(self._settings)
+        self._load_excel_history()
         self.refresh_history(silent=True)
         if self._batch_service is None:
             self.workflow_page.clear_active_batch()
@@ -341,6 +374,367 @@ class MainWindow(QMainWindow):
     def open_assistant(self) -> None:
         self._launch_assistant(self._settings)
 
+    def _missing_excel_configuration(self, *, require_daily: bool) -> bool:
+        daily = str(
+            _attribute(self._settings, "daily_workbook_path", default="") or ""
+        ).strip()
+        bk = str(
+            _attribute(self._settings, "bk_workbook_path", default="") or ""
+        ).strip()
+        if bk and (daily or not require_daily):
+            return False
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Icon.Warning)
+        message.setWindowTitle("Chưa cấu hình đường dẫn Excel")
+        message.setText(
+            "Hãy cấu hình file Hàng ngày và file BK trong trang Cài đặt."
+            if require_daily
+            else "Hãy cấu hình file BK trong trang Cài đặt."
+        )
+        open_settings = message.addButton(
+            "Mở Cài đặt", QMessageBox.ButtonRole.AcceptRole
+        )
+        message.addButton("Đóng", QMessageBox.ButtonRole.RejectRole)
+        message.exec()
+        if message.clickedButton() is open_settings:
+            self.navigation.setCurrentRow(2)
+        return True
+
+    @Slot()
+    def start_daily_sync(self) -> None:
+        if self._missing_excel_configuration(require_daily=True):
+            return
+        if self._excel_tasks is None:
+            QMessageBox.warning(
+                self,
+                "Chưa thể đồng bộ",
+                "Dịch vụ xử lý Excel chưa được khởi tạo.",
+            )
+            return
+        self._excel_context = "workflow"
+        try:
+            self._excel_tasks.start_sync()
+        except Exception as exc:
+            self._show_excel_error(exc, operation="sync")
+
+    @Slot()
+    def start_expense_posting(self) -> None:
+        if self._missing_excel_configuration(require_daily=False):
+            return
+        if self._excel_tasks is None:
+            QMessageBox.warning(
+                self,
+                "Chưa thể nhập khoản chi",
+                "Dịch vụ xử lý Excel chưa được khởi tạo.",
+            )
+            return
+        self._excel_context = "workflow"
+        try:
+            self._excel_tasks.start_posting()
+        except Exception as exc:
+            self._show_excel_error(exc, operation="posting")
+
+    @Slot(str)
+    def _excel_started(self, operation: str) -> None:
+        self._excel_operation = operation
+        if self._excel_context != "configuration":
+            self.workflow_page.set_excel_running(operation)
+        self.statusBar().showMessage("Đang xử lý dữ liệu Excel…")
+
+    @Slot(str, str)
+    def _excel_progress(self, operation: str, message: str) -> None:
+        if self._excel_context == "configuration":
+            self.settings_page.show_check_result(True, message)
+        else:
+            self.workflow_page.set_excel_progress(operation, message)
+        self.statusBar().showMessage(message)
+
+    @Slot(object)
+    def _excel_analysis_ready(self, plan: Any) -> None:
+        if self._excel_tasks is None:
+            return
+        try:
+            operation = self._excel_tasks.normalize_operation(
+                _attribute(plan, "operation", "operation_type", default=self._excel_operation)
+            )
+            resolutions: dict[str, Any] = {}
+            handled_conflicts: set[str] = set()
+            conflicts = list(_attribute(plan, "conflicts", default=()) or ())
+
+            selected_month = _attribute(plan, "selected_month")
+            month_candidates = list(
+                _attribute(plan, "month_candidates", default=()) or ()
+            )
+            if operation == "sync" and selected_month is None and month_candidates:
+                dialog = MonthSelectionDialog(
+                    month_candidates,
+                    self,
+                    title="Chọn tháng cần đồng bộ",
+                )
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    self._excel_tasks.cancel_waiting()
+                    return
+                selection = dialog.selection()
+                for conflict in conflicts:
+                    kind = str(
+                        getattr(
+                            _attribute(conflict, "conflict_type", "type", default=""),
+                            "value",
+                            _attribute(conflict, "conflict_type", "type", default=""),
+                        )
+                    )
+                    if kind == "TARGET_MONTH_AMBIGUOUS":
+                        conflict_id = str(
+                            _attribute(conflict, "conflict_id", "id")
+                        )
+                        resolutions[conflict_id] = {
+                            "conflict_id": conflict_id,
+                            "action": "SELECT_MONTH",
+                            **selection,
+                        }
+                        handled_conflicts.add(conflict_id)
+
+            selected_sheet = _attribute(plan, "selected_sheet", "selected_sheet_name")
+            sheet_candidates = list(
+                _attribute(
+                    plan,
+                    "sheet_candidates",
+                    "target_sheet_candidates",
+                    default=(),
+                )
+                or ()
+            )
+            if (
+                operation == "posting"
+                and selected_sheet in (None, "")
+                and sheet_candidates
+            ):
+                dialog = MonthSelectionDialog(
+                    sheet_candidates,
+                    self,
+                    title="Chọn sheet nhận khoản chi",
+                )
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    self._excel_tasks.cancel_waiting()
+                    return
+                # Re-analyze the selected sheet so every row/cell conflict is
+                # collected before apply; no old decision is reused.
+                sheet_name = dialog.selected_sheet_name
+                self._excel_tasks.cancel_waiting()
+                self._excel_context = "workflow"
+                self._excel_tasks.start_posting(sheet_name=sheet_name)
+                return
+
+            remaining = [
+                conflict
+                for conflict in conflicts
+                if str(_attribute(conflict, "conflict_id", "id"))
+                not in handled_conflicts
+            ]
+            if remaining:
+                dialog = ConflictResolutionDialog(remaining, self)
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    self._excel_tasks.cancel_waiting()
+                    return
+                resolutions.update(dialog.resolution_map())
+            selector_actions = {
+                str(value.get("action", ""))
+                for value in resolutions.values()
+                if isinstance(value, Mapping)
+            }
+            if (
+                operation == "posting"
+                and selector_actions.intersection({"SELECT_ROW", "SELECT_FEE"})
+            ):
+                self._excel_tasks.refine_plan(
+                    plan,
+                    resolutions,
+                    operation=operation,
+                )
+            else:
+                self._excel_tasks.apply_plan(
+                    plan,
+                    resolutions,
+                    operation=operation,
+                )
+        except Exception as exc:
+            LOGGER.exception("Không xử lý được kế hoạch Excel: %s", exc)
+            self._excel_tasks.cancel_waiting()
+            self._show_excel_error(exc, operation=self._excel_operation)
+
+    @Slot(object)
+    def _excel_completed(self, result: Any) -> None:
+        if self._excel_context == "configuration":
+            valid = bool(_attribute(result, "is_valid", default=False))
+            checks = list(_attribute(result, "checks", default=()) or ())
+            detail = "\n".join(
+                (
+                    "✓ " if bool(_attribute(check, "ok", default=False)) else "✗ "
+                )
+                + str(_attribute(check, "message", default=""))
+                for check in checks
+            )
+            self.settings_page.show_check_result(
+                valid,
+                detail or ("Cấu hình Excel hợp lệ." if valid else "Cấu hình Excel chưa hợp lệ."),
+            )
+            return
+
+        operation = self._excel_operation or "sync"
+        try:
+            operation = self._excel_tasks.normalize_operation(
+                _attribute(result, "operation", default=operation)
+            )
+        except Exception:
+            pass
+        self.workflow_page.set_excel_result(operation, result)
+        self._load_excel_history()
+        message = str(
+            _attribute(result, "message", default="Hoàn tất xử lý Excel.") or ""
+        )
+        if operation == "sync":
+            detail = (
+                f"{message}\n\n"
+                f"Sheet: {_attribute(result, 'sheet_name', default='—')}\n"
+                f"Đã thêm: {_attribute(result, 'added_rows', default=0)} dòng\n"
+                f"Bỏ qua: {_attribute(result, 'skipped_rows', default=0)}"
+            )
+            title = "Đồng bộ thành công"
+        else:
+            detail = (
+                f"{message}\n\n"
+                f"Đã nhập: {_attribute(result, 'posted_source_items', default=0)} khoản\n"
+                f"Đã tồn tại: {_attribute(result, 'already_existing_items', default=0)}\n"
+                f"Bỏ qua: {_attribute(result, 'skipped_source_items', default=0)}\n"
+                f"Sheet: {_attribute(result, 'sheet_name', default='—')}"
+            )
+            title = "Nhập khoản chi hoàn tất"
+        QMessageBox.information(self, title, detail)
+
+    @Slot(object)
+    def _excel_failed(self, error: Any) -> None:
+        if self._excel_context == "configuration":
+            self.settings_page.show_check_result(False, str(error))
+            return
+        self._show_excel_error(error, operation=self._excel_operation)
+
+    @Slot(str)
+    def _excel_finished(self, operation: str) -> None:
+        if self._excel_context == "configuration":
+            self.settings_page._validate_form()
+        else:
+            self.workflow_page.set_excel_idle(operation)
+        self.statusBar().showMessage("Sẵn sàng", 3000)
+        self._excel_operation = None
+        self._excel_context = None
+
+    def _show_excel_error(
+        self, error: Any, *, operation: str | None = None
+    ) -> None:
+        text = str(error)
+        folded = text.casefold()
+        if "ready" in folded or "json" in folded and "không có" in folded:
+            title = "Không có JSON đã xác nhận"
+            retry_label = None
+        elif "khóa" in folded or "đang được mở" in folded:
+            title = "File BK đang được sử dụng"
+            retry_label = "Thử lại"
+        elif "thay đổi" in folded:
+            title = "File BK đã thay đổi"
+            retry_label = "Đọc lại"
+        elif "hàng ngày" in folded and (
+            "không tìm thấy" in folded or "không thể đọc" in folded
+        ):
+            title = "Không thể đọc file Hàng ngày"
+            retry_label = "Thử lại"
+        elif "quyền" in folded:
+            title = "Không có quyền ghi BK"
+            retry_label = None
+        else:
+            title = "Không thể xử lý workbook"
+            retry_label = None
+        LOGGER.error("%s: %s", title, text)
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Icon.Critical)
+        message.setWindowTitle(title)
+        message.setText(f"{text}\n\nFile BK gốc không bị thay đổi.")
+        retry_button = None
+        if retry_label is not None:
+            retry_button = message.addButton(
+                retry_label, QMessageBox.ButtonRole.AcceptRole
+            )
+            message.addButton("Hủy", QMessageBox.ButtonRole.RejectRole)
+        elif title == "Không có JSON đã xác nhận":
+            review_button = message.addButton(
+                "Quay lại Bước 2", QMessageBox.ButtonRole.AcceptRole
+            )
+            message.addButton("Đóng", QMessageBox.ButtonRole.RejectRole)
+        else:
+            review_button = None
+            message.addButton("Đóng", QMessageBox.ButtonRole.RejectRole)
+        message.exec()
+        if retry_button is not None and message.clickedButton() is retry_button:
+            try:
+                retry_operation = (
+                    self._excel_tasks.normalize_operation(operation)
+                    if self._excel_tasks is not None
+                    else operation
+                )
+            except Exception:
+                retry_operation = operation
+            if retry_operation == "sync":
+                QTimer.singleShot(0, self.start_daily_sync)
+            elif retry_operation == "posting":
+                QTimer.singleShot(0, self.start_expense_posting)
+        elif (
+            title == "Không có JSON đã xác nhận"
+            and review_button is not None
+            and message.clickedButton() is review_button
+        ):
+            self.navigation.setCurrentRow(0)
+            if self._active_batch is not None:
+                self.open_review(self._active_batch)
+
+    def _load_excel_history(self) -> None:
+        repository = self._excel_run_repository
+        if repository is None:
+            return
+        for operation, ui_operation in (
+            ("DAILY_SYNC", "sync"),
+            ("EXPENSE_POSTING", "posting"),
+        ):
+            try:
+                record = repository.get_latest(
+                    operation=operation,
+                    statuses=("SUCCEEDED", "NO_CHANGES"),
+                )
+            except Exception:
+                LOGGER.exception("Không đọc được lịch sử %s.", operation)
+                continue
+            if record is None:
+                continue
+            timestamp = _attribute(record, "completed_at", "started_at", default="")
+            try:
+                from datetime import datetime
+
+                parsed = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+                timestamp_text = parsed.strftime("%d/%m/%Y %H:%M")
+            except (TypeError, ValueError):
+                timestamp_text = str(timestamp)
+            if ui_operation == "sync":
+                summary = (
+                    f"{timestamp_text} – thêm "
+                    f"{_attribute(record, 'changed_items', default=0)} dòng vào "
+                    f"{_attribute(record, 'sheet_name', default='—')}"
+                )
+            else:
+                summary = (
+                    f"{timestamp_text} – nhập "
+                    f"{_attribute(record, 'changed_items', default=0)} khoản, bỏ qua "
+                    f"{_attribute(record, 'skipped_items', default=0)}"
+                )
+            self.workflow_page.set_excel_result(ui_operation, summary)
+
     @Slot(object)
     def check_settings(self, settings_data: Mapping[str, Any]) -> None:
         launcher = self._assistant_launcher
@@ -354,8 +748,37 @@ class MainWindow(QMainWindow):
                 settings_data.get("assistant_bat_path"),
                 settings_data.get("output_dir"),
             )
-            self.settings_page.show_check_result(True, "Cấu hình hợp lệ.")
         except Exception as exc:
+            self.settings_page.show_check_result(False, str(exc))
+            return
+
+        daily = str(settings_data.get("daily_workbook_path") or "").strip()
+        bk = str(settings_data.get("bk_workbook_path") or "").strip()
+        if not daily or not bk:
+            self.settings_page.show_check_result(
+                False,
+                "Cấu hình Trợ lý hợp lệ, nhưng chưa chọn đủ file Hàng ngày và file BK.",
+            )
+            return
+        if self._excel_tasks is None:
+            self.settings_page.show_check_result(
+                False, "Dịch vụ kiểm tra workbook chưa được khởi tạo."
+            )
+            return
+        try:
+            from app.services.excel import ExcelConfigurationService
+
+            candidate_settings = self._build_settings(settings_data)
+            service = ExcelConfigurationService(candidate_settings)
+            self._excel_context = "configuration"
+            self.settings_page.check_button.setEnabled(False)
+            self._excel_tasks.submit(
+                "sync",
+                service.validate,
+                with_progress=True,
+            )
+        except Exception as exc:
+            self._excel_context = None
             self.settings_page.show_check_result(False, str(exc))
 
     def _launch_assistant(self, settings: Any) -> None:
@@ -487,6 +910,21 @@ class MainWindow(QMainWindow):
                 ),
                 8000,
             )
+        if automatic and not duplicate and review is not None:
+            self._open_new_download(review)
+
+    def _open_new_download(self, review: Any) -> None:
+        """Bỏ cửa sổ cũ và đưa dữ liệu vừa tải lên màn hình kiểm tra."""
+
+        for window in list(self._review_windows.values()):
+            window.model.mark_clean()
+            window.close()
+        self._review_windows.clear()
+        self.navigation.setCurrentRow(0)
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        self.open_review(review)
 
     @Slot(object)
     def open_review(self, batch: Any = None) -> ReviewWindow | None:

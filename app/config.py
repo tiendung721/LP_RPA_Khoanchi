@@ -45,6 +45,10 @@ class AppPaths:
     workspace_dir: Path
     ready_dir: Path
     rejected_dir: Path
+    excel_dir: Path
+    excel_temp_dir: Path
+    excel_backup_dir: Path
+    excel_reports_dir: Path
     database_dir: Path
     database_path: Path
     logs_dir: Path
@@ -62,6 +66,7 @@ class AppPaths:
         database_dir = root / "Database"
         logs_dir = root / "Logs"
         system_dir = output / "_system"
+        excel_dir = system_dir / "Excel"
         return cls(
             data_root=root,
             config_dir=config_dir,
@@ -72,6 +77,10 @@ class AppPaths:
             workspace_dir=system_dir / "Workspace",
             ready_dir=system_dir / "Ready",
             rejected_dir=system_dir / "Rejected",
+            excel_dir=excel_dir,
+            excel_temp_dir=excel_dir / "Temp",
+            excel_backup_dir=excel_dir / "Backup",
+            excel_reports_dir=excel_dir / "Reports",
             database_dir=database_dir,
             database_path=database_dir / "app_state.db",
             logs_dir=logs_dir,
@@ -93,10 +102,10 @@ class AppPaths:
             self.config_dir,
             self.output_dir,
             self.system_dir,
-            self.archive_original_dir,
-            self.workspace_dir,
-            self.ready_dir,
-            self.rejected_dir,
+            self.excel_dir,
+            self.excel_temp_dir,
+            self.excel_backup_dir,
+            self.excel_reports_dir,
             self.database_dir,
             self.logs_dir,
         )
@@ -126,6 +135,8 @@ class AppSettings:
     data_root: Path = field(default_factory=default_data_root)
     assistant_bat_path: str = ""
     output_dir: Path = field(default_factory=default_output_dir)
+    daily_workbook_path: str = ""
+    bk_workbook_path: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.data_root, (str, os.PathLike)) or not str(
@@ -136,13 +147,20 @@ class AppSettings:
             self.output_dir
         ).strip():
             raise ValueError("Thư mục Output không được để trống.")
-        if isinstance(self.assistant_bat_path, os.PathLike):
-            self.assistant_bat_path = os.fspath(self.assistant_bat_path)
-        if not isinstance(self.assistant_bat_path, str):
-            raise ValueError("Đường dẫn BAT phải là chuỗi.")
+        optional_paths = (
+            ("assistant_bat_path", "Đường dẫn BAT"),
+            ("daily_workbook_path", "Đường dẫn file Hàng ngày"),
+            ("bk_workbook_path", "Đường dẫn file BK"),
+        )
+        for attribute, label in optional_paths:
+            value = getattr(self, attribute)
+            if isinstance(value, os.PathLike):
+                value = os.fspath(value)
+            if not isinstance(value, str):
+                raise ValueError(f"{label} phải là chuỗi.")
+            setattr(self, attribute, value.strip())
         self.data_root = Path(self.data_root).expanduser()
         self.output_dir = Path(self.output_dir).expanduser()
-        self.assistant_bat_path = self.assistant_bat_path.strip()
 
     @property
     def paths(self) -> AppPaths:
@@ -157,6 +175,8 @@ class AppSettings:
             "data_root": str(self.data_root),
             "assistant_bat_path": self.assistant_bat_path,
             "output_dir": str(self.output_dir),
+            "daily_workbook_path": self.daily_workbook_path,
+            "bk_workbook_path": self.bk_workbook_path,
         }
 
     @classmethod
@@ -171,6 +191,8 @@ class AppSettings:
             data_root=value.get("data_root", fallback.data_root),
             assistant_bat_path=value.get("assistant_bat_path", ""),
             output_dir=value.get("output_dir", fallback.output_dir),
+            daily_workbook_path=value.get("daily_workbook_path", ""),
+            bk_workbook_path=value.get("bk_workbook_path", ""),
         )
 
 

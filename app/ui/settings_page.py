@@ -1,4 +1,4 @@
-"""Trang cấu hình BAT mở Trợ lý ảo và thư mục Output."""
+"""Trang cấu hình BAT, Output và hai workbook dùng cho Bước 3."""
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ class SettingsPage(QWidget):
         title = QLabel("Cài đặt")
         title.setObjectName("pageTitle")
         subtitle = QLabel(
-            "Chọn file BAT mở Trợ lý ảo và thư mục nhận kết quả Output."
+            "Chọn file BAT, thư mục Output và các workbook dùng để xử lý khoản chi."
         )
         subtitle.setProperty("muted", True)
         layout.addWidget(title)
@@ -91,6 +91,42 @@ class SettingsPage(QWidget):
         output_widget = QWidget()
         output_widget.setLayout(output_row)
         form.addRow("Thư mục Output:", output_widget)
+
+        daily_row = QHBoxLayout()
+        self.daily_workbook_edit = QLineEdit()
+        self.daily_workbook_edit.setObjectName("dailyWorkbookEdit")
+        self.daily_workbook_edit.setPlaceholderText(
+            "Chọn file Hàng ngày (.xlsx hoặc .xlsm)"
+        )
+        self.daily_workbook_edit.setClearButtonEnabled(True)
+        self.browse_daily_workbook_button = QPushButton("Chọn…")
+        self.browse_daily_workbook_button.setObjectName("browseDailyWorkbookButton")
+        daily_row.addWidget(self.daily_workbook_edit, 1)
+        daily_row.addWidget(self.browse_daily_workbook_button)
+        daily_widget = QWidget()
+        daily_widget.setLayout(daily_row)
+        form.addRow("File Hàng ngày:", daily_widget)
+
+        bk_row = QHBoxLayout()
+        self.bk_workbook_edit = QLineEdit()
+        self.bk_workbook_edit.setObjectName("bkWorkbookEdit")
+        self.bk_workbook_edit.setPlaceholderText(
+            "Chọn file BK Tổng hợp (.xlsx hoặc .xlsm)"
+        )
+        self.bk_workbook_edit.setClearButtonEnabled(True)
+        self.browse_bk_workbook_button = QPushButton("Chọn…")
+        self.browse_bk_workbook_button.setObjectName("browseBkWorkbookButton")
+        bk_row.addWidget(self.bk_workbook_edit, 1)
+        bk_row.addWidget(self.browse_bk_workbook_button)
+        bk_widget = QWidget()
+        bk_widget.setLayout(bk_row)
+        form.addRow("File BK Tổng hợp:", bk_widget)
+
+        # Các alias giúp phần tích hợp không phụ thuộc hậu tố ``_workbook``.
+        self.daily_edit = self.daily_workbook_edit
+        self.bk_edit = self.bk_workbook_edit
+        self.browse_daily_button = self.browse_daily_workbook_button
+        self.browse_bk_button = self.browse_bk_workbook_button
         card_layout.addLayout(form)
         layout.addWidget(card)
 
@@ -115,6 +151,10 @@ class SettingsPage(QWidget):
     def _connect_signals(self) -> None:
         self.browse_bat_button.clicked.connect(self._browse_bat)
         self.browse_output_button.clicked.connect(self._browse_output)
+        self.browse_daily_workbook_button.clicked.connect(
+            self._browse_daily_workbook
+        )
+        self.browse_bk_workbook_button.clicked.connect(self._browse_bk_workbook)
         self.save_button.clicked.connect(self._request_save)
         self.check_button.clicked.connect(
             lambda: self.check_requested.emit(self.settings_data())
@@ -126,16 +166,26 @@ class SettingsPage(QWidget):
         )
         self.bat_edit.textChanged.connect(self._validate_form)
         self.output_edit.textChanged.connect(self._validate_form)
+        self.daily_workbook_edit.textChanged.connect(self._validate_form)
+        self.bk_workbook_edit.textChanged.connect(self._validate_form)
 
     def set_settings(self, settings: Any | None) -> None:
         self.bat_edit.setText(str(_setting(settings, "assistant_bat_path") or ""))
         self.output_edit.setText(str(_setting(settings, "output_dir") or ""))
+        self.daily_workbook_edit.setText(
+            str(_setting(settings, "daily_workbook_path") or "")
+        )
+        self.bk_workbook_edit.setText(
+            str(_setting(settings, "bk_workbook_path") or "")
+        )
         self._validate_form()
 
     def settings_data(self) -> dict[str, Any]:
         return {
             "assistant_bat_path": self.bat_edit.text().strip(),
             "output_dir": self.output_edit.text().strip(),
+            "daily_workbook_path": self.daily_workbook_edit.text().strip(),
+            "bk_workbook_path": self.bk_workbook_edit.text().strip(),
         }
 
     values = settings_data
@@ -152,6 +202,12 @@ class SettingsPage(QWidget):
             problems.append("Không tìm thấy file BAT đã chọn.")
         if not output_text:
             problems.append("Cần chọn thư mục Output.")
+        for label, path_text in (
+            ("File Hàng ngày", self.daily_workbook_edit.text().strip()),
+            ("File BK Tổng hợp", self.bk_workbook_edit.text().strip()),
+        ):
+            if path_text and Path(path_text).suffix.casefold() not in {".xlsx", ".xlsm"}:
+                problems.append(f"{label} phải có đuôi .xlsx hoặc .xlsm.")
 
         valid = not problems
         self.save_button.setEnabled(valid)
@@ -201,3 +257,25 @@ class SettingsPage(QWidget):
         )
         if directory:
             self.output_edit.setText(directory)
+
+    def _browse_daily_workbook(self) -> None:
+        self._browse_workbook(
+            self.daily_workbook_edit,
+            "Chọn file Hàng ngày",
+        )
+
+    def _browse_bk_workbook(self) -> None:
+        self._browse_workbook(
+            self.bk_workbook_edit,
+            "Chọn file BK Tổng hợp",
+        )
+
+    def _browse_workbook(self, target: QLineEdit, title: str) -> None:
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            title,
+            target.text().strip(),
+            "Workbook Excel (*.xlsx *.xlsm)",
+        )
+        if filename:
+            target.setText(filename)

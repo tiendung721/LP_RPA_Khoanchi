@@ -278,12 +278,8 @@ class HistoryPage(QWidget):
         self.path_button.setText("Mở thư mục chứa")
         self.path_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         menu = QMenu(self.path_button)
-        self.original_action = QAction("Bản gốc (Archive)", self)
-        self.working_action = QAction("Bản làm việc (Workspace)", self)
-        self.ready_action = QAction("Bản đã duyệt (Ready)", self)
-        menu.addAction(self.original_action)
-        menu.addAction(self.working_action)
-        menu.addAction(self.ready_action)
+        self.current_file_action = QAction("File JSON hiện hành", self)
+        menu.addAction(self.current_file_action)
         self.path_button.setMenu(menu)
         actions.addWidget(self.path_button)
         layout.addLayout(actions)
@@ -295,11 +291,9 @@ class HistoryPage(QWidget):
         self.open_batch_button.clicked.connect(self._emit_open_batch)
         self.table.doubleClicked.connect(lambda _index: self._emit_open_batch())
         self.table.selectionModel().selectionChanged.connect(self._update_actions)
-        self.original_action.triggered.connect(
-            lambda: self._emit_open_path("original_archive_path")
+        self.current_file_action.triggered.connect(
+            lambda: self._emit_open_path("source_output_path")
         )
-        self.working_action.triggered.connect(lambda: self._emit_open_path("working_path"))
-        self.ready_action.triggered.connect(lambda: self._emit_open_path("ready_path"))
 
     def set_batches(self, batches: Iterable[Any]) -> None:
         self.model.set_batches(batches)
@@ -336,13 +330,8 @@ class HistoryPage(QWidget):
         batch = self.selected_batch()
         has_selection = batch is not None
         self.open_batch_button.setEnabled(has_selection)
-        self.original_action.setEnabled(
-            has_selection and bool(_field(batch, "original_archive_path"))
+        current_path = _field(batch, "source_output_path")
+        self.current_file_action.setEnabled(
+            has_selection and bool(current_path) and Path(current_path).is_file()
         )
-        self.working_action.setEnabled(has_selection and bool(_field(batch, "working_path")))
-        self.ready_action.setEnabled(has_selection and bool(_field(batch, "ready_path")))
-        self.path_button.setEnabled(
-            self.original_action.isEnabled()
-            or self.working_action.isEnabled()
-            or self.ready_action.isEnabled()
-        )
+        self.path_button.setEnabled(self.current_file_action.isEnabled())

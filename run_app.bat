@@ -41,7 +41,7 @@ if errorlevel 1 goto :venv_invalid
 "%APP_PYTHON%" -c "import hashlib, pathlib, sys; requirement = pathlib.Path(sys.argv[1]); marker = pathlib.Path(sys.argv[2]); digest = hashlib.sha256(requirement.read_bytes()).hexdigest(); raise SystemExit(0 if marker.is_file() and marker.read_text(encoding='ascii').strip() == digest else 1)" "%REQUIREMENTS_FILE%" "%REQUIREMENTS_MARKER%" >nul 2>&1
 if errorlevel 1 goto :install_dependencies
 
-"%APP_PYTHON%" -c "import PySide6, watchdog" >nul 2>&1
+"%APP_PYTHON%" -c "import PySide6, openpyxl, watchdog" >nul 2>&1
 if errorlevel 1 goto :install_dependencies
 goto :verify_dependencies
 
@@ -55,7 +55,7 @@ if errorlevel 1 goto :dependency_error
 :verify_dependencies
 "%APP_PYTHON%" -m pip check >nul
 if errorlevel 1 goto :dependency_error
-"%APP_PYTHON%" -c "import PySide6, watchdog" >nul 2>&1
+"%APP_PYTHON%" -c "import PySide6, openpyxl, watchdog" >nul 2>&1
 if errorlevel 1 goto :dependency_error
 
 echo [3/3] Dang khoi dong ung dung...

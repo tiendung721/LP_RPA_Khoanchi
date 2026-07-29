@@ -15,14 +15,16 @@ Bước 1 hoặc chọn JSON thủ công.
   profile trong bundle để tải thẳng về thư mục `Output`.
 - Theo dõi `ket_qua_boc_tach*.json`, bỏ qua file tải tạm và chờ file ghi ổn
   định.
-- Archive bản tải xuống, tạo working copy, chống trùng bằng SHA-256 và chỉ giữ
-  `Output\ket_qua_boc_tach.json` mới nhất.
+- Mỗi lượt tải thay thế file JSON trước đó và được đặt tên
+  `ket_qua_boc_tach_YYYYMMDD_HHMMSS.json`.
 - Kiểm tra schema và các quy tắc nghiệp vụ hiện có; hỗ trợ xem, thêm, sửa, xóa,
   xem JSON thô, lưu và xác nhận.
 - Bước 2 hiển thị trạng thái file và thời điểm lưu gần nhất theo định dạng
   `HH:mm ngày dd/MM/yyyy`.
-- Snapshot đã xác nhận được lưu trong `Output\_system\Ready` để phục vụ các
-  mô-đun tích hợp sau này.
+- Bước 3 đồng bộ các SQT mới từ workbook Hàng ngày và nhập khoản chi của
+  file JSON hiện hành đã xác nhận vào workbook BK.
+- Mọi lần ghi BK đều dùng backup, working copy, kiểm tra lại và thay file
+  nguyên tử; tác vụ chạy nền để không khóa giao diện.
 
 ## Yêu cầu
 
@@ -73,6 +75,14 @@ Database, Logs và cây dữ liệu nội bộ bên dưới `Output\_system`.
 6. Làm việc trong cửa sổ Trợ lý ảo rồi nhấn tải file kết quả. Ứng dụng sẽ tự
    nhận file; không cần chọn file bằng tay.
 
+Để dùng Bước 3, cấu hình thêm:
+
+- **File Hàng ngày trên LAN** (`.xlsx` hoặc `.xlsm`).
+- **File BK Tổng hợp cá nhân** (`.xlsx` hoặc `.xlsm`).
+
+Nút **Kiểm tra cấu hình** chỉ đọc workbook/bản sao tạm, không lưu thử vào file
+gốc. Định dạng Excel cũ `.xls` không được hỗ trợ.
+
 Ứng dụng không sửa file BAT, PowerShell, extension hay file ZIP. Chỉ Chrome
 `Preferences` trong `RPA_ChatGPT_Profile\Default` được cập nhật để đặt:
 
@@ -120,19 +130,18 @@ Thư mục mặc định là:
 
 Khi có file hoàn chỉnh mới:
 
-1. Bản tải xuống được sao lưu vào `Output\_system\Archive\Original`.
-2. Các file kết quả cũ trong `Output` bị loại bỏ.
-3. File mới được chuẩn hóa thành `ket_qua_boc_tach.json`.
-4. Working copy được tạo và kiểm tra để cập nhật Bước 2.
+1. Các file kết quả JSON cũ trong `Output` bị loại bỏ.
+2. File mới được đặt tên theo timestamp nhận file.
+3. Nội dung được kiểm tra và tự động mở trên màn hình review.
 
 Quy tắc mới nhất luôn thắng. Nếu hai lượt tải chồng nhau, ứng dụng bỏ qua sự
 kiện cũ. Nếu file mới sai schema, file cũ vẫn bị loại bỏ theo quy tắc đã chốt
 và Bước 2 hiển thị nguyên nhân lỗi, không hiển thị lưu thành công.
 
-Khi lưu từ màn hình review, working copy được backup rồi đồng bộ lại file
-canonical trong `Output`. Nếu đang sửa một batch cũ trong lúc có bản tải mới,
-batch cũ chỉ được lưu trong `Output\_system\Workspace` và không được ghi đè
-Output hiện hành.
+Khi lưu từ màn hình review, ứng dụng ghi nguyên tử trực tiếp vào một file JSON
+timestamp mới rồi xóa tên cũ. Không tạo archive, working copy, `.bak` hoặc
+snapshot Ready. Nếu file mới được tải khi cửa sổ cũ còn thay đổi chưa lưu, dữ
+liệu cũ bị bỏ và cửa sổ review chuyển ngay sang dữ liệu mới.
 
 ## Thư mục dữ liệu
 
@@ -144,27 +153,23 @@ khoanchi_pm_project\                 (hoặc thư mục chứa file .exe)
 ├── Database\app_state.db
 ├── Logs\
 └── Output\
-    ├── ket_qua_boc_tach.json
+    ├── ket_qua_boc_tach_YYYYMMDD_HHMMSS.json
     └── _system\
-        ├── Archive\Original\
-        ├── Workspace\
-        ├── Ready\
-        └── Rejected\
+        └── Excel\
+            ├── Temp\
+            ├── Backup\
+            └── Reports\
 ```
 
 Khi cả bundle được chuyển vị trí, ứng dụng tự cập nhật `data_root`, `Output`
 mặc định và các đường dẫn batch trong SQLite sang vị trí mới. Đường dẫn ngoài
 bundle do người dùng tự chọn vẫn được giữ nguyên.
 
-- `Output\ket_qua_boc_tach.json`: kết quả hiện hành được watcher tiếp nhận.
-- `Output\_system\Archive\Original`: bản gốc đã tiếp nhận.
-- `Output\_system\Workspace\<batch_id>`: bản đang chỉnh sửa và backup.
-- `Output\_system\Ready`: snapshot sau khi xác nhận.
-- `Output\_system\Rejected`: bản sao của file không parse được hoặc sai cấu trúc.
+- `Output\ket_qua_boc_tach_YYYYMMDD_HHMMSS.json`: JSON hiện hành duy nhất.
+- `Output\_system\Excel\Temp`: snapshot nguồn và working copy ngắn hạn.
+- `Output\_system\Excel\Backup`: backup BK tạo ngay trước mỗi lần ghi.
+- `Output\_system\Excel\Reports`: vùng dành cho báo cáo xử lý Excel.
 - `Database`: metadata batch và trạng thái ứng dụng.
-
-Không sửa file trong `Output\_system\Archive` hoặc `Output\_system\Ready`
-bằng tay.
 
 ## Chạy kiểm thử
 
@@ -210,4 +215,5 @@ get_ready_json_path(batch_id: int) -> Path | None
 list_ready_batches() -> list[BatchMetadata]
 ```
 
-Path trả về luôn trỏ tới snapshot đã xác nhận trong `Output\_system\Ready`.
+Các tên API cũ được giữ để tương thích, nhưng path trả về trỏ tới file JSON
+hiện hành đã xác nhận trong `Output`.

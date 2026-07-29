@@ -24,12 +24,20 @@ from app.database import Database
 from app.logging_setup import setup_logging
 from app.repositories.batch_repository import BatchRepository
 from app.repositories.batch_repository import local_now_iso
+from app.repositories.excel_run_repository import ExcelRunRepository
+from app.repositories.expense_posting_repository import ExpensePostingRepository
 from app.services.batch_service import BatchService
 from app.services.assistant_bat_launcher import AssistantBatLauncher
+from app.services.excel import (
+    DailySyncService,
+    ExcelConfigurationService,
+    ExpensePostingService,
+)
 from app.services.output_watcher import OutputWatcher
 from app.services.json_codec import JsonCodec
 from app.services.reviewed_batch_provider import ReviewedBatchProvider
 from app.services.validation_service import ValidationService
+from app.ui.excel_task_controller import ExcelTaskController
 
 LOGGER = logging.getLogger(__name__)
 
@@ -81,6 +89,13 @@ class ApplicationRuntime:
             max_file_size_bytes=self.settings.max_file_size_bytes,
         )
         self.reviewed_batch_provider = ReviewedBatchProvider(self.batch_service)
+        self.excel_run_repository = ExcelRunRepository(self.database)
+        self.expense_posting_repository = ExpensePostingRepository(self.database)
+        self._configure_excel_services(self.settings)
+        self.excel_task_controller = ExcelTaskController(
+            daily_sync_service=self.daily_sync_service,
+            expense_posting_service=self.expense_posting_service,
+        )
         self.assistant_launcher = AssistantBatLauncher(self.settings)
         self.launcher = self.assistant_launcher
         self.watcher = OutputWatcher(
@@ -103,6 +118,21 @@ class ApplicationRuntime:
         LOGGER.info("Watcher chuyển file ổn định sang BatchService: %s", path.name)
         return self.batch_service.receive_file(path)
 
+    def _configure_excel_services(self, settings: AppSettings) -> None:
+        """Tạo các service Bước 3 từ cùng settings/repository của runtime."""
+
+        self.daily_sync_service = DailySyncService(
+            settings,
+            run_repository=self.excel_run_repository,
+        )
+        self.expense_posting_service = ExpensePostingService(
+            self.reviewed_batch_provider,
+            settings,
+            run_repository=self.excel_run_repository,
+            posting_repository=self.expense_posting_repository,
+        )
+        self.excel_configuration_service = ExcelConfigurationService(settings)
+
     def apply_settings(self, settings: AppSettings) -> AppSettings:
         """Lưu cấu hình và cập nhật các service không cần tái tạo database."""
 
@@ -115,6 +145,9 @@ class ApplicationRuntime:
                 "Không thể đổi data_root khi ứng dụng đang chạy. "
                 "Hãy đóng ứng dụng và khởi động lại với --data-root."
             )
+        task_controller = getattr(self, "excel_task_controller", None)
+        if task_controller is not None and task_controller.is_busy:
+            raise ValueError("Không thể đổi cấu hình khi tác vụ Excel đang chạy.")
         new_paths.ensure_directories()
         self.config_manager.save(settings)
         self.settings = settings
@@ -122,6 +155,12 @@ class ApplicationRuntime:
         self.batch_service.update_paths(new_paths)
         self.batch_service.max_file_size_bytes = settings.max_file_size_bytes
         self.assistant_launcher.update_settings(settings)
+        self._configure_excel_services(settings)
+        if task_controller is not None:
+            task_controller.update_services(
+                daily_sync_service=self.daily_sync_service,
+                expense_posting_service=self.expense_posting_service,
+            )
         LOGGER.info(
             "Đã áp dụng cấu hình; bat=%s, output=%s",
             settings.assistant_bat_path,
@@ -174,6 +213,10 @@ class ApplicationRuntime:
             self.watcher.stop()
         except Exception:
             LOGGER.exception("Không thể dừng watcher sạch")
+        try:
+            self.excel_task_controller.shutdown(wait=True)
+        except Exception:
+            LOGGER.exception("Không thể dừng worker Excel sạch")
         try:
             self.database.close()
         except Exception:

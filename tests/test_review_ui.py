@@ -53,13 +53,18 @@ def test_delete_selected_row_requires_confirmation(qtbot, monkeypatch) -> None:
         window.close()
 
 
-def test_ctrl_s_saves_working_document_and_clears_dirty(qtbot) -> None:
+def test_ctrl_s_saves_once_and_clears_dirty(qtbot, monkeypatch) -> None:
     calls: list[tuple[int, Any]] = []
 
-    def save(batch_id: int, document: Any) -> None:
+    def confirm(batch_id: int, document: Any) -> None:
         calls.append((batch_id, document))
 
-    window = ReviewWindow(_review_payload(), save_handler=save)
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Ok,
+    )
+    window = ReviewWindow(_review_payload(), confirm_handler=confirm)
     qtbot.addWidget(window)
     window.show()
     window.model.update_row(
@@ -192,26 +197,26 @@ def test_add_dialog_keeps_rule_selector(qtbot) -> None:
         dialog.close()
 
 
-def test_combined_button_saves_and_confirms_dirty_document(
+def test_save_button_writes_once_and_shows_simple_success_message(
     qtbot, monkeypatch
 ) -> None:
-    saved: list[tuple[int, Any]] = []
     confirmed: list[tuple[int, Any]] = []
-
-    def save(batch_id: int, document: Any) -> None:
-        saved.append((batch_id, document))
+    messages: list[tuple[str, str]] = []
 
     def confirm(batch_id: int, document: Any) -> None:
         confirmed.append((batch_id, document))
 
+    def information(*args: Any, **kwargs: Any) -> QMessageBox.StandardButton:
+        messages.append((str(args[1]), str(args[2])))
+        return QMessageBox.StandardButton.Ok
+
     monkeypatch.setattr(
         QMessageBox,
         "information",
-        lambda *args, **kwargs: QMessageBox.StandardButton.Ok,
+        information,
     )
     window = ReviewWindow(
         _review_payload(),
-        save_handler=save,
         confirm_handler=confirm,
     )
     qtbot.addWidget(window)
@@ -222,15 +227,15 @@ def test_combined_button_saves_and_confirms_dirty_document(
     window.show()
 
     try:
-        assert window.confirm_button.text() == "Lưu và xác nhận hoàn tất"
+        assert window.confirm_button.text() == "Lưu"
         assert not hasattr(window, "save_button")
 
         qtbot.mouseClick(window.confirm_button, Qt.MouseButton.LeftButton)
 
-        assert saved[0][0] == 7
-        assert saved[0][1].rows[0].amount == 13_554_001
+        assert len(confirmed) == 1
         assert confirmed[0][0] == 7
         assert confirmed[0][1].rows[0].amount == 13_554_001
+        assert messages == [("Lưu thành công", "Đã lưu thành công.")]
         assert window.status_value.text() == "Đã xác nhận"
         assert not window.model.dirty
     finally:

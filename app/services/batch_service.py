@@ -1,20 +1,18 @@
-"""Điều phối tiếp nhận, chống trùng, archive, working copy và snapshot Ready."""
+"""Điều phối một file JSON hiện hành duy nhất trong thư mục Output."""
 
 from __future__ import annotations
 
 import logging
 import os
-import re
 import shutil
 import sqlite3
 import stat
-import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
 from app.config import AppPaths, AppSettings
-from app.constants import CANONICAL_JSON_FILENAME, DEFAULT_MAX_FILE_SIZE_BYTES
+from app.constants import DEFAULT_MAX_FILE_SIZE_BYTES
 from app.database import Database
 from app.models import (
     BatchDocument,
@@ -32,7 +30,6 @@ from app.services.json_codec import JsonCodec, JsonCodecError
 from app.services.validation_service import ValidationService
 
 LOGGER = logging.getLogger(__name__)
-_UNSAFE_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
 class BatchServiceError(RuntimeError):
@@ -52,10 +49,6 @@ class BatchValidationError(BatchServiceError):
         super().__init__(message)
         self.validation = validation
         self.first_error_row = validation.first_error_row
-
-
-class SourceFileChangedError(BatchServiceError):
-    """File nguồn thay đổi sau lúc tính hash."""
 
 
 def calculate_sha256(path: str | Path) -> str:
@@ -90,6 +83,7 @@ class BatchService:
 
         actual_paths.ensure_directories()
         self.paths = actual_paths
+        self._cleanup_legacy_json_storage()
         self._owns_repository = actual_repository is None
         self.repository = actual_repository or BatchRepository(
             Database(actual_paths.database_path)
@@ -119,6 +113,7 @@ class BatchService:
             self.paths.output_dir
         )
         self.paths = paths
+        self._cleanup_legacy_json_storage()
         if output_changed:
             self._current_output_batch_id = self._find_current_output_batch_id()
             self.repository.set_active_batch_id(self._current_output_batch_id)
@@ -142,7 +137,7 @@ class BatchService:
         return AppPaths.from_data_root(value)
 
     def receive_file(self, path: str | Path) -> ReceiveResult:
-        """Tiếp nhận file ổn định từ Output và giữ bản gốc trong Archive."""
+        """Tiếp nhận file ổn định và thay thế JSON hiện hành trong Output."""
 
         source = Path(path)
         LOGGER.info("Bắt đầu tiếp nhận file: %s", source.name)
@@ -172,134 +167,94 @@ class BatchService:
         except OSError as exc:
             raise BatchServiceError("Không thể đọc file để tính SHA-256.") from exc
         LOGGER.info("SHA-256 file %s: %s", source.name, sha256)
-        duplicate = self.repository.get_by_sha256(sha256)
-        if duplicate is not None:
-            canonical_source = self._promote_output_file(source)
-            duplicate = self.repository.update_batch(
-                duplicate.id,
-                source_filename=canonical_source.name,
-                source_output_path=canonical_source,
-            )
-            self._current_output_batch_id = duplicate.id
-            LOGGER.info(
-                "File trùng SHA-256 với batch %s; không tạo batch mới",
-                duplicate.id,
-            )
+        current = self.get_current_output_batch()
+        if (
+            current is not None
+            and current.source_output_path is not None
+            and self._path_key(current.source_output_path) == self._path_key(source)
+        ):
+            LOGGER.info("Bỏ qua sự kiện lặp của JSON hiện hành: %s", source.name)
             return ReceiveResult(
-                batch=duplicate,
+                batch=current,
                 duplicate=True,
-                message="File này đã được tiếp nhận trước đó.",
+                message="File hiện hành không thay đổi.",
             )
 
         received_at = local_now_iso()
-        placeholder = self.paths.workspace_dir / ".pending"
+        output_path = self._promote_output_file(source, received_at)
+        duplicate = self.repository.get_by_sha256(sha256)
         try:
-            batch = self.repository.create_batch(
-                source_filename=source.name,
-                source_output_path=source,
-                original_archive_path=self.paths.archive_original_dir / ".pending",
-                working_path=placeholder,
-                sha256=sha256,
+            if duplicate is None:
+                batch = self.repository.create_batch(
+                    source_filename=output_path.name,
+                    source_output_path=output_path,
+                    original_archive_path=output_path,
+                    working_path=output_path,
+                    sha256=sha256,
+                    status=BatchStatus.RECEIVED,
+                    received_at=received_at,
+                )
+            else:
+                batch = self.repository.update_batch(
+                    duplicate.id,
+                    source_filename=output_path.name,
+                    source_output_path=output_path,
+                    original_archive_path=output_path,
+                    working_path=output_path,
+                    ready_path=None,
+                    status=BatchStatus.RECEIVED,
+                    received_at=received_at,
+                    last_opened_at=None,
+                    last_saved_at=None,
+                    confirmed_at=None,
+                    row_count=0,
+                    valid_count=0,
+                    warning_count=0,
+                    error_count=0,
+                    total_amount=0,
+                    last_error=None,
+                )
+        except sqlite3.IntegrityError:
+            # Hai event có thể đồng thời vượt qua bước tra SHA-256.
+            existing = self.repository.get_by_sha256(sha256)
+            if existing is None:
+                raise BatchServiceError("Không thể tạo metadata cho file JSON.")
+            batch = self.repository.update_batch(
+                existing.id,
+                source_filename=output_path.name,
+                source_output_path=output_path,
+                original_archive_path=output_path,
+                working_path=output_path,
+                ready_path=None,
                 status=BatchStatus.RECEIVED,
                 received_at=received_at,
-            )
-        except sqlite3.IntegrityError:
-            # Hai event watchdog có thể đồng thời vượt qua kiểm tra trên.
-            duplicate = self.repository.get_by_sha256(sha256)
-            if duplicate is None:
-                raise BatchServiceError("Không thể tạo metadata cho file JSON.")
-            return ReceiveResult(
-                batch=duplicate,
-                duplicate=True,
-                message="File này đã được tiếp nhận trước đó.",
+                last_opened_at=None,
+                last_saved_at=None,
+                confirmed_at=None,
+                last_error=None,
             )
 
-        timestamp = self._filename_timestamp(received_at)
-        safe_source_name = self._safe_filename(source.name)
-        archive_path = (
-            self.paths.archive_original_dir
-            / f"{batch.id}__{timestamp}__{safe_source_name}"
-        )
-        workspace_batch_dir = self.paths.workspace_dir / str(batch.id)
-        working_path = workspace_batch_dir / CANONICAL_JSON_FILENAME
-        workspace_batch_dir.mkdir(parents=True, exist_ok=True)
-
+        self._current_output_batch_id = batch.id
         try:
-            self._copy_file_atomic(source, archive_path)
-            archived_hash = calculate_sha256(archive_path)
-            if archived_hash != sha256:
-                raise SourceFileChangedError(
-                    "File nguồn đã thay đổi trong lúc tiếp nhận; vui lòng thử lại."
-                )
-            self._copy_file_atomic(archive_path, working_path)
-            self._make_writable(working_path)
-            self._mark_read_only(archive_path)
-            batch = self.repository.update_batch(
-                batch.id,
-                source_filename=CANONICAL_JSON_FILENAME,
-                source_output_path=self._promote_output_file(source),
-                original_archive_path=archive_path,
-                working_path=working_path,
-            )
-            self._current_output_batch_id = batch.id
-            LOGGER.info(
-                "Đã tạo archive %s và working copy %s",
-                archive_path,
-                working_path,
-            )
-        except Exception as exc:
-            LOGGER.exception("Không thể tạo archive/working cho batch %s", batch.id)
-            if archive_path.is_file():
-                self._mark_read_only(archive_path)
-            metadata = self.repository.update_batch(
-                batch.id,
-                status=BatchStatus.INVALID,
-                original_archive_path=archive_path,
-                working_path=working_path,
-                error_count=1,
-                last_error=str(exc),
-            )
-            return ReceiveResult(
-                batch=metadata,
-                duplicate=False,
-                message=(
-                    "Không thể sao lưu file nguồn an toàn. "
-                    "Vui lòng kiểm tra quyền ghi thư mục dữ liệu."
-                ),
-            )
-
-        try:
-            document = self.codec.load(working_path)
+            document = self.codec.load(output_path)
         except JsonCodecError as exc:
             LOGGER.warning("Batch %s không parse/schema được: %s", batch.id, exc)
-            rejected_path = (
-                self.paths.rejected_dir
-                / f"{batch.id}__{timestamp}__{safe_source_name}"
-            )
-            try:
-                self._copy_file_atomic(archive_path, rejected_path)
-                self._mark_read_only(rejected_path)
-            except OSError:
-                LOGGER.exception("Không thể tạo bản Rejected cho batch %s", batch.id)
             metadata = self.repository.update_batch(
                 batch.id,
                 status=BatchStatus.INVALID,
                 error_count=1,
                 last_error=str(exc),
             )
+            self.repository.set_active_batch_id(batch.id)
             return ReceiveResult(
                 batch=metadata,
                 duplicate=False,
-                message=(
-                    "File JSON không đọc được hoặc sai cấu trúc gốc. "
-                    "Vui lòng kiểm tra file trong mục Lịch sử."
-                ),
+                message="File JSON không đọc được hoặc sai cấu trúc gốc.",
             )
 
         validation = self.validation_service.validate_document(document)
         batch = self.repository.update_batch(
             batch.id,
-            last_saved_at=local_now_iso(),
             row_count=validation.summary.total_rows,
             valid_count=validation.summary.valid_count,
             warning_count=validation.summary.warning_count,
@@ -371,21 +326,9 @@ class BatchService:
         | dict[str, Any]
         | Iterable[DataRow | Sequence[Any]],
     ) -> BatchReview:
-        metadata = self._require_batch(batch_id)
+        metadata = self._require_current_batch(batch_id)
         normalized = coerce_document(document)
-        try:
-            self.codec.dump_atomic(
-                metadata.working_path,
-                normalized,
-                create_backup=True,
-                validate=True,
-            )
-            reloaded = self.codec.load(metadata.working_path)
-        except (JsonCodecError, OSError) as exc:
-            LOGGER.exception("Không thể lưu working file batch %s", batch_id)
-            raise BatchDataError(
-                "Không thể lưu bản đang chỉnh sửa an toàn."
-            ) from exc
+        output_path, reloaded = self._write_current_document(metadata, normalized)
         revalidation = self.validation_service.validate_document(reloaded)
         metadata = self.repository.mark_saved(
             batch_id,
@@ -393,10 +336,16 @@ class BatchService:
             status=BatchStatus.REVIEWING,
             error_count=revalidation.error_count,
         )
-        if batch_id == self._current_output_batch_id:
-            self.repository.set_active_batch_id(batch_id)
-        self._sync_active_batch_to_output(batch_id, metadata.working_path)
-        LOGGER.info("Đã lưu working file batch %s bằng phép ghi nguyên tử", batch_id)
+        metadata = self.repository.update_batch(
+            batch_id,
+            source_filename=output_path.name,
+            source_output_path=output_path,
+            original_archive_path=output_path,
+            working_path=output_path,
+            ready_path=None,
+        )
+        self.repository.set_active_batch_id(batch_id)
+        LOGGER.info("Đã lưu JSON hiện hành của batch %s", batch_id)
         return BatchReview(metadata, reloaded, revalidation)
 
     save_working_copy = save_working
@@ -410,53 +359,48 @@ class BatchService:
         | Iterable[DataRow | Sequence[Any]]
         | None = None,
     ) -> BatchReview:
-        if document is None:
-            loaded = self.load_batch(batch_id)
-            document_to_save = loaded.document
-        else:
-            document_to_save = coerce_document(document)
-
-        saved = self.save_working(batch_id, document_to_save)
-        if saved.validation.has_errors:
+        metadata = self._require_current_batch(batch_id)
+        document_to_save = (
+            self.codec.load(metadata.working_path)
+            if document is None
+            else coerce_document(document)
+        )
+        validation = self.validation_service.validate_document(document_to_save)
+        if validation.has_errors:
             raise BatchValidationError(
                 "Không thể xác nhận vì lô vẫn còn lỗi chặn.",
-                saved.validation,
+                validation,
             )
-
-        ready_path = self._new_ready_path(batch_id)
-        try:
-            self.codec.dump_atomic(
-                ready_path,
-                saved.document,
-                create_backup=False,
-                validate=True,
+        output_path, reloaded = self._write_current_document(
+            metadata, document_to_save
+        )
+        revalidation = self.validation_service.validate_document(reloaded)
+        if revalidation.has_errors:
+            raise BatchValidationError(
+                "Dữ liệu đọc lại vẫn còn lỗi chặn.",
+                revalidation,
             )
-            ready_validation = self.validation_service.validate_document(
-                self.codec.load(ready_path)
-            )
-            if ready_validation.has_errors:
-                raise BatchValidationError(
-                    "Snapshot Ready không vượt qua kiểm tra đọc lại.",
-                    ready_validation,
-                )
-            self._mark_read_only(ready_path)
-            metadata = self.repository.mark_ready(
-                batch_id,
-                ready_path,
-                ready_validation.summary,
-            )
-        except Exception:
-            LOGGER.exception("Không thể tạo snapshot Ready cho batch %s", batch_id)
-            # File vừa tạo chưa được công bố trong database; dọn orphan nếu có.
-            try:
-                self._make_writable(ready_path)
-                ready_path.unlink(missing_ok=True)
-            except OSError:
-                LOGGER.exception("Không thể dọn snapshot Ready chưa hoàn tất")
-            raise
-
-        LOGGER.info("Đã xác nhận batch %s tại %s", batch_id, ready_path)
-        return BatchReview(metadata, saved.document, ready_validation)
+        timestamp = local_now_iso()
+        metadata = self.repository.update_batch(
+            batch_id,
+            source_filename=output_path.name,
+            source_output_path=output_path,
+            original_archive_path=output_path,
+            working_path=output_path,
+            ready_path=output_path,
+            status=BatchStatus.READY,
+            last_saved_at=timestamp,
+            confirmed_at=timestamp,
+            row_count=revalidation.summary.total_rows,
+            valid_count=revalidation.summary.valid_count,
+            warning_count=revalidation.summary.warning_count,
+            error_count=revalidation.error_count,
+            total_amount=revalidation.summary.total_amount,
+            last_error=None,
+        )
+        self.repository.set_active_batch_id(batch_id)
+        LOGGER.info("Đã lưu và xác nhận JSON hiện hành của batch %s", batch_id)
+        return BatchReview(metadata, reloaded, revalidation)
 
     confirm = confirm_batch
     finalize_batch = confirm_batch
@@ -531,8 +475,7 @@ class BatchService:
             self.repository.database.close()
 
     def _activate_if_appropriate(self, new_batch: BatchMetadata) -> None:
-        # File Output mới luôn là phiên bản hiện hành. Cửa sổ review cũ vẫn giữ
-        # working copy riêng và không được đồng bộ ngược ra Output.
+        # File tải mới luôn là phiên bản duy nhất được phép tiếp tục chỉnh sửa.
         self.repository.set_active_batch_id(new_batch.id)
 
     def _require_batch(self, batch_id: int) -> BatchMetadata:
@@ -540,24 +483,6 @@ class BatchService:
         if metadata is None:
             raise BatchNotFoundError(f"Không tìm thấy batch {batch_id}.")
         return metadata
-
-    def _new_ready_path(self, batch_id: int) -> Path:
-        timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
-        candidate = (
-            self.paths.ready_dir
-            / f"{batch_id}__{timestamp}__{CANONICAL_JSON_FILENAME}"
-        )
-        counter = 1
-        while candidate.exists():
-            candidate = (
-                self.paths.ready_dir
-                / (
-                    f"{batch_id}__{timestamp}_{counter:02d}"
-                    f"__{CANONICAL_JSON_FILENAME}"
-                )
-            )
-            counter += 1
-        return candidate
 
     @staticmethod
     def _filename_timestamp(iso_value: str) -> str:
@@ -567,13 +492,8 @@ class BatchService:
             parsed = datetime.now().astimezone()
         return parsed.strftime("%Y%m%d_%H%M%S")
 
-    @staticmethod
-    def _safe_filename(filename: str) -> str:
-        safe = _UNSAFE_FILENAME_RE.sub("_", Path(filename).name).strip(" .")
-        return safe or CANONICAL_JSON_FILENAME
-
-    def _promote_output_file(self, source: Path) -> Path:
-        """Chỉ giữ candidate mới và chuẩn hóa tên trong thư mục Output."""
+    def _promote_output_file(self, source: Path, received_at: str) -> Path:
+        """Chỉ giữ candidate mới và đặt tên theo timestamp tiếp nhận."""
 
         try:
             in_output = source.resolve().parent == self.paths.output_dir.resolve()
@@ -582,7 +502,7 @@ class BatchService:
         if not in_output:
             return source
 
-        canonical = self.paths.output_dir / CANONICAL_JSON_FILENAME
+        target = self._timestamped_output_path(received_at)
         for candidate in self.paths.output_dir.glob("ket_qua_boc_tach*.json"):
             try:
                 same_as_source = candidate.resolve() == source.resolve()
@@ -598,26 +518,41 @@ class BatchService:
                     f"Không thể xóa file Output cũ đang bị khóa: {candidate.name}"
                 ) from exc
 
-        if source != canonical:
+        if source != target:
             try:
-                os.replace(source, canonical)
+                os.replace(source, target)
             except OSError as exc:
                 raise BatchServiceError(
-                    f"Không thể chuẩn hóa file Output thành {CANONICAL_JSON_FILENAME}."
+                    f"Không thể đổi tên file Output thành {target.name}."
                 ) from exc
-        self._notify_output_written(canonical)
-        return canonical
+        self._notify_output_written(target)
+        return target
 
     def _find_current_output_batch_id(self) -> int | None:
-        canonical = self.paths.output_dir / CANONICAL_JSON_FILENAME
+        candidates = [
+            path
+            for path in self.paths.output_dir.glob("ket_qua_boc_tach*.json")
+            if path.is_file()
+        ]
+        if not candidates:
+            return None
+        current_path = max(
+            candidates,
+            key=lambda path: (path.stat().st_mtime_ns, path.name.casefold()),
+        )
+        for metadata in self.repository.list_batches():
+            source_path = metadata.source_output_path
+            if (
+                source_path is not None
+                and self._path_key(source_path) == self._path_key(current_path)
+            ):
+                return metadata.id
         try:
-            if not canonical.is_file():
-                return None
-            sha256 = calculate_sha256(canonical)
+            sha256 = calculate_sha256(current_path)
         except OSError:
             LOGGER.warning(
                 "Không thể nhận diện batch tương ứng với Output hiện hành: %s",
-                canonical,
+                current_path,
             )
             return None
         metadata = self.repository.get_by_sha256(sha256)
@@ -649,21 +584,80 @@ class BatchService:
             return True
         return self._path_key(latest) == self._path_key(source)
 
-    def _sync_active_batch_to_output(self, batch_id: int, working_path: Path) -> None:
+    def _require_current_batch(self, batch_id: int) -> BatchMetadata:
+        metadata = self._require_batch(batch_id)
         if self._current_output_batch_id != batch_id:
-            LOGGER.info(
-                "Batch %s không còn là Output hiện hành; chỉ lưu working copy.",
-                batch_id,
+            raise BatchDataError(
+                "Batch này đã bị file tải mới thay thế và không còn dữ liệu để lưu."
             )
-            return
-        output_path = self.paths.output_dir / CANONICAL_JSON_FILENAME
-        self._copy_file_atomic(working_path, output_path)
+        if not metadata.working_path.is_file():
+            raise BatchDataError("File JSON hiện hành không còn tồn tại.")
+        return metadata
+
+    def _write_current_document(
+        self,
+        metadata: BatchMetadata,
+        document: BatchDocument,
+    ) -> tuple[Path, BatchDocument]:
+        old_path = metadata.working_path
+        timestamp = local_now_iso()
+        output_path = self._timestamped_output_path(timestamp)
+        try:
+            self.codec.dump_atomic(
+                output_path,
+                document,
+                create_backup=False,
+                validate=True,
+            )
+            reloaded = self.codec.load(output_path)
+            if self._path_key(old_path) != self._path_key(output_path):
+                self._make_writable(old_path)
+                old_path.unlink(missing_ok=True)
+            self._remove_other_output_json(output_path)
+        except (JsonCodecError, OSError) as exc:
+            LOGGER.exception("Không thể ghi JSON hiện hành: %s", output_path)
+            raise BatchDataError("Không thể lưu dữ liệu JSON.") from exc
         self._notify_output_written(output_path)
-        self.repository.update_batch(
-            batch_id,
-            source_filename=CANONICAL_JSON_FILENAME,
-            source_output_path=output_path,
-        )
+        return output_path, reloaded
+
+    def _timestamped_output_path(self, iso_value: str) -> Path:
+        timestamp = self._filename_timestamp(iso_value)
+        return self.paths.output_dir / f"ket_qua_boc_tach_{timestamp}.json"
+
+    def _remove_other_output_json(self, keep: Path) -> None:
+        for candidate in self.paths.output_dir.glob("ket_qua_boc_tach*.json"):
+            if self._path_key(candidate) == self._path_key(keep):
+                continue
+            self._make_writable(candidate)
+            candidate.unlink(missing_ok=True)
+
+    def _cleanup_legacy_json_storage(self) -> None:
+        for legacy_dir in (
+            self.paths.system_dir / "Archive",
+            self.paths.workspace_dir,
+            self.paths.ready_dir,
+            self.paths.rejected_dir,
+        ):
+            if not legacy_dir.exists():
+                continue
+            try:
+                shutil.rmtree(legacy_dir, onerror=self._remove_readonly)
+                LOGGER.info("Đã xóa vùng lưu JSON cũ: %s", legacy_dir)
+            except OSError:
+                LOGGER.exception("Không thể xóa vùng lưu JSON cũ: %s", legacy_dir)
+        for backup in self.paths.output_dir.glob("ket_qua_boc_tach*.json.bak"):
+            try:
+                self._make_writable(backup)
+                backup.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.exception("Không thể xóa backup JSON cũ: %s", backup)
+
+    @staticmethod
+    def _remove_readonly(
+        function: Callable[[str], None], path: str, _exc: object
+    ) -> None:
+        os.chmod(path, stat.S_IWRITE)
+        function(path)
 
     def _notify_output_written(self, path: Path) -> None:
         callback = self._output_write_callback
@@ -676,44 +670,6 @@ class BatchService:
     @staticmethod
     def _path_key(path: str | Path) -> str:
         return os.path.normcase(os.path.abspath(os.fspath(path)))
-
-    @staticmethod
-    def _copy_file_atomic(source: Path, target: Path) -> None:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temp_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="wb",
-                prefix=f".{target.name}.",
-                suffix=".tmp",
-                dir=target.parent,
-                delete=False,
-            ) as target_handle:
-                temp_path = Path(target_handle.name)
-                with source.open("rb") as source_handle:
-                    shutil.copyfileobj(
-                        source_handle,
-                        target_handle,
-                        length=1024 * 1024,
-                    )
-                target_handle.flush()
-                os.fsync(target_handle.fileno())
-            try:
-                shutil.copystat(source, temp_path)
-            except OSError:
-                LOGGER.debug("Không sao chép được metadata file %s", source)
-            os.replace(temp_path, target)
-            temp_path = None
-        finally:
-            if temp_path is not None:
-                temp_path.unlink(missing_ok=True)
-
-    @staticmethod
-    def _mark_read_only(path: Path) -> None:
-        try:
-            path.chmod(path.stat().st_mode & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
-        except OSError:
-            LOGGER.warning("Không thể đánh dấu chỉ đọc cho %s", path)
 
     @staticmethod
     def _make_writable(path: Path) -> None:

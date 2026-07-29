@@ -73,6 +73,10 @@ class Database:
                 self._migration_2(connection)
                 connection.execute("PRAGMA user_version = 2")
                 current_version = 2
+            if current_version < 3:
+                self._migration_3(connection)
+                connection.execute("PRAGMA user_version = 3")
+                current_version = 3
             if current_version != SQLITE_SCHEMA_VERSION:
                 raise DatabaseError("Không thể nâng cấp database đến phiên bản hiện tại.")
 
@@ -146,6 +150,89 @@ class Database:
             """
         )
         connection.execute("DELETE FROM app_state WHERE key = 'last_inbox_scan_at'")
+
+    @staticmethod
+    def _migration_3(connection: sqlite3.Connection) -> None:
+        statements = (
+            """
+            CREATE TABLE IF NOT EXISTS excel_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operation TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                source_path TEXT,
+                target_path TEXT,
+                source_fingerprint TEXT,
+                target_fingerprint_before TEXT,
+                target_fingerprint_after TEXT,
+                sheet_name TEXT,
+                backup_path TEXT,
+                status TEXT NOT NULL CHECK (
+                    status IN (
+                        'ANALYZING', 'WAITING_USER', 'APPLYING', 'SUCCEEDED',
+                        'NO_CHANGES', 'CANCELLED', 'FAILED'
+                    )
+                ),
+                total_items INTEGER NOT NULL DEFAULT 0 CHECK (total_items >= 0),
+                changed_items INTEGER NOT NULL DEFAULT 0 CHECK (changed_items >= 0),
+                skipped_items INTEGER NOT NULL DEFAULT 0 CHECK (skipped_items >= 0),
+                conflict_count INTEGER NOT NULL DEFAULT 0 CHECK (conflict_count >= 0),
+                error_message TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS expense_posting_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                batch_id INTEGER NOT NULL,
+                batch_hash TEXT NOT NULL,
+                source_item_index INTEGER NOT NULL CHECK (source_item_index >= 0),
+                container TEXT,
+                bl TEXT,
+                fee_original TEXT NOT NULL,
+                fee_selected TEXT,
+                rule TEXT,
+                amount INTEGER NOT NULL CHECK (amount >= 0),
+                sheet_name TEXT,
+                target_row INTEGER CHECK (target_row IS NULL OR target_row > 0),
+                target_column INTEGER CHECK (
+                    target_column IS NULL OR target_column > 0
+                ),
+                target_cell TEXT,
+                value_before TEXT,
+                value_after TEXT,
+                action TEXT,
+                status TEXT NOT NULL CHECK (
+                    status IN (
+                        'PLANNED', 'POSTED', 'ALREADY_EXISTS', 'USER_SKIPPED',
+                        'NOT_MATCHED', 'UNRESOLVED', 'FAILED'
+                    )
+                ),
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (run_id) REFERENCES excel_runs(id) ON DELETE CASCADE,
+                FOREIGN KEY (batch_id) REFERENCES batches(id) ON DELETE RESTRICT
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_excel_runs_operation_status
+                ON excel_runs(operation, status, started_at DESC, id DESC)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_expense_posting_items_run
+                ON expense_posting_items(run_id, source_item_index)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_expense_posting_items_batch
+                ON expense_posting_items(batch_hash, source_item_index, status)
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_expense_posting_success_source
+                ON expense_posting_items(batch_hash, source_item_index)
+                WHERE status IN ('POSTED', 'ALREADY_EXISTS')
+            """,
+        )
+        for statement in statements:
+            connection.execute(statement)
 
     @contextmanager
     def transaction(

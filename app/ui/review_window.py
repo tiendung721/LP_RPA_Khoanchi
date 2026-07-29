@@ -332,7 +332,7 @@ class ReviewWindow(QMainWindow):
         self.visible_label.setProperty("muted", True)
         bottom.addWidget(self.visible_label)
         bottom.addStretch(1)
-        self.confirm_button = QPushButton("Lưu và xác nhận hoàn tất")
+        self.confirm_button = QPushButton("Lưu")
         self.confirm_button.setObjectName("confirmButton")
         self.confirm_button.setProperty("primary", True)
         self.close_button = QPushButton("Đóng")
@@ -368,7 +368,7 @@ class ReviewWindow(QMainWindow):
     def _install_shortcuts(self) -> None:
         self.save_shortcut = QShortcut(QKeySequence.StandardKey.Save, self)
         self.save_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        self.save_shortcut.activated.connect(self.save_working)
+        self.save_shortcut.activated.connect(self.confirm_batch)
 
         self.find_shortcut = QShortcut(QKeySequence.StandardKey.Find, self)
         self.find_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
@@ -616,9 +616,9 @@ class ReviewWindow(QMainWindow):
         if stats.warning:
             answer = QMessageBox.question(
                 self,
-                "Xác nhận khi còn cảnh báo",
-                f"Batch còn {stats.warning} dòng cảnh báo. Bạn đã kiểm tra và vẫn muốn "
-                "tạo snapshot JSON đã duyệt?",
+                "Lưu khi còn cảnh báo",
+                f"Dữ liệu còn {stats.warning} dòng cảnh báo. Bạn đã kiểm tra và vẫn "
+                "muốn lưu?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -631,11 +631,9 @@ class ReviewWindow(QMainWindow):
         if handler is None:
             QMessageBox.warning(
                 self,
-                "Chưa thể xác nhận",
-                "Chưa kết nối dịch vụ tạo snapshot Ready.",
+                "Chưa thể lưu",
+                "Chưa kết nối dịch vụ lưu dữ liệu.",
             )
-            return False
-        if self.model.dirty and not self.save_working():
             return False
 
         document = self._core_document()
@@ -651,23 +649,17 @@ class ReviewWindow(QMainWindow):
             self.model.mark_clean()
             self.confirmed.emit(result if result is not None else self._metadata)
             self.batchUpdated.emit(result if result is not None else self._metadata)
-            ready_path = _value(
-                _value(result, "metadata", default=result),
-                "ready_path",
-                default="",
-            )
-            detail = f"\n\nSnapshot: {ready_path}" if ready_path else ""
             QMessageBox.information(
                 self,
-                "Đã xác nhận hoàn tất",
-                "Batch đã được kiểm tra và tạo snapshot JSON trong thư mục Ready." + detail,
+                "Lưu thành công",
+                "Đã lưu thành công.",
             )
             return True
         except Exception as exc:
             QMessageBox.critical(
                 self,
-                "Không xác nhận được",
-                f"Không thể tạo snapshot Ready: {exc}\nHãy kiểm tra log và thử lại.",
+                "Không lưu được dữ liệu",
+                f"Không thể lưu dữ liệu: {exc}\nHãy kiểm tra log và thử lại.",
             )
             return False
         finally:
@@ -736,7 +728,7 @@ class ReviewWindow(QMainWindow):
             if clicked is cancel:
                 event.ignore()
                 return
-            if clicked is save and not self.save_working():
+            if clicked is save and not self.confirm_batch():
                 event.ignore()
                 return
             if clicked is not discard and clicked is not save:

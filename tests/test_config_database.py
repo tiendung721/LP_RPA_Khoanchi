@@ -42,6 +42,13 @@ def test_runtime_files_are_grouped_below_output_system(tmp_path: Path) -> None:
     assert paths.workspace_dir == tmp_path / "Output" / "_system" / "Workspace"
     assert paths.ready_dir == tmp_path / "Output" / "_system" / "Ready"
     assert paths.rejected_dir == tmp_path / "Output" / "_system" / "Rejected"
+    assert paths.excel_temp_dir == tmp_path / "Output" / "_system" / "Excel" / "Temp"
+    assert paths.excel_backup_dir == (
+        tmp_path / "Output" / "_system" / "Excel" / "Backup"
+    )
+    assert paths.excel_reports_dir == (
+        tmp_path / "Output" / "_system" / "Excel" / "Reports"
+    )
 
 
 def test_legacy_runtime_layout_is_moved_without_changing_files(
@@ -80,6 +87,8 @@ def test_settings_round_trip_utf8(tmp_path: Path) -> None:
         data_root=root,
         assistant_bat_path=str(root / "Mở trợ lý.bat"),
         output_dir=tmp_path / "Kết quả",
+        daily_workbook_path=root / "Hàng ngày 2026.xlsx",
+        bk_workbook_path=root / "BK Tổng hợp 2026.xlsm",
     )
 
     manager.save(settings)
@@ -87,6 +96,8 @@ def test_settings_round_trip_utf8(tmp_path: Path) -> None:
 
     assert loaded.assistant_bat_path == settings.assistant_bat_path
     assert loaded.output_dir == settings.output_dir
+    assert loaded.daily_workbook_path == settings.daily_workbook_path
+    assert loaded.bk_workbook_path == settings.bk_workbook_path
     assert manager.settings_path.read_bytes().startswith(b"{")
 
 
@@ -140,7 +151,15 @@ def test_legacy_settings_are_rewritten_without_browser_or_inbox_keys(
 
     assert loaded.assistant_bat_path == ""
     assert loaded.output_dir == paths.output_dir
-    assert set(rewritten) == {"data_root", "assistant_bat_path", "output_dir"}
+    assert loaded.daily_workbook_path == ""
+    assert loaded.bk_workbook_path == ""
+    assert set(rewritten) == {
+        "data_root",
+        "assistant_bat_path",
+        "output_dir",
+        "daily_workbook_path",
+        "bk_workbook_path",
+    }
 
 
 def test_copied_settings_rebase_paths_inside_the_old_bundle(tmp_path: Path) -> None:
