@@ -115,12 +115,11 @@ class ExcelConfigurationService:
                 raise ValueError(
                     "Không nhận diện được header nguồn: " + "; ".join(header_errors)
                 )
-            result.source_year = self.years.from_filename(source)
             result.checks.append(
                 ConfigurationCheck(
                     "daily_workbook",
                     True,
-                    f"File Hàng ngày đọc được, năm {result.source_year}.",
+                    "File Hàng ngày đọc được và có cấu trúc phù hợp.",
                 )
             )
         except Exception as exc:
@@ -143,18 +142,16 @@ class ExcelConfigurationService:
             with self.lock_service.acquire(target):
                 pass
             target_book = self.gateway.load(target, read_only=False)
-            result.target_year = self.years.target_year(
-                target, target_book.sheetnames
-            )
-            target_sheets = self.months.target_sheets(
-                target_book.sheetnames,
-                year=result.target_year,
-            )
+            target_sheets = [
+                name
+                for name in target_book.sheetnames
+                if self.months.parse_target_sheet(name) is not None
+            ]
             if not target_sheets:
                 raise ValueError("Không có sheet BK dạng TMM YY.")
             header_ok = False
             header_errors: list[str] = []
-            for sheet_name in target_sheets.values():
+            for sheet_name in target_sheets:
                 try:
                     self.headers.resolve(
                         target_book[sheet_name],
@@ -173,7 +170,7 @@ class ExcelConfigurationService:
                 ConfigurationCheck(
                     "bk_workbook",
                     True,
-                    f"File BK đọc được và có quyền ghi, năm {result.target_year}.",
+                    "File BK đọc được, có sheet tháng và có quyền ghi.",
                 )
             )
         except Exception as exc:
@@ -182,22 +179,6 @@ class ExcelConfigurationService:
             if target_book is not None:
                 target_book.close()
 
-        if result.source_year is not None and result.target_year is not None:
-            matching = result.source_year == result.target_year
-            result.checks.append(
-                ConfigurationCheck(
-                    "workbook_years",
-                    matching,
-                    (
-                        f"Năm hai workbook cùng là {result.source_year}."
-                        if matching
-                        else (
-                            f"Năm Hàng ngày {result.source_year} không khớp "
-                            f"năm BK {result.target_year}."
-                        )
-                    ),
-                )
-            )
         return result
 
     validate_configuration = validate

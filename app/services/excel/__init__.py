@@ -32,6 +32,7 @@ from .models import (
     PostingResult,
     ResolutionAction,
     RowCandidate,
+    SourceSheetCandidate,
     SyncConflict,
     SyncPlan,
     SyncResolution,
@@ -98,6 +99,7 @@ __all__ = [
     "PostingResult",
     "ResolutionAction",
     "RowCandidate",
+    "SourceSheetCandidate",
     "SyncConflict",
     "SyncPlan",
     "SyncResolution",
@@ -119,4 +121,3 @@ __all__ = [
     "validate_configuration",
     "workbook_fingerprint",
 ]
-

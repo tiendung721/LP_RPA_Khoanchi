@@ -77,6 +77,10 @@ class Database:
                 self._migration_3(connection)
                 connection.execute("PRAGMA user_version = 3")
                 current_version = 3
+            if current_version < 4:
+                self._migration_4(connection)
+                connection.execute("PRAGMA user_version = 4")
+                current_version = 4
             if current_version != SQLITE_SCHEMA_VERSION:
                 raise DatabaseError("Không thể nâng cấp database đến phiên bản hiện tại.")
 
@@ -233,6 +237,21 @@ class Database:
         )
         for statement in statements:
             connection.execute(statement)
+
+    @staticmethod
+    def _migration_4(connection: sqlite3.Connection) -> None:
+        """Cho phép lưu nhiều lần nhập thành công cho cùng một dòng JSON."""
+
+        connection.execute("DROP INDEX IF EXISTS ux_expense_posting_success_source")
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_expense_posting_success_source
+                ON expense_posting_items(
+                    batch_hash, source_item_index, created_at DESC, id DESC
+                )
+                WHERE status IN ('POSTED', 'ALREADY_EXISTS')
+            """
+        )
 
     @contextmanager
     def transaction(

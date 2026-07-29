@@ -344,6 +344,34 @@ class ExpensePostingRepository:
         )
         return {int(row["source_item_index"]) for row in rows}
 
+    def latest_successful_items(
+        self,
+        batch_hash: str,
+    ) -> list[ExpensePostingItemRecord]:
+        """Trả về lần nhập thành công mới nhất của từng dòng nguồn."""
+
+        rows = self.database.query_all(
+            """
+            SELECT item.*
+            FROM expense_posting_items AS item
+            WHERE item.batch_hash = ?
+              AND item.status IN ('POSTED', 'ALREADY_EXISTS')
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM expense_posting_items AS newer
+                    WHERE newer.batch_hash = item.batch_hash
+                      AND newer.source_item_index = item.source_item_index
+                      AND newer.status IN ('POSTED', 'ALREADY_EXISTS')
+                      AND newer.id > item.id
+              )
+            ORDER BY item.source_item_index
+            """,
+            (batch_hash,),
+        )
+        return [self._to_record(row) for row in rows]
+
+    get_latest_successful_items = latest_successful_items
+
     get_successful_source_indices = successful_source_indices
     posted_source_indices = successful_source_indices
 

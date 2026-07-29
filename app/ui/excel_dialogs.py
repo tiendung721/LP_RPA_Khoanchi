@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from typing import Any
 
 from PySide6.QtCore import Qt
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QRadioButton,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -90,6 +92,19 @@ def _format_amount(value: Any) -> str:
     return _display(value)
 
 
+def _format_datetime(value: Any) -> str:
+    if value in (None, ""):
+        return "—"
+    if isinstance(value, datetime):
+        return value.strftime("%d/%m/%Y %H:%M:%S")
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).strftime(
+            "%d/%m/%Y %H:%M:%S"
+        )
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def _sheet_name(candidate: Any) -> str:
     return str(
         _value(
@@ -113,6 +128,8 @@ class MonthSelectionDialog(QDialog):
         parent: QWidget | None = None,
         *,
         title: str = "Chọn tháng xử lý",
+        preselect_first: bool = True,
+        show_recommendations: bool = True,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("monthSelectionDialog")
@@ -126,12 +143,14 @@ class MonthSelectionDialog(QDialog):
             default=candidates_or_plan,
         )
         self.candidates = list(_sequence(candidates))
+        self.preselect_first = preselect_first
+        self.show_recommendations = show_recommendations
         self._build_ui()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
         note = QLabel(
-            "Có nhiều tháng phù hợp. Hãy chọn một sheet để tiếp tục; "
+            "Hãy chọn một sheet để tiếp tục; "
             "chỉ sheet này được phép thay đổi."
         )
         note.setWordWrap(True)
@@ -154,6 +173,9 @@ class MonthSelectionDialog(QDialog):
             QHeaderView.ResizeMode.ResizeToContents
         )
         self.table.horizontalHeader().setStretchLastSection(True)
+        if not self.show_recommendations:
+            self.table.setColumnHidden(3, True)
+            self.table.setColumnHidden(4, True)
         layout.addWidget(self.table, 1)
 
         for candidate in self.candidates:
@@ -208,7 +230,7 @@ class MonthSelectionDialog(QDialog):
         layout.addWidget(self.buttons)
         self.table.itemSelectionChanged.connect(self._update_action)
         self.table.itemDoubleClicked.connect(lambda _item: self.accept())
-        if self.candidates:
+        if self.candidates and self.preselect_first:
             self.table.selectRow(0)
         self._update_action()
 
@@ -409,9 +431,9 @@ ACTION_LABELS = {
     "KEEP_ALL": "Giữ tất cả",
     "SELECT_SHEET": "Chọn sheet",
     "SELECT_MONTH": "Chọn tháng",
-    "SELECT_ROW": "Chọn dòng BK",
+    "SELECT_ROW": "Chọn dòng",
     "SELECT_FEE": "Chọn mã phí",
-    "KEEP_EXISTING": "Giữ giá trị hiện tại",
+    "KEEP_EXISTING": "Giữ nguyên",
     "KEEP_FORMULA": "Giữ công thức",
     "OVERWRITE": "Ghi đè",
     "ADD": "Cộng thêm",
@@ -419,6 +441,126 @@ ACTION_LABELS = {
     "REANALYZE": "Đọc lại dữ liệu",
     "RETRY": "Thử lại",
 }
+
+
+class RepostSelectionDialog(QDialog):
+    """Chọn các khoản đã nhập trước đây cần được nhập lại."""
+
+    COLUMNS = (
+        "Chọn",
+        "Dòng JSON",
+        "Container",
+        "Phí",
+        "Số tiền",
+        "Sheet",
+        "Dòng / ô",
+        "Đã nhập lúc",
+    )
+
+    def __init__(
+        self,
+        items: Sequence[Any],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.items = list(items)
+        self.setObjectName("repostSelectionDialog")
+        self.setWindowTitle("Chọn khoản nhập lại")
+        self.resize(920, 520)
+        self._checkbox_items: list[QTableWidgetItem] = []
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        note = QLabel(
+            f"Có {len(self.items)} khoản đã được nhập trước đây. "
+            "Mặc định phần mềm chỉ nhập các khoản chưa nhập."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        self.unposted_only = QRadioButton("Chỉ nhập khoản chưa nhập")
+        self.choose_reposts = QRadioButton("Chọn khoản nhập lại")
+        self.unposted_only.setChecked(True)
+        layout.addWidget(self.unposted_only)
+        layout.addWidget(self.choose_reposts)
+
+        self.table = QTableWidget(0, len(self.COLUMNS))
+        self.table.setObjectName("repostItemTable")
+        self.table.setHorizontalHeaderLabels(list(self.COLUMNS))
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.table, 1)
+
+        for source in self.items:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            checkbox = QTableWidgetItem()
+            checkbox.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsUserCheckable
+                | Qt.ItemFlag.ItemIsSelectable
+            )
+            checkbox.setCheckState(Qt.CheckState.Unchecked)
+            checkbox.setData(
+                Qt.ItemDataRole.UserRole,
+                _value(source, "source_item_index"),
+            )
+            self._checkbox_items.append(checkbox)
+            self.table.setItem(row, 0, checkbox)
+            row_cell = " / ".join(
+                part
+                for part in (
+                    _display(_value(source, "target_row")),
+                    _display(_value(source, "target_cell")),
+                )
+                if part != "—"
+            )
+            values = (
+                (
+                    int(_value(source, "source_item_index", default=0)) + 1
+                ),
+                _value(source, "container"),
+                _value(source, "fee", "fee_selected"),
+                _format_amount(_value(source, "amount")),
+                _value(source, "sheet_name"),
+                row_cell or "—",
+                _format_datetime(_value(source, "created_at")),
+            )
+            for column, value in enumerate(values, 1):
+                self.table.setItem(row, column, QTableWidgetItem(_display(value)))
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Tiếp tục")
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Hủy")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        self.choose_reposts.toggled.connect(self._update_enabled)
+        self._update_enabled(False)
+
+    def _update_enabled(self, enabled: bool) -> None:
+        self.table.setEnabled(enabled)
+
+    @property
+    def selected_source_indices(self) -> list[int]:
+        if not self.choose_reposts.isChecked():
+            return []
+        return [
+            int(item.data(Qt.ItemDataRole.UserRole))
+            for item in self._checkbox_items
+            if item.checkState() == Qt.CheckState.Checked
+        ]
 
 
 class ConflictResolutionDialog(QDialog):
@@ -569,17 +711,13 @@ class ConflictResolutionDialog(QDialog):
         action_combo.setObjectName(f"conflictAction_{row}")
         options = self._actions(conflict, conflict_type)
         default_action = _code(
-            _value(
-                conflict,
-                "default_action",
-                "default_resolution",
-                default=DEFAULT_RESOLUTION.get(conflict_type, options[0]),
-            )
-        )
+            _value(conflict, "default_action", "default_resolution")
+        ) or DEFAULT_RESOLUTION.get(conflict_type, _code(options[0]))
         for option in options:
             code = _code(option)
-            label = str(
-                _value(option, "label", "name", default=ACTION_LABELS.get(code, code))
+            label = ACTION_LABELS.get(
+                code,
+                str(_value(option, "label", default=code)),
             )
             action_combo.addItem(label, code)
         default_index = action_combo.findData(default_action)
@@ -794,6 +932,7 @@ __all__ = [
     "ExcelConflictDialog",
     "ManualRowPickerDialog",
     "MonthSelectionDialog",
+    "RepostSelectionDialog",
     "TargetMonthDialog",
     "VALID_FEE_CODES",
 ]

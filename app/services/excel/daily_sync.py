@@ -22,6 +22,7 @@ from .models import (
     ExcelRunStatus,
     MonthCandidate,
     ResolutionAction,
+    SourceSheetCandidate,
     SyncConflict,
     SyncPlan,
     SyncResolution,
@@ -68,7 +69,7 @@ SOURCE_HEADER_ALIASES: dict[str, tuple[str, ...]] = {
     "estimated_delivery": ("Dự kiến giao", "Ngày dự kiến giao"),
     "recipient": ("Người nhận", "Khách hàng"),
     "sea_transport": ("VT biển", "Vận tải biển"),
-    "transport": ("Vận chuyển", "Đơn vị vận chuyển"),
+    "transport": ("Vận chuyển", "Đơn vị vận chuyển", "VT bộ"),
 }
 
 TARGET_EXPECTED_COLUMNS: dict[str, int] = {
@@ -155,8 +156,32 @@ class DailySyncService:
         # Temp vẫn chỉ dùng cho snapshot nguồn LAN.
         self.backups = ExcelBackupService(self.backup_dir)
 
+    def source_sheet_candidates(self) -> list[SourceSheetCandidate]:
+        """Liệt kê các sheet tháng nguồn trước khi bắt đầu phân tích dữ liệu."""
+
+        source = ensure_supported_workbook(self.daily_path)
+        if not source.is_file():
+            raise DailySyncError(f"Không tìm thấy file Hàng ngày: {source}")
+        self.lock_service.ensure_readable(source)
+        workbook = self.gateway.load(source, read_only=True)
+        try:
+            source_sheets = self.months.daily_sheets(workbook.sheetnames)
+        finally:
+            workbook.close()
+        if not source_sheets:
+            raise DailySyncError(
+                "File Hàng ngày không có sheet Tháng 1…Tháng 12."
+            )
+        return [
+            SourceSheetCandidate(month=month, source_sheet=sheet_name)
+            for month, sheet_name in sorted(source_sheets.items())
+        ]
+
     def analyze(
-        self, progress_callback: ProgressCallback = None
+        self,
+        progress_callback: ProgressCallback = None,
+        *,
+        source_sheet_name: str | None = None,
     ) -> SyncPlan:
         source = ensure_supported_workbook(self.daily_path)
         target = ensure_supported_workbook(self.bk_path)
@@ -181,64 +206,117 @@ class DailySyncService:
             source_book = self.gateway.load(source_snapshot, read_only=True)
             target_book = self.gateway.load(target, read_only=False)
             try:
-                source_year = self.years.from_filename(source)
-                target_year = self.years.target_year(target, target_book.sheetnames)
-                if source_year != target_year:
-                    raise DailySyncError(
-                        f"Năm file Hàng ngày ({source_year}) không khớp BK ({target_year})."
-                    )
                 source_sheets = self.months.daily_sheets(source_book.sheetnames)
                 if not source_sheets:
                     raise DailySyncError(
                         "File Hàng ngày không có sheet Tháng 1…Tháng 12."
                     )
-                target_sheets = self.months.target_sheets(
-                    target_book.sheetnames, year=target_year
+                if source_sheet_name is not None:
+                    selected_sources = {
+                        month: sheet_name
+                        for month, sheet_name in source_sheets.items()
+                        if sheet_name == source_sheet_name
+                    }
+                    if not selected_sources:
+                        raise DailySyncError(
+                            f"Không tìm thấy sheet nguồn {source_sheet_name!r} "
+                            "trong file Hàng ngày."
+                        )
+                    source_sheets = selected_sources
+                target_sheets = self._target_sheets(target_book.sheetnames)
+                target_years = sorted(
+                    {
+                        year
+                        for sheets in target_sheets.values()
+                        for year, _name in sheets
+                    }
                 )
+                if not target_years:
+                    raise DailySyncError("File BK không có sheet tháng TMM YY.")
                 rows_by_month: dict[int, list[SyncRow]] = {}
+                rows_by_target: dict[str, list[SyncRow]] = {}
                 candidates: list[MonthCandidate] = []
                 conflicts: list[SyncConflict] = []
-                for month, source_sheet_name in sorted(source_sheets.items()):
+                conflict_ids: set[str] = set()
+                for month, current_source_sheet_name in sorted(
+                    source_sheets.items()
+                ):
                     _progress(
                         progress_callback,
-                        f"Đang phân tích {source_sheet_name}…",
+                        f"Đang phân tích {current_source_sheet_name}…",
                     )
-                    source_sheet = source_book[source_sheet_name]
+                    source_sheet = source_book[current_source_sheet_name]
                     source_headers = self.headers.resolve(
                         source_sheet, SOURCE_HEADER_ALIASES, required=SYNC_FIELDS
                     )
-                    target_sheet_name = target_sheets.get(
-                        month, self.months.target_name(month, target_year)
+                    existing_targets = list(target_sheets.get(month, ()))
+                    target_options = (
+                        existing_targets
+                        if existing_targets
+                        else [
+                            (
+                                target_year,
+                                self.months.target_name(month, target_year),
+                            )
+                            for target_year in target_years
+                        ]
                     )
-                    last_sqt = 0
-                    if month in target_sheets:
-                        target_sheet = target_book[target_sheet_name]
-                        target_headers = self._resolve_target_headers(target_sheet)
-                        last_sqt = self._last_sqt(target_sheet, target_headers)
-                    month_rows, month_conflicts = self._source_rows(
-                        source_sheet,
-                        source_headers,
-                        month=month,
-                        last_sqt=last_sqt,
-                        source_fingerprint=source_fingerprint.sha256,
-                    )
-                    conflicts.extend(month_conflicts)
-                    if month_rows:
-                        rows_by_month[month] = month_rows
-                        candidates.append(
-                            MonthCandidate(
-                                month=month,
-                                source_sheet=source_sheet_name,
-                                target_sheet=target_sheet_name,
-                                new_row_count=len(month_rows),
-                                last_sqt=last_sqt,
+                    existing_by_year = dict(existing_targets)
+                    target_analyses: list[
+                        tuple[int, str, int, list[SyncRow]]
+                    ] = []
+                    for target_year, target_sheet_name in target_options:
+                        last_sqt = 0
+                        if target_year in existing_by_year:
+                            target_sheet = target_book[target_sheet_name]
+                            target_headers = self._resolve_target_headers(target_sheet)
+                            last_sqt = self._last_sqt(target_sheet, target_headers)
+                        month_rows, month_conflicts = self._source_rows(
+                            source_sheet,
+                            source_headers,
+                            month=month,
+                            last_sqt=last_sqt,
+                            source_fingerprint=source_fingerprint.sha256,
+                        )
+                        for conflict in month_conflicts:
+                            if conflict.conflict_id not in conflict_ids:
+                                conflict_ids.add(conflict.conflict_id)
+                                conflicts.append(conflict)
+                        rows_by_target[target_sheet_name] = month_rows
+                        target_analyses.append(
+                            (
+                                target_year,
+                                target_sheet_name,
+                                last_sqt,
+                                month_rows,
                             )
                         )
+                    if any(rows for *_metadata, rows in target_analyses):
+                        for (
+                            target_year,
+                            target_sheet_name,
+                            last_sqt,
+                            month_rows,
+                        ) in target_analyses:
+                            rows_by_month.setdefault(month, month_rows)
+                            candidates.append(
+                                MonthCandidate(
+                                    month=month,
+                                    year=target_year,
+                                    source_sheet=current_source_sheet_name,
+                                    target_sheet=target_sheet_name,
+                                    new_row_count=len(month_rows),
+                                    last_sqt=last_sqt,
+                                )
+                            )
             finally:
                 source_book.close()
                 target_book.close()
 
             selected_month = candidates[0].month if len(candidates) == 1 else None
+            selected_target_sheet = (
+                candidates[0].target_sheet if len(candidates) == 1 else None
+            )
             if len(candidates) > 1:
                 conflicts.append(
                     SyncConflict(
@@ -248,29 +326,42 @@ class DailySyncService:
                             [candidate.month for candidate in candidates],
                         ),
                         conflict_type=ConflictType.TARGET_MONTH_AMBIGUOUS,
-                        message="Có dữ liệu mới ở nhiều tháng; hãy chọn một tháng.",
+                        message=(
+                            "Có dữ liệu mới ở nhiều tháng hoặc nhiều sheet BK; "
+                            "hãy chọn một sheet đích."
+                        ),
                         allowed_actions=(
                             ResolutionAction.SELECT_MONTH,
                             ResolutionAction.CANCEL_ALL,
                         ),
                         details={
-                            "months": [candidate.month for candidate in candidates]
+                            "months": [candidate.month for candidate in candidates],
+                            "sheet_candidates": candidates,
                         },
                     )
                 )
+            selected_year = (
+                candidates[0].year
+                if len(candidates) == 1
+                else target_years[0]
+                if len(target_years) == 1
+                else None
+            )
             plan = SyncPlan(
                 source_path=source,
                 source_snapshot_path=source_snapshot,
                 target_path=target,
                 source_fingerprint=source_fingerprint,
                 target_fingerprint=target_fingerprint,
-                source_year=source_year,
-                target_year=target_year,
+                source_year=None,
+                target_year=selected_year,
                 month_candidates=candidates,
                 rows_by_month=rows_by_month,
+                rows_by_target=rows_by_target,
                 source_snapshot_fingerprint=source_snapshot_fingerprint,
                 conflicts=conflicts,
                 selected_month=selected_month,
+                selected_target_sheet=selected_target_sheet,
                 run_id=run_id,
             )
             status = (
@@ -304,8 +395,8 @@ class DailySyncService:
     ) -> SyncResult:
         resolved = resolution_map(resolutions)
         try:
-            month = self._selected_month(plan, resolved)
-            if month is None:
+            candidate = self._selected_candidate(plan, resolved)
+            if candidate is None:
                 if not plan.has_changes:
                     result = SyncResult(
                         status=ExcelRunStatus.NO_CHANGES,
@@ -320,12 +411,17 @@ class DailySyncService:
                     plan.source_snapshot_path.unlink(missing_ok=True)
                     return result
                 raise DailySyncError("Chưa chọn tháng cần đồng bộ.")
-            rows, skipped = self._resolved_rows(plan, month, resolved)
+            month = candidate.month
+            target_year = candidate.year
+            if target_year is None:
+                raise DailySyncError("Không xác định được năm của sheet BK đích.")
+            target_name = candidate.target_sheet
+            rows, skipped = self._resolved_rows(plan, candidate, resolved)
             if not rows:
                 result = SyncResult(
                     status=ExcelRunStatus.NO_CHANGES,
                     target_path=plan.target_path,
-                    sheet_name=self.months.target_name(month, plan.target_year),
+                    sheet_name=target_name,
                     skipped_rows=skipped,
                     conflict_count=len(plan.conflicts),
                     fingerprint_before=plan.target_fingerprint,
@@ -376,11 +472,10 @@ class DailySyncService:
             )
             workbook = self.gateway.load(working_path, read_only=False)
             try:
-                target_name = self.months.target_name(month, plan.target_year)
                 created = target_name not in workbook.sheetnames
                 if created:
                     worksheet = self._create_month_sheet(
-                        workbook, month, plan.target_year, target_name
+                        workbook, month, target_year, target_name
                     )
                 else:
                     worksheet = workbook[target_name]
@@ -566,6 +661,23 @@ class DailySyncService:
             )
         return resolution
 
+    def _target_sheets(
+        self, sheet_names: Sequence[str]
+    ) -> dict[int, list[tuple[int, str]]]:
+        result: dict[int, list[tuple[int, str]]] = {}
+        seen: set[tuple[int, int]] = set()
+        for name in sheet_names:
+            parsed = self.months.parse_target_sheet(name)
+            if parsed is None:
+                continue
+            month, year = parsed
+            key = (month, year)
+            if key in seen:
+                raise DailySyncError(f"Có nhiều sheet BK cho tháng {month}/{year}.")
+            seen.add(key)
+            result.setdefault(month, []).append((year, name))
+        return result
+
     @staticmethod
     def _last_sqt(worksheet: Worksheet, header: HeaderResolution) -> int:
         values = (
@@ -694,11 +806,18 @@ class DailySyncService:
             return " ".join(value.split()).casefold()
         return value
 
-    def _selected_month(
+    def _selected_candidate(
         self, plan: SyncPlan, resolutions: Mapping[str, Any]
-    ) -> int | None:
-        if plan.selected_month is not None:
-            return plan.selected_month
+    ) -> MonthCandidate | None:
+        if plan.selected_sheet is not None:
+            return next(
+                (
+                    candidate
+                    for candidate in plan.month_candidates
+                    if candidate.target_sheet == plan.selected_sheet
+                ),
+                None,
+            )
         for conflict in plan.conflicts:
             if conflict.conflict_type is not ConflictType.TARGET_MONTH_AMBIGUOUS:
                 continue
@@ -709,19 +828,46 @@ class DailySyncService:
             if action in {ResolutionAction.CANCEL, ResolutionAction.CANCEL_ALL}:
                 raise DailySyncError("Người dùng đã hủy đồng bộ.")
             month = getattr(value, "selected_month", None)
+            sheet = getattr(value, "selected_sheet", None)
             if isinstance(value, Mapping):
                 month = value.get("selected_month", month)
-            if action is ResolutionAction.SELECT_MONTH and month is not None:
-                return int(month)
+                sheet = value.get(
+                    "selected_sheet",
+                    value.get("selected_sheet_name", sheet),
+                )
+            if action is ResolutionAction.SELECT_MONTH:
+                if sheet:
+                    return next(
+                        (
+                            candidate
+                            for candidate in plan.month_candidates
+                            if candidate.target_sheet == str(sheet)
+                        ),
+                        None,
+                    )
+                if month is not None:
+                    matching = [
+                        candidate
+                        for candidate in plan.month_candidates
+                        if candidate.month == int(month)
+                    ]
+                    if len(matching) == 1:
+                        return matching[0]
         return None
 
     def _resolved_rows(
         self,
         plan: SyncPlan,
-        month: int,
+        candidate: MonthCandidate,
         resolutions: Mapping[str, Any],
     ) -> tuple[list[SyncRow], int]:
-        rows = list(plan.rows_by_month.get(month, ()))
+        month = candidate.month
+        rows = list(
+            plan.rows_by_target.get(
+                candidate.target_sheet,
+                plan.rows_by_month.get(month, ()),
+            )
+        )
         skipped = 0
         for conflict in plan.conflicts:
             if (

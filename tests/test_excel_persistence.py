@@ -3,8 +3,6 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-import pytest
-
 from app.constants import SQLITE_SCHEMA_VERSION
 from app.database import Database
 from app.repositories.batch_repository import BatchRepository
@@ -46,14 +44,20 @@ def test_v2_database_is_migrated_transactionally_to_excel_schema(
     assert database.query_one(
         "SELECT name FROM sqlite_master WHERE name = 'expense_posting_items'"
     )
-    partial_index = database.query_one(
+    history_index = database.query_one(
         """
         SELECT sql FROM sqlite_master
-        WHERE type = 'index' AND name = 'ux_expense_posting_success_source'
+        WHERE type = 'index' AND name = 'idx_expense_posting_success_source'
         """
     )
-    assert partial_index is not None
-    assert "WHERE status IN ('POSTED', 'ALREADY_EXISTS')" in partial_index["sql"]
+    assert history_index is not None
+    assert "WHERE status IN ('POSTED', 'ALREADY_EXISTS')" in history_index["sql"]
+    assert database.query_one(
+        """
+        SELECT name FROM sqlite_master
+        WHERE type = 'index' AND name = 'ux_expense_posting_success_source'
+        """
+    ) is None
     database.close()
 
 
@@ -147,7 +151,7 @@ def test_posting_repository_round_trips_items_and_filters_successful_sources(
     database.close()
 
 
-def test_partial_unique_index_allows_replans_but_blocks_duplicate_success(
+def test_posting_history_allows_multiple_successful_reposts(
     tmp_path: Path,
 ) -> None:
     database = Database(tmp_path / "app_state.db")
@@ -167,9 +171,10 @@ def test_partial_unique_index_allows_replans_but_blocks_duplicate_success(
     postings.create_item(run_id=first_run.id, status="POSTED", **common)
     retry = postings.create_item(run_id=second_run.id, status="PLANNED", **common)
 
-    with pytest.raises(sqlite3.IntegrityError):
-        postings.update_item(retry.id, status="ALREADY_EXISTS")
+    postings.update_item(retry.id, status="ALREADY_EXISTS")
 
-    assert postings.require_by_id(retry.id).status == "PLANNED"
+    assert postings.require_by_id(retry.id).status == "ALREADY_EXISTS"
     assert postings.successful_source_indices("1" * 64) == {4}
+    latest = postings.latest_successful_items("1" * 64)
+    assert [item.id for item in latest] == [retry.id]
     database.close()

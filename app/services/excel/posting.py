@@ -7,6 +7,7 @@ import hashlib
 import json
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -81,6 +82,11 @@ INVOICE_HEADER_NAMES = frozenset(
         "Số HĐ",
     )
 )
+UPDATE_HEADER_NAMES = frozenset(
+    normalize_header(value) for value in ("Date cập nhật", "Data cập nhật")
+)
+UPDATE_HEADER_CANONICAL = "Date cập nhật"
+UPDATE_NUMBER_FORMAT = "dd/mm/yyyy hh:mm:ss"
 
 
 class ExpensePostingError(RuntimeError):
@@ -136,6 +142,7 @@ class ExpensePostingService:
         year_resolver: YearResolver | None = None,
         run_repository: Any | None = None,
         posting_repository: Any | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.provider = reviewed_batch_provider or provider
         if self.provider is None:
@@ -160,6 +167,7 @@ class ExpensePostingService:
         self.years = year_resolver or YearResolver()
         self.run_repository = run_repository
         self.posting_repository = posting_repository
+        self.clock = clock or (lambda: datetime.now().astimezone().replace(tzinfo=None))
         # Working copy nằm cạnh BK để atomic replace không bao giờ cross-volume.
         self.backups = ExcelBackupService(self.backup_dir)
 
@@ -167,6 +175,7 @@ class ExpensePostingService:
         self,
         batch_id: int | None = None,
         sheet_name: str | None = None,
+        repost_source_indices: Sequence[int] | None = None,
         progress_callback: ProgressCallback = None,
     ) -> PostingPlan:
         target = ensure_supported_workbook(self.bk_path)
@@ -183,6 +192,18 @@ class ExpensePostingService:
         resolved_batch_id = batch_id or self._batch_id_for_path(batch_path)
         document_rows = self._validate_json(raw)
         already_posted = self._successful_indices(batch_hash)
+        repost_indices = set(repost_source_indices or ())
+        invalid_reposts = repost_indices.difference(already_posted)
+        if invalid_reposts:
+            raise ExpensePostingError(
+                "Danh sách khoản nhập lại không còn hợp lệ; vui lòng đọc lại."
+            )
+        repost_selection_done = repost_source_indices is not None
+        previously_posted = self._previously_posted_items(
+            batch_hash,
+            document_rows,
+            already_posted,
+        )
         run_id = self._create_run(batch_path, target)
         try:
             _progress(progress_callback, "Đang đọc cấu trúc file BK…")
@@ -190,98 +211,36 @@ class ExpensePostingService:
             fingerprint = self.gateway.fingerprint(target)
             workbook = self.gateway.load(target, read_only=False)
             try:
-                target_year = self.years.target_year(
-                    target, workbook.sheetnames
-                )
                 sheet_names = [
                     name
                     for name in workbook.sheetnames
-                    if (
-                        (parsed := self.months.parse_target_sheet(name))
-                        is not None
-                        and parsed[1] == target_year
-                    )
+                    if self.months.parse_target_sheet(name) is not None
                 ]
                 if not sheet_names:
                     raise ExpensePostingError("File BK không có sheet tháng TMM YY.")
-                groups = self._group_rows(document_rows, already_posted)
-                latest_sheet = self._latest_sync_sheet()
-                candidates, indexes = self._sheet_candidates(
-                    workbook, sheet_names, groups, latest_sheet
+                groups = self._group_rows(
+                    document_rows,
+                    already_posted,
+                    repost_indices,
                 )
-                if not groups and already_posted and sheet_name is None:
-                    previous = (
-                        self.posting_repository.get_latest_successful_for_batch(
-                            batch_hash
-                        )
-                        if self.posting_repository is not None
-                        else None
+                candidates = [
+                    MonthCandidate(
+                        month=parsed[0],
+                        year=parsed[1],
+                        source_sheet="",
+                        target_sheet=name,
                     )
-                    previous_sheet = getattr(previous, "sheet_name", None)
-                    if previous_sheet in {
-                        candidate.target_sheet for candidate in candidates
-                    }:
-                        sheet_name = previous_sheet
-                    elif latest_sheet in {
-                        candidate.target_sheet for candidate in candidates
-                    }:
-                        sheet_name = latest_sheet
-                    elif candidates:
-                        sheet_name = candidates[0].target_sheet
-                selected = self._choose_sheet(
-                    sheet_name, candidates, groups, latest_sheet
-                )
-                items = self._items_from_groups(groups)
+                    for name in sheet_names
+                    if (parsed := self.months.parse_target_sheet(name)) is not None
+                ]
+                selected = self._choose_sheet(sheet_name, candidates, groups, None)
+                items = self._items_from_groups(groups, repost_indices)
                 conflicts: list[PostingConflict] = []
-                if already_posted:
-                    conflicts.append(
-                        PostingConflict(
-                            conflict_id=_stable_id(
-                                "batch-posted", batch_hash, sorted(already_posted)
-                            ),
-                            conflict_type=ConflictType.BATCH_ALREADY_POSTED,
-                            message=(
-                                f"{len(already_posted)} khoản của batch đã được xử lý; "
-                                "chỉ các khoản chưa nhập sẽ được lập kế hoạch."
-                            ),
-                            allowed_actions=(
-                                ResolutionAction.POST_UNPOSTED_ONLY,
-                                ResolutionAction.CANCEL,
-                            ),
-                            default_action=ResolutionAction.POST_UNPOSTED_ONLY,
-                            details={"posted_indices": sorted(already_posted)},
-                        )
-                    )
-                if selected is None:
-                    conflicts.append(
-                        PostingConflict(
-                            conflict_id=_stable_id(
-                                "sheet", batch_hash, [c.target_sheet for c in candidates]
-                            ),
-                            conflict_type=ConflictType.TARGET_SHEET_AMBIGUOUS,
-                            message="Không thể tự chọn sheet tháng; hãy chọn một sheet BK.",
-                            allowed_actions=(
-                                ResolutionAction.SELECT_SHEET,
-                                ResolutionAction.CANCEL,
-                            ),
-                            details={
-                                "sheets": [
-                                    {
-                                        "name": candidate.target_sheet,
-                                        "match_count": candidate.match_count,
-                                        "recently_synced": candidate.recently_synced,
-                                    }
-                                    for candidate in candidates
-                                ]
-                            },
-                        )
-                    )
-                else:
+                if selected is not None:
                     sheet_items, item_conflicts = self._analyze_items(
                         workbook[selected],
                         items,
                         batch_hash=batch_hash,
-                        prebuilt_index=indexes[selected],
                     )
                     items = sheet_items
                     conflicts.extend(item_conflicts)
@@ -300,13 +259,16 @@ class ExpensePostingService:
                 selected_sheet=selected,
                 source_item_count=len(document_rows),
                 already_posted_indices=already_posted,
+                previously_posted_items=previously_posted,
+                repost_source_indices=repost_indices,
+                repost_selection_done=repost_selection_done,
                 run_id=run_id,
             )
             status = (
-                ExcelRunStatus.NO_CHANGES
+                ExcelRunStatus.WAITING_USER
+                if plan.requires_user_input
+                else ExcelRunStatus.NO_CHANGES
                 if not items
-                else ExcelRunStatus.WAITING_USER
-                if conflicts
                 else ExcelRunStatus.ANALYZING
             )
             self._update_run(
@@ -415,6 +377,8 @@ class ExpensePostingService:
         backup_path: Path | None = None
         working_path: Path | None = None
         after = plan.target_fingerprint
+        update_timestamp: datetime | None = None
+        update_column: int | None = None
         self._update_run(plan.run_id, status=ExcelRunStatus.APPLYING)
         try:
             if write_actions:
@@ -438,6 +402,12 @@ class ExpensePostingService:
                     fee_columns = self._resolve_fee_columns(
                         worksheet, self._resolve_base_headers(worksheet)
                     )
+                    update_column = self._ensure_update_column(worksheet)
+                    update_timestamp = self.clock().replace(
+                        tzinfo=None,
+                        microsecond=0,
+                    )
+                    updated_rows: set[int] = set()
                     for action in write_actions:
                         column = int(action["target_column"])
                         fee = str(action["fee_selected"])
@@ -448,10 +418,21 @@ class ExpensePostingService:
                         worksheet.cell(
                             int(action["target_row"]), column
                         ).value = action["value_after"]
+                        updated_rows.add(int(action["target_row"]))
+                    for target_row in updated_rows:
+                        update_cell = worksheet.cell(target_row, update_column)
+                        update_cell.value = update_timestamp
+                        update_cell.number_format = UPDATE_NUMBER_FORMAT
                     self.gateway.save(write_book, working_path)
                 finally:
                     write_book.close()
-                self._verify_posting(working_path, selected_sheet, write_actions)
+                self._verify_posting(
+                    working_path,
+                    selected_sheet,
+                    write_actions,
+                    update_column=update_column,
+                    update_timestamp=update_timestamp,
+                )
                 after = self.gateway.atomic_replace(
                     working_path,
                     plan.target_path,
@@ -609,6 +590,9 @@ class ExpensePostingService:
             selected_sheet=selected_sheet,
             source_item_count=plan.source_item_count,
             already_posted_indices=plan.already_posted_indices,
+            previously_posted_items=plan.previously_posted_items,
+            repost_source_indices=plan.repost_source_indices,
+            repost_selection_done=plan.repost_selection_done,
             run_id=plan.run_id,
         )
         self._update_run(
@@ -686,11 +670,15 @@ class ExpensePostingService:
 
     @staticmethod
     def _group_rows(
-        rows: Sequence[dict[str, Any]], already_posted: set[int]
+        rows: Sequence[dict[str, Any]],
+        already_posted: set[int],
+        repost_source_indices: set[int] | None = None,
     ) -> list[list[dict[str, Any]]]:
+        repost = repost_source_indices or set()
         groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
         for row in rows:
-            if row["source_item_index"] in already_posted:
+            source_index = row["source_item_index"]
+            if source_index in already_posted and source_index not in repost:
                 continue
             key = (
                 (row["container"], row["fee"])
@@ -702,8 +690,10 @@ class ExpensePostingService:
 
     @staticmethod
     def _items_from_groups(
-        groups: Sequence[Sequence[dict[str, Any]]]
+        groups: Sequence[Sequence[dict[str, Any]]],
+        repost_source_indices: set[int] | None = None,
     ) -> list[PostingItem]:
+        repost = repost_source_indices or set()
         return [
             PostingItem(
                 source_indices=[row["source_item_index"] for row in group],
@@ -714,6 +704,9 @@ class ExpensePostingService:
                 rule=group[0]["rule"],
                 amount=sum(row["amount"] for row in group),
                 source_items=[dict(row) for row in group],
+                force_repost=any(
+                    row["source_item_index"] in repost for row in group
+                ),
             )
             for group in groups
         ]
@@ -768,6 +761,42 @@ class ExpensePostingService:
                 continue
             result[fee] = column
         return result
+
+    @staticmethod
+    def _update_column(
+        base: HeaderResolution,
+    ) -> int | None:
+        matches = [
+            column
+            for column, header in base.headers.items()
+            if header in UPDATE_HEADER_NAMES
+        ]
+        if len(matches) > 1:
+            raise ExpensePostingError(
+                "Sheet BK có nhiều cột Date cập nhật; không thể chọn an toàn."
+            )
+        return matches[0] if matches else None
+
+    def _ensure_update_column(self, worksheet: Any) -> int:
+        base = self._resolve_base_headers(worksheet)
+        existing = self._update_column(base)
+        if existing is not None:
+            return existing
+        used_headers = [
+            column for column, header in base.headers.items() if header
+        ]
+        column = (max(used_headers) if used_headers else worksheet.max_column) + 1
+        header_cell = worksheet.cell(base.row_end, column)
+        previous = worksheet.cell(base.row_end, column - 1)
+        if previous.has_style:
+            header_cell._style = copy.copy(previous._style)
+        header_cell.font = copy.copy(previous.font)
+        header_cell.fill = copy.copy(previous.fill)
+        header_cell.border = copy.copy(previous.border)
+        header_cell.alignment = copy.copy(previous.alignment)
+        header_cell.protection = copy.copy(previous.protection)
+        header_cell.value = UPDATE_HEADER_CANONICAL
+        return column
 
     def _container_index(
         self, worksheet: Any, base: HeaderResolution
@@ -858,18 +887,7 @@ class ExpensePostingService:
             if requested not in names:
                 raise ExpensePostingError(f"Sheet {requested!r} không hợp lệ.")
             return requested
-        containers = {
-            row["container"]
-            for group in groups
-            for row in group
-            if row["container"]
-        }
-        if containers and latest_sheet in names:
-            latest = next(c for c in candidates if c.target_sheet == latest_sheet)
-            if latest.match_count == len(containers):
-                return latest_sheet
-        matched = [c for c in candidates if c.match_count > 0]
-        return matched[0].target_sheet if len(matched) == 1 else None
+        return None
 
     def _analyze_items(
         self,
@@ -1001,27 +1019,7 @@ class ExpensePostingService:
 
     @staticmethod
     def _automatic_row(candidates: Sequence[RowCandidate]) -> RowCandidate | None:
-        primary = [
-            candidate
-            for candidate in candidates
-            if candidate.sqt
-            and candidate.closing_date not in (None, "")
-            and not candidate.is_ron
-        ]
-        if len(primary) != 1:
-            return None
-        chosen = primary[0]
-        if all(
-            candidate is chosen
-            or candidate.is_ron
-            or (
-                candidate.sqt is None
-                and candidate.closing_date in (None, "")
-            )
-            for candidate in candidates
-        ):
-            return chosen
-        return None
+        return candidates[0] if len(candidates) == 1 else None
 
     @staticmethod
     def _set_cell_state(worksheet: Any, item: PostingItem) -> None:
@@ -1032,7 +1030,10 @@ class ExpensePostingService:
         if item.cell_state.kind in {TargetCellKind.EMPTY, TargetCellKind.ZERO}:
             item.action = ResolutionAction.OVERWRITE
         elif item.cell_state.kind is TargetCellKind.SAME_VALUE:
-            item.status = PostingItemStatus.ALREADY_EXISTS
+            if item.force_repost:
+                item.action = ResolutionAction.OVERWRITE
+            else:
+                item.status = PostingItemStatus.ALREADY_EXISTS
 
     def _cell_conflict(
         self, batch_hash: str, item_index: int, item: PostingItem
@@ -1227,7 +1228,10 @@ class ExpensePostingService:
                 column = fee_columns[selected_fee]
                 cell = worksheet.cell(selected_row, column)
                 state = classify_target_cell(cell, item.amount)
-                if state.kind is TargetCellKind.SAME_VALUE:
+                if (
+                    state.kind is TargetCellKind.SAME_VALUE
+                    and not item.force_repost
+                ):
                     action_record = self._action_record(
                         item,
                         selected_fee,
@@ -1240,12 +1244,18 @@ class ExpensePostingService:
                     )
                 else:
                     chosen = cell_action
-                    if state.kind in {TargetCellKind.EMPTY, TargetCellKind.ZERO}:
+                    if state.kind in {
+                        TargetCellKind.EMPTY,
+                        TargetCellKind.ZERO,
+                    } or (
+                        state.kind is TargetCellKind.SAME_VALUE
+                        and item.force_repost
+                    ):
                         chosen = ResolutionAction.OVERWRITE
                     if chosen is ResolutionAction.ADD:
                         if state.kind is not TargetCellKind.NUMBER:
                             raise ExpensePostingError(
-                                "Chỉ được ADD vào ô số không có công thức."
+                                "Chỉ có thể cộng thêm vào ô số không có công thức."
                             )
                         value_after = cell.value + item.amount
                     elif chosen is ResolutionAction.OVERWRITE:
@@ -1341,6 +1351,9 @@ class ExpensePostingService:
         path: Path,
         sheet_name: str,
         actions: Sequence[Mapping[str, Any]],
+        *,
+        update_column: int | None = None,
+        update_timestamp: datetime | None = None,
     ) -> None:
         workbook = self.gateway.load(path, read_only=False)
         try:
@@ -1356,6 +1369,19 @@ class ExpensePostingService:
                 if actual != action["value_after"]:
                     raise ExpensePostingError(
                         f"Ô {action['target_cell']} không có giá trị dự kiến."
+                    )
+            if update_column is None or update_timestamp is None:
+                raise ExpensePostingError("Bản lưu thiếu thông tin Date cập nhật.")
+            actual_update_column = self._update_column(base)
+            if actual_update_column != update_column:
+                raise ExpensePostingError("Cột Date cập nhật không qua verify.")
+            for target_row in {
+                int(action["target_row"]) for action in actions
+            }:
+                actual = worksheet.cell(target_row, update_column).value
+                if actual != update_timestamp:
+                    raise ExpensePostingError(
+                        f"Date cập nhật tại dòng {target_row} không đúng."
                     )
         finally:
             workbook.close()
@@ -1397,6 +1423,53 @@ class ExpensePostingService:
         if self.posting_repository is None:
             return set()
         return set(self.posting_repository.successful_source_indices(batch_hash))
+
+    def _previously_posted_items(
+        self,
+        batch_hash: str,
+        document_rows: Sequence[Mapping[str, Any]],
+        successful_indices: set[int],
+    ) -> list[dict[str, Any]]:
+        records: Sequence[Any] = ()
+        latest = getattr(
+            self.posting_repository,
+            "latest_successful_items",
+            None,
+        )
+        if callable(latest):
+            records = latest(batch_hash)
+        by_index = {
+            int(getattr(record, "source_item_index")): record
+            for record in records
+        }
+        result: list[dict[str, Any]] = []
+        for source_index in sorted(successful_indices):
+            if source_index >= len(document_rows):
+                continue
+            source = document_rows[source_index]
+            record = by_index.get(source_index)
+
+            def previous(name: str, default: Any = None) -> Any:
+                return getattr(record, name, default) if record is not None else default
+
+            result.append(
+                {
+                    "source_item_index": source_index,
+                    "container": previous("container", source.get("container")),
+                    "bl": previous("bl", source.get("bl")),
+                    "fee": previous(
+                        "fee_selected",
+                        source.get("fee"),
+                    )
+                    or source.get("fee"),
+                    "amount": previous("amount", source.get("amount")),
+                    "sheet_name": previous("sheet_name"),
+                    "target_row": previous("target_row"),
+                    "target_cell": previous("target_cell"),
+                    "created_at": previous("created_at"),
+                }
+            )
+        return result
 
     def _latest_sync_sheet(self) -> str | None:
         if self.run_repository is None:

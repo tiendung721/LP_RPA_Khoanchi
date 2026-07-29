@@ -30,7 +30,11 @@ from .log_page import LogPage
 from .review_window import ReviewWindow
 from .settings_page import SettingsPage
 from .workflow_page import WorkflowPage
-from .excel_dialogs import ConflictResolutionDialog, MonthSelectionDialog
+from .excel_dialogs import (
+    ConflictResolutionDialog,
+    MonthSelectionDialog,
+    RepostSelectionDialog,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -413,7 +417,30 @@ class MainWindow(QMainWindow):
             return
         self._excel_context = "workflow"
         try:
-            self._excel_tasks.start_sync()
+            service = _attribute(self._excel_tasks, "daily_sync_service")
+            list_candidates = getattr(service, "source_sheet_candidates", None)
+            if not callable(list_candidates):
+                raise RuntimeError(
+                    "Dịch vụ đồng bộ chưa hỗ trợ chọn sheet nguồn."
+                )
+            candidates = list(list_candidates())
+            dialog = MonthSelectionDialog(
+                candidates,
+                self,
+                title="Chọn sheet tháng cần đồng bộ",
+                preselect_first=False,
+                show_recommendations=False,
+            )
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                self._excel_context = None
+                return
+            source_sheet_name = dialog.selected_sheet_name
+            if not source_sheet_name:
+                self._excel_context = None
+                return
+            self._excel_tasks.start_sync(
+                source_sheet_name=source_sheet_name
+            )
         except Exception as exc:
             self._show_excel_error(exc, operation="sync")
 
@@ -513,6 +540,8 @@ class MainWindow(QMainWindow):
                     sheet_candidates,
                     self,
                     title="Chọn sheet nhận khoản chi",
+                    preselect_first=False,
+                    show_recommendations=False,
                 )
                 if dialog.exec() != QDialog.DialogCode.Accepted:
                     self._excel_tasks.cancel_waiting()
@@ -523,6 +552,31 @@ class MainWindow(QMainWindow):
                 self._excel_tasks.cancel_waiting()
                 self._excel_context = "workflow"
                 self._excel_tasks.start_posting(sheet_name=sheet_name)
+                return
+
+            previously_posted = list(
+                _attribute(plan, "previously_posted_items", default=()) or ()
+            )
+            repost_selection_done = bool(
+                _attribute(plan, "repost_selection_done", default=False)
+            )
+            if (
+                operation == "posting"
+                and selected_sheet not in (None, "")
+                and previously_posted
+                and not repost_selection_done
+            ):
+                dialog = RepostSelectionDialog(previously_posted, self)
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    self._excel_tasks.cancel_waiting()
+                    return
+                repost_indices = dialog.selected_source_indices
+                self._excel_tasks.cancel_waiting()
+                self._excel_context = "workflow"
+                self._excel_tasks.start_posting(
+                    sheet_name=str(selected_sheet),
+                    repost_source_indices=repost_indices,
+                )
                 return
 
             remaining = [

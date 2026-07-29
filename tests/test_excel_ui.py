@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QPushButton
+from PySide6.QtWidgets import QDialog, QDialogButtonBox, QPushButton
 
+import app.ui.main_window as main_window_module
 from app.ui.excel_dialogs import (
     ConflictResolutionDialog,
     ManualRowPickerDialog,
     MonthSelectionDialog,
+    RepostSelectionDialog,
 )
 from app.ui.excel_task_controller import ExcelTaskController
+from app.ui.main_window import MainWindow
 from app.ui.settings_page import SettingsPage
 from app.ui.workflow_page import WorkflowPage
 
@@ -50,6 +54,60 @@ def test_step_three_locks_both_actions_while_running(qtbot) -> None:
     assert page.sync_daily_button.isEnabled()
     assert page.post_expenses_button.isEnabled()
     assert page.sync_daily_button.text() == "Đồng bộ dữ liệu Hàng ngày"
+
+
+def test_sync_button_requires_source_sheet_before_starting_analysis(
+    monkeypatch,
+) -> None:
+    candidates = [
+        SimpleNamespace(month=7, sheet_name="Tháng 7"),
+        SimpleNamespace(month=8, sheet_name="Tháng 8"),
+    ]
+
+    class Service:
+        def source_sheet_candidates(self) -> list[Any]:
+            return candidates
+
+    class Tasks:
+        daily_sync_service = Service()
+
+        def __init__(self) -> None:
+            self.sync_calls: list[dict[str, Any]] = []
+
+        def start_sync(self, **kwargs: Any) -> None:
+            self.sync_calls.append(kwargs)
+
+    captured: dict[str, Any] = {}
+
+    class Dialog:
+        def __init__(
+            self,
+            dialog_candidates: list[Any],
+            _parent: Any,
+            **kwargs: Any,
+        ) -> None:
+            captured["candidates"] = dialog_candidates
+            captured.update(kwargs)
+            self.selected_sheet_name = "Tháng 8"
+
+        def exec(self) -> QDialog.DialogCode:
+            return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(main_window_module, "MonthSelectionDialog", Dialog)
+    tasks = Tasks()
+    owner = SimpleNamespace(
+        _excel_tasks=tasks,
+        _excel_context=None,
+        _missing_excel_configuration=lambda **_kwargs: False,
+        _show_excel_error=lambda *_args, **_kwargs: None,
+    )
+
+    MainWindow.start_daily_sync(owner)
+
+    assert captured["candidates"] == candidates
+    assert captured["preselect_first"] is False
+    assert captured["show_recommendations"] is False
+    assert tasks.sync_calls == [{"source_sheet_name": "Tháng 8"}]
 
 
 def test_settings_round_trip_optional_excel_paths_and_reject_xls(
@@ -286,6 +344,115 @@ def test_month_and_conflict_dialogs_collect_generic_mapping(qtbot) -> None:
     assert result["occupied"]["action"] == "ADD"
     assert result["unknown"]["action"] == "SELECT_FEE"
     assert result["unknown"]["selected_fee"] == "SC"
+
+
+def test_posting_month_dialog_has_no_default_or_recommendation(qtbot) -> None:
+    dialog = MonthSelectionDialog(
+        [
+            {
+                "sheet_name": "T06 26",
+                "month": 6,
+                "year": 2026,
+                "match_count": 2,
+                "is_recent": True,
+            },
+            {
+                "sheet_name": "T07 26",
+                "month": 7,
+                "year": 2026,
+                "match_count": 4,
+            },
+        ],
+        title="Chọn sheet nhận khoản chi",
+        preselect_first=False,
+        show_recommendations=False,
+    )
+    qtbot.addWidget(dialog)
+
+    assert dialog.table.currentRow() == -1
+    assert dialog.selected_sheet_name is None
+    assert dialog.table.isColumnHidden(3)
+    assert dialog.table.isColumnHidden(4)
+    assert not dialog.buttons.button(
+        QDialogButtonBox.StandardButton.Ok
+    ).isEnabled()
+
+    dialog.table.selectRow(1)
+
+    assert dialog.selected_sheet_name == "T07 26"
+    assert dialog.buttons.button(
+        QDialogButtonBox.StandardButton.Ok
+    ).isEnabled()
+
+
+def test_repost_dialog_defaults_to_unposted_and_selects_individual_rows(
+    qtbot,
+) -> None:
+    dialog = RepostSelectionDialog(
+        [
+            {
+                "source_item_index": 3,
+                "container": "DRYU3026167",
+                "fee_selected": "VTN",
+                "amount": 1_000_000,
+                "sheet_name": "T07 26",
+                "target_row": 12,
+                "target_cell": "Q12",
+                "created_at": "2026-07-29T09:15:00",
+            }
+        ]
+    )
+    qtbot.addWidget(dialog)
+
+    assert dialog.unposted_only.isChecked()
+    assert not dialog.table.isEnabled()
+    assert dialog.selected_source_indices == []
+
+    dialog.choose_reposts.setChecked(True)
+    dialog.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+
+    assert dialog.table.isEnabled()
+    assert dialog.selected_source_indices == [3]
+
+
+def test_conflict_actions_are_short_vietnamese_labels(qtbot) -> None:
+    dialog = ConflictResolutionDialog(
+        [
+            {
+                "conflict_id": "duplicate",
+                "type": "MULTIPLE_CONTAINER_MATCH",
+                "allowed_actions": ["SKIP", "SELECT_ROW"],
+                "row_candidates": [{"row_number": 12}, {"row_number": 13}],
+            },
+            {
+                "conflict_id": "occupied",
+                "type": "TARGET_CELL_OCCUPIED",
+                "allowed_actions": [
+                    "KEEP_EXISTING",
+                    "OVERWRITE",
+                    "ADD",
+                    "SKIP",
+                ],
+            },
+        ]
+    )
+    qtbot.addWidget(dialog)
+
+    duplicate_labels = [
+        dialog._action_combos["duplicate"].itemText(index)
+        for index in range(dialog._action_combos["duplicate"].count())
+    ]
+    occupied_labels = [
+        dialog._action_combos["occupied"].itemText(index)
+        for index in range(dialog._action_combos["occupied"].count())
+    ]
+
+    assert duplicate_labels == ["Bỏ qua", "Chọn dòng"]
+    assert occupied_labels == ["Giữ nguyên", "Ghi đè", "Cộng thêm", "Bỏ qua"]
+    assert not any(
+        "_" in label
+        for label in duplicate_labels + occupied_labels
+    )
 
 
 def test_manual_row_picker_returns_only_workbook_row(qtbot) -> None:

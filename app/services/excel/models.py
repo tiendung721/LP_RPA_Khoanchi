@@ -120,6 +120,16 @@ class TargetCellState:
 
 
 @dataclass(slots=True)
+class SourceSheetCandidate:
+    month: int
+    source_sheet: str
+
+    @property
+    def sheet_name(self) -> str:
+        return self.source_sheet
+
+
+@dataclass(slots=True)
 class MonthCandidate:
     month: int
     source_sheet: str
@@ -128,6 +138,7 @@ class MonthCandidate:
     last_sqt: int = 0
     match_count: int = 0
     recently_synced: bool = False
+    year: int | None = None
 
     @property
     def sheet_name(self) -> str:
@@ -193,13 +204,15 @@ class SyncPlan:
     target_path: Path
     source_fingerprint: WorkbookFingerprint
     target_fingerprint: WorkbookFingerprint
-    source_year: int
-    target_year: int
     month_candidates: list[MonthCandidate]
     rows_by_month: dict[int, list[SyncRow]]
+    source_year: int | None = None
+    target_year: int | None = None
+    rows_by_target: dict[str, list[SyncRow]] = field(default_factory=dict)
     source_snapshot_fingerprint: WorkbookFingerprint | None = None
     conflicts: list[SyncConflict] = field(default_factory=list)
     selected_month: int | None = None
+    selected_target_sheet: str | None = None
     run_id: int | None = None
 
     @property
@@ -208,12 +221,16 @@ class SyncPlan:
 
     @property
     def rows(self) -> list[SyncRow]:
+        if self.selected_target_sheet is not None and self.rows_by_target:
+            return list(self.rows_by_target.get(self.selected_target_sheet, ()))
         if self.selected_month is None:
             return []
         return list(self.rows_by_month.get(self.selected_month, ()))
 
     @property
     def selected_sheet(self) -> str | None:
+        if self.selected_target_sheet is not None:
+            return self.selected_target_sheet
         for candidate in self.month_candidates:
             if candidate.month == self.selected_month:
                 return candidate.target_sheet
@@ -221,11 +238,13 @@ class SyncPlan:
 
     @property
     def has_changes(self) -> bool:
-        return any(self.rows_by_month.values())
+        return any(
+            (self.rows_by_target or self.rows_by_month).values()
+        )
 
     @property
     def requires_user_input(self) -> bool:
-        return self.selected_month is None or any(
+        return self.selected_sheet is None or any(
             conflict.default_action is None for conflict in self.conflicts
         )
 
@@ -280,6 +299,7 @@ class PostingItem:
     status: PostingItemStatus = PostingItemStatus.PLANNED
     row_candidates: list[RowCandidate] = field(default_factory=list)
     source_items: list[dict[str, Any]] = field(default_factory=list)
+    force_repost: bool = False
 
     @property
     def fee(self) -> str:
@@ -358,6 +378,9 @@ class PostingPlan:
     selected_sheet: str | None = None
     source_item_count: int = 0
     already_posted_indices: set[int] = field(default_factory=set)
+    previously_posted_items: list[Any] = field(default_factory=list)
+    repost_source_indices: set[int] = field(default_factory=set)
+    repost_selection_done: bool = False
     run_id: int | None = None
 
     @property
@@ -366,8 +389,13 @@ class PostingPlan:
 
     @property
     def requires_user_input(self) -> bool:
-        return self.selected_sheet is None or any(
-            conflict.default_action is None for conflict in self.conflicts
+        return (
+            self.selected_sheet is None
+            or (
+                bool(self.previously_posted_items)
+                and not self.repost_selection_done
+            )
+            or bool(self.conflicts)
         )
 
     @property

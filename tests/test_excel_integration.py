@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterable
@@ -239,6 +240,7 @@ def _posting_service(
     *,
     posting_repository: Any | None = None,
     run_repository: Any | None = None,
+    clock: Any | None = None,
 ) -> ExpensePostingService:
     return ExpensePostingService(
         _ReadyProvider(ready),
@@ -247,6 +249,7 @@ def _posting_service(
         backup_dir=runtime_dir / "Backup",
         posting_repository=posting_repository,
         run_repository=run_repository,
+        clock=clock,
     )
 
 
@@ -322,7 +325,7 @@ def test_daily_sync_filters_by_max_sqt_preserves_order_and_is_idempotent(
     target_before = _sha256(target)
 
     service = _sync_service(daily, target, runtime_dir)
-    plan = service.analyze()
+    plan = service.analyze(source_sheet_name="Tháng 7")
 
     assert plan.selected_month == 7
     assert [row.sqt for row in plan.rows] == [700, 700, 701, 701]
@@ -378,6 +381,95 @@ def test_daily_sync_filters_by_max_sqt_preserves_order_and_is_idempotent(
     assert second_result.backup_path is None
     assert _sha256(target) == target_after_first_apply
     assert len(list((runtime_dir / "Backup").iterdir())) == backup_count
+
+
+def test_daily_sync_accepts_vt_bo_as_target_transport_header(
+    tmp_path: Path,
+) -> None:
+    daily = tmp_path / "Hàng ngày 2026.xlsx"
+    target = tmp_path / "BK 2026.xlsx"
+    runtime_dir = tmp_path / "Excel"
+    _save_daily(daily, [_sync_row(700)], month=7)
+    _save_target(target, [_sync_row(699)], month=7)
+
+    workbook = load_workbook(target)
+    try:
+        workbook["T07 26"]["P1"] = "VT bộ"
+        workbook.save(target)
+    finally:
+        workbook.close()
+
+    service = _sync_service(daily, target, runtime_dir)
+    plan = service.analyze(source_sheet_name="Tháng 7")
+
+    assert plan.selected_sheet == "T07 26"
+    assert [row.sqt for row in plan.rows] == [700]
+    service.cancel(plan)
+
+
+def test_daily_sync_lists_month_sheets_and_analyzes_only_selected_source(
+    tmp_path: Path,
+) -> None:
+    daily = tmp_path / "Hàng ngày.xlsx"
+    target = tmp_path / "BK.xlsx"
+    runtime_dir = tmp_path / "Excel"
+
+    workbook = Workbook()
+    july = workbook.active
+    july.title = "Tháng 7"
+    july.append(SYNC_HEADERS)
+    july.append(_sync_row(700, "JULY0000001"))
+    august = workbook.create_sheet("Tháng 8")
+    august.append(["Header sai"])
+    august.append([800])
+    workbook.create_sheet("Ghi chú")
+    workbook.save(daily)
+    workbook.close()
+
+    workbook = Workbook()
+    july_target = workbook.active
+    july_target.title = "T07 26"
+    _populate_target_sheet(july_target, [_sync_row(699, "OLDU0000001")])
+    august_target = workbook.create_sheet("T08 26")
+    _populate_target_sheet(august_target, [_sync_row(799, "OLDU0000002")])
+    workbook.save(target)
+    workbook.close()
+
+    service = _sync_service(daily, target, runtime_dir)
+
+    assert [
+        (candidate.month, candidate.sheet_name)
+        for candidate in service.source_sheet_candidates()
+    ] == [(7, "Tháng 7"), (8, "Tháng 8")]
+
+    progress: list[str] = []
+    plan = service.analyze(
+        source_sheet_name="Tháng 7",
+        progress_callback=progress.append,
+    )
+
+    assert plan.selected_month == 7
+    assert plan.selected_sheet == "T07 26"
+    assert [row.sqt for row in plan.rows] == [700]
+    assert [candidate.source_sheet for candidate in plan.month_candidates] == [
+        "Tháng 7"
+    ]
+    assert any("Tháng 7" in message for message in progress)
+    assert not any("Tháng 8" in message for message in progress)
+    service.cancel(plan)
+
+
+def test_daily_sync_rejects_source_sheet_not_in_daily_workbook(
+    tmp_path: Path,
+) -> None:
+    daily = tmp_path / "Hàng ngày.xlsx"
+    target = tmp_path / "BK.xlsx"
+    _save_daily(daily, [_sync_row(700)], month=7)
+    _save_target(target, [_sync_row(699)], month=7)
+    service = _sync_service(daily, target, tmp_path / "Excel")
+
+    with pytest.raises(DailySyncError, match="Không tìm thấy sheet nguồn"):
+        service.analyze(source_sheet_name="Tháng 8")
 
 
 def test_daily_sync_creates_new_month_from_previous_nonempty_template(
@@ -481,7 +573,10 @@ def test_posting_groups_normalized_container_and_keeps_bl_only_rows_separate(
     workbook.close()
 
     service = _posting_service(ready, target, runtime_dir)
-    plan = service.analyze()
+    unselected = service.analyze()
+    assert unselected.selected_sheet is None
+    assert [item.target_sheet for item in unselected.sheet_candidates] == ["T07 26"]
+    plan = service.analyze(sheet_name="T07 26")
 
     assert plan.selected_sheet == "T07 26"
     assert len(plan.items) == 3
@@ -550,7 +645,7 @@ def test_posting_cell_conflicts_honor_add_overwrite_and_skip_resolutions(
     workbook.close()
 
     service = _posting_service(ready, target, runtime_dir)
-    plan = service.analyze()
+    plan = service.analyze(sheet_name="T07 26")
     by_container = {item.container: item for item in plan.items}
 
     assert by_container[containers[0]].cell_state.kind is TargetCellKind.EMPTY
@@ -637,16 +732,23 @@ def test_posting_uses_primary_row_beside_ron_and_reports_unsafe_matches(
     workbook.save(target)
     workbook.close()
 
-    plan = _posting_service(ready, target, runtime_dir).analyze()
+    plan = _posting_service(ready, target, runtime_dir).analyze(
+        sheet_name="T07 26"
+    )
     by_container = {item.container: item for item in plan.items if item.container}
 
-    assert by_container[primary_and_ron].target_row == 2
+    assert by_container[primary_and_ron].target_row is None
     assert by_container[ambiguous].target_row is None
     assert by_container[missing].target_row is None
     conflict_types = {
         conflict.conflict_type for conflict in plan.conflicts
     }
-    assert ConflictType.MULTIPLE_CONTAINER_MATCH in conflict_types
+    multiple = [
+        conflict
+        for conflict in plan.conflicts
+        if conflict.conflict_type is ConflictType.MULTIPLE_CONTAINER_MATCH
+    ]
+    assert len(multiple) == 2
     assert ConflictType.CONTAINER_NOT_FOUND in conflict_types
     assert ConflictType.BL_ONLY_NO_CONTAINER in conflict_types
 
@@ -672,7 +774,9 @@ def test_posting_unknown_fee_and_invoice_header_are_never_auto_mapped(
     workbook.save(target)
     workbook.close()
 
-    plan = _posting_service(ready, target, runtime_dir).analyze()
+    plan = _posting_service(ready, target, runtime_dir).analyze(
+        sheet_name="T07 26"
+    )
     conflicts = {
         conflict.conflict_type: conflict for conflict in plan.conflicts
     }
@@ -702,7 +806,9 @@ def test_posting_rejects_invoice_unit_price_alias_after_notes(
     workbook.save(target)
     workbook.close()
 
-    plan = _posting_service(ready, target, tmp_path / "Excel").analyze()
+    plan = _posting_service(ready, target, tmp_path / "Excel").analyze(
+        sheet_name="T07 26"
+    )
 
     conflict = next(
         item
@@ -739,16 +845,18 @@ def test_posting_partial_replay_sums_only_unposted_source_rows(
         runtime_dir,
         posting_repository=repository,
     )
-    plan = service.analyze()
+    first_plan = service.analyze(sheet_name="T07 26")
 
-    assert plan.already_posted_indices == {0}
+    assert first_plan.already_posted_indices == {0}
+    assert len(first_plan.previously_posted_items) == 1
+    assert first_plan.requires_user_input
+    plan = service.analyze(
+        sheet_name="T07 26",
+        repost_source_indices=[],
+    )
     assert len(plan.items) == 1
     assert plan.items[0].source_indices == [1]
     assert plan.items[0].amount == 250
-    assert any(
-        conflict.conflict_type is ConflictType.BATCH_ALREADY_POSTED
-        for conflict in plan.conflicts
-    )
 
     result = service.apply(plan, {})
 
@@ -776,7 +884,7 @@ def test_posting_aborts_without_backup_when_target_changes_after_analyze(
     workbook.save(target)
     workbook.close()
     service = _posting_service(ready, target, runtime_dir)
-    plan = service.analyze()
+    plan = service.analyze(sheet_name="T07 26")
 
     workbook = load_workbook(target)
     workbook["T07 26"]["A30"] = "external change"
@@ -958,6 +1066,205 @@ def test_posting_history_preserves_keep_action_and_cell_value(
     assert not (runtime_dir / "Backup").exists()
 
 
+def test_daily_sync_ignores_filename_year_and_requires_target_sheet_when_ambiguous(
+    tmp_path: Path,
+) -> None:
+    daily = tmp_path / "bao cao noi bo 2025-2027.xlsx"
+    target = tmp_path / "so cai tong hop.xlsx"
+    _save_daily(daily, [_sync_row(700)])
+    workbook = Workbook()
+    first = workbook.active
+    first.title = "T07 25"
+    _populate_target_sheet(first, [_sync_row(700, "OLDU0000001")])
+    second = workbook.create_sheet("T07 26")
+    _populate_target_sheet(second, [_sync_row(699, "OLDU0000002")])
+    workbook.save(target)
+    workbook.close()
+
+    service = _sync_service(daily, target, tmp_path / "Excel")
+    plan = service.analyze(source_sheet_name="Tháng 7")
+
+    assert plan.source_year is None
+    assert plan.selected_sheet is None
+    assert {item.target_sheet for item in plan.month_candidates} == {
+        "T07 25",
+        "T07 26",
+    }
+    assert {
+        item.target_sheet: item.new_row_count
+        for item in plan.month_candidates
+    } == {"T07 25": 0, "T07 26": 1}
+    conflict = next(
+        item
+        for item in plan.conflicts
+        if item.conflict_type is ConflictType.TARGET_MONTH_AMBIGUOUS
+    )
+    result = service.apply(
+        plan,
+        {
+            conflict.conflict_id: {
+                "action": "SELECT_MONTH",
+                "selected_month": 7,
+                "selected_sheet": "T07 26",
+            }
+        },
+    )
+
+    assert result.sheet_name == "T07 26"
+    workbook = load_workbook(target)
+    try:
+        assert workbook["T07 25"]["A3"].value is None
+        assert workbook["T07 26"]["A3"].value == 700
+    finally:
+        workbook.close()
+
+
+def test_daily_sync_uses_the_only_existing_sheet_for_source_month(
+    tmp_path: Path,
+) -> None:
+    daily = tmp_path / "du lieu tuy chon.xlsx"
+    target = tmp_path / "bk nhieu nam.xlsx"
+    _save_daily(daily, [_sync_row(700)])
+    workbook = Workbook()
+    july = workbook.active
+    july.title = "T07 25"
+    _populate_target_sheet(july, [_sync_row(699, "OLDU0000001")])
+    june = workbook.create_sheet("T06 26")
+    _populate_target_sheet(june, [_sync_row(699, "OLDU0000002")])
+    workbook.save(target)
+    workbook.close()
+
+    service = _sync_service(daily, target, tmp_path / "Excel")
+    plan = service.analyze()
+
+    assert [item.target_sheet for item in plan.month_candidates] == ["T07 25"]
+    assert plan.selected_sheet == "T07 25"
+    assert not any(
+        item.conflict_type is ConflictType.TARGET_MONTH_AMBIGUOUS
+        for item in plan.conflicts
+    )
+
+    result = service.apply(plan, {})
+
+    assert result.sheet_name == "T07 25"
+    workbook = load_workbook(target)
+    try:
+        assert workbook["T07 25"]["A3"].value == 700
+        assert "T07 26" not in workbook.sheetnames
+    finally:
+        workbook.close()
+
+
+@pytest.mark.parametrize("existing_header", [None, "Data cập nhật", "Date cập nhật"])
+def test_posting_writes_or_reuses_update_date_column(
+    tmp_path: Path,
+    existing_header: str | None,
+) -> None:
+    ready = tmp_path / "ready.json"
+    target = tmp_path / "BK tuy chon.xlsx"
+    fixed = datetime(2026, 7, 29, 15, 4, 5)
+    _save_ready(ready, [["DRYU3026167", None, "NV", "ST", 100]])
+    workbook = Workbook()
+    sheet = _new_posting_sheet(workbook, "T07 26")
+    _add_posting_row(sheet, 2, "DRYU3026167")
+    last_header = len(POSTING_BASE_HEADERS) + len(POSTING_FEE_COLUMNS) + 2
+    sheet.cell(1, last_header).fill = PatternFill("solid", fgColor="FFF2CC")
+    update_column = last_header + 1
+    if existing_header is not None:
+        sheet.cell(1, update_column).value = existing_header
+    workbook.save(target)
+    workbook.close()
+
+    service = _posting_service(
+        ready,
+        target,
+        tmp_path / "Excel",
+        clock=lambda: fixed,
+    )
+    result = service.apply(
+        service.analyze(sheet_name="T07 26"),
+        {},
+    )
+
+    assert result.written_cells == 1
+    workbook = load_workbook(target)
+    try:
+        sheet = workbook["T07 26"]
+        assert sheet.cell(1, update_column).value == (
+            existing_header or "Date cập nhật"
+        )
+        assert sheet.cell(2, update_column).value == fixed
+        assert sheet.cell(2, update_column).number_format == "dd/mm/yyyy hh:mm:ss"
+        if existing_header is None:
+            assert (
+                sheet.cell(1, update_column).fill.fgColor.rgb
+                == sheet.cell(1, last_header).fill.fgColor.rgb
+            )
+    finally:
+        workbook.close()
+
+
+def test_posting_same_value_only_updates_date_when_explicitly_reposted(
+    tmp_path: Path,
+) -> None:
+    ready = tmp_path / "ready.json"
+    target = tmp_path / "BK.xlsx"
+    fixed = datetime(2026, 7, 29, 16, 30, 0)
+    _save_ready(ready, [["DRYU3026167", None, "NV", "ST", 100]])
+    workbook = Workbook()
+    sheet = _new_posting_sheet(workbook, "T07 26")
+    _add_posting_row(sheet, 2, "DRYU3026167")
+    sheet.cell(2, POSTING_FEE_COLUMNS["NV"]).value = 100
+    workbook.save(target)
+    workbook.close()
+
+    normal = _posting_service(
+        ready,
+        target,
+        tmp_path / "Normal",
+        clock=lambda: fixed,
+    )
+    normal_result = normal.apply(normal.analyze(sheet_name="T07 26"), {})
+    assert normal_result.written_cells == 0
+    assert normal_result.backup_path is None
+    workbook = load_workbook(target)
+    try:
+        headers = [
+            workbook["T07 26"].cell(1, column).value
+            for column in range(1, workbook["T07 26"].max_column + 1)
+        ]
+        assert "Date cập nhật" not in headers
+    finally:
+        workbook.close()
+
+    repost = _posting_service(
+        ready,
+        target,
+        tmp_path / "Repost",
+        posting_repository=_PostedIndexRepository({0}),
+        clock=lambda: fixed,
+    )
+    repost_plan = repost.analyze(
+        sheet_name="T07 26",
+        repost_source_indices=[0],
+    )
+    repost_result = repost.apply(repost_plan, {})
+
+    assert repost_plan.items[0].force_repost
+    assert repost_result.written_cells == 1
+    workbook = load_workbook(target)
+    try:
+        sheet = workbook["T07 26"]
+        date_column = next(
+            column
+            for column in range(1, sheet.max_column + 1)
+            if sheet.cell(1, column).value == "Date cập nhật"
+        )
+        assert sheet.cell(2, date_column).value == fixed
+    finally:
+        workbook.close()
+
+
 def test_posting_sheet_cancel_is_audited_as_cancelled(
     tmp_path: Path,
 ) -> None:
@@ -977,17 +1284,9 @@ def test_posting_sheet_cancel_is_audited_as_cancelled(
         run_repository=runs,
     )
     plan = service.analyze()
-    conflict = next(
-        item
-        for item in plan.conflicts
-        if item.conflict_type is ConflictType.TARGET_SHEET_AMBIGUOUS
-    )
-
-    with pytest.raises(ExpensePostingError, match="Người dùng đã hủy"):
-        service.apply(
-            plan,
-            {conflict.conflict_id: {"action": "CANCEL"}},
-        )
+    assert plan.selected_sheet is None
+    assert not plan.conflicts
+    service.cancel(plan)
 
     assert runs.finished[-1]["status"] is ExcelRunStatus.CANCELLED
 

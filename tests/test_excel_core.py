@@ -201,10 +201,10 @@ def test_posting_target_cell_classification(
         ),
     ],
 )
-def test_posting_does_not_auto_select_a_single_non_primary_row(
+def test_posting_auto_selects_the_only_matching_row(
     candidate: RowCandidate,
 ) -> None:
-    assert ExpensePostingService._automatic_row([candidate]) is None
+    assert ExpensePostingService._automatic_row([candidate]) is candidate
 
 
 def test_posting_auto_selects_a_single_complete_non_ron_row() -> None:
