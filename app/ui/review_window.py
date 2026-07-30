@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
@@ -32,6 +33,8 @@ from PySide6.QtWidgets import (
 )
 
 from .edit_row_dialog import EditRowDialog
+from .container_load_delegate import InlineActionDelegate
+from .container_load_dialog import ContainerLoadPreviewDialog
 from .review_table_model import (
     FEE_CATALOG,
     ReviewFilterProxyModel,
@@ -40,6 +43,10 @@ from .review_table_model import (
     ReviewTableModel,
     RowStatus,
 )
+from app.container_load.validation import allocate_amount, row_fingerprint
+from app.ui.container_load_controller import ContainerLoadBusyError
+
+LOGGER = logging.getLogger(__name__)
 
 STATUS_VI = {
     "RECEIVED": "Đã tiếp nhận",
@@ -143,6 +150,7 @@ class ReviewWindow(QMainWindow):
         validator: Any | None = None,
         save_handler: Callable[[Any, Any], Any] | None = None,
         confirm_handler: Callable[[Any, Any], Any] | None = None,
+        container_load_controller: Any | None = None,
     ) -> None:
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
@@ -153,6 +161,8 @@ class ReviewWindow(QMainWindow):
         self._validator = validator
         self._save_handler = save_handler
         self._confirm_handler = confirm_handler
+        self._container_load_controller = container_load_controller
+        self._load_runtime_by_session: dict[str, str] = {}
         self._metadata, initial_rows = _extract_review(batch, rows)
         self._batch_id = _value(self._metadata, "id", "batch_id")
         self._last_saved_at = _value(self._metadata, "last_saved_at")
@@ -170,6 +180,7 @@ class ReviewWindow(QMainWindow):
         self._update_stats(self.model.stats)
         self._update_dirty(False)
         self._update_action_state()
+        self._connect_container_load()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -324,6 +335,13 @@ class ReviewWindow(QMainWindow):
         self.table.setColumnWidth(ReviewTableModel.COLUMN_CONT, 140)
         self.table.setColumnWidth(ReviewTableModel.COLUMN_BL, 130)
         self.table.setColumnWidth(ReviewTableModel.COLUMN_AMOUNT, 185)
+        self.table.setColumnWidth(ReviewTableModel.COLUMN_LOOKUP_RESULT, 190)
+        self.table.setColumnWidth(ReviewTableModel.COLUMN_LOOKUP_ACTION, 120)
+        self.lookup_action_delegate = InlineActionDelegate(self.table)
+        self.table.setItemDelegateForColumn(
+            ReviewTableModel.COLUMN_LOOKUP_ACTION,
+            self.lookup_action_delegate,
+        )
         self.table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         root.addWidget(self.table, 1)
 
@@ -364,6 +382,9 @@ class ReviewWindow(QMainWindow):
         self.model.dirtyChanged.connect(self._dirty_state_changed)
         self.model.validationChanged.connect(self._update_stats)
         self.model.rowsChanged.connect(self._update_visible_count)
+        self.lookup_action_delegate.clicked.connect(
+            self._lookup_action_clicked
+        )
 
     def _install_shortcuts(self) -> None:
         self.save_shortcut = QShortcut(QKeySequence.StandardKey.Save, self)
@@ -493,6 +514,10 @@ class ReviewWindow(QMainWindow):
         self._select_source_row(position)
 
     def edit_selected_row(self, _index: QModelIndex | None = None) -> None:
+        if _index is not None and _index.isValid() and _index.column() in {
+            ReviewTableModel.COLUMN_LOOKUP_ACTION,
+        }:
+            return
         source_row = self._selected_source_row()
         if source_row is None:
             return
@@ -711,6 +736,7 @@ class ReviewWindow(QMainWindow):
         self._last_saved_at = _value(metadata, "last_saved_at")
         self.model.set_rows(rows, mark_dirty=False)
         self._update_metadata_labels()
+        self._load_runtime_by_session.clear()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         if self.model.dirty:
@@ -734,5 +760,233 @@ class ReviewWindow(QMainWindow):
             if clicked is not discard and clicked is not save:
                 event.ignore()
                 return
+        controller = self._container_load_controller
+        if controller is not None:
+            controller.cancel_for_batch(self._batch_id)
         self.closed.emit()
         event.accept()
+
+    def _connect_container_load(self) -> None:
+        controller = self._container_load_controller
+        if controller is None:
+            return
+        controller.started.connect(self._container_load_started)
+        controller.progress.connect(self._container_load_progress)
+        controller.resultReady.connect(self._container_result_ready)
+        controller.resultRejected.connect(self._container_result_rejected)
+        controller.failed.connect(self._container_load_failed)
+
+    def _lookup_action_clicked(self, proxy_index: QModelIndex) -> None:
+        source_index = self.proxy_model.mapToSource(proxy_index)
+        if not source_index.isValid():
+            return
+        source_row = source_index.row()
+        runtime_id = self.model.runtime_id_at(source_row)
+        presentation = self.model.lookup_presentation(runtime_id)
+        if (
+            presentation.session_id
+            and presentation.status in {"WAITING_RESULT", "INVALID_RESULT"}
+        ):
+            self.cancel_container_load(source_row)
+            return
+        self.start_container_load(source_row)
+
+    def cancel_container_load(self, source_row: int) -> bool:
+        controller = self._container_load_controller
+        if controller is None or not (0 <= source_row < self.model.rowCount()):
+            return False
+        runtime_id = self.model.runtime_id_at(source_row)
+        presentation = self.model.lookup_presentation(runtime_id)
+        session_id = presentation.session_id
+        if not session_id:
+            return False
+        answer = QMessageBox.question(
+            self,
+            "Hủy Load số container",
+            "Bạn có chắc muốn dừng lượt Load số container đang chờ không?\n\n"
+            "Cửa sổ Custom GPT đã mở sẽ không bị đóng.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        cancel = getattr(controller, "cancel", None)
+        stopped = (
+            bool(cancel(session_id))
+            if callable(cancel)
+            else bool(controller.finish(session_id))
+        )
+        if not stopped:
+            QMessageBox.information(
+                self,
+                "Lượt Load đã kết thúc",
+                "Lượt Load số container này không còn hoạt động.",
+            )
+            return False
+        self._load_runtime_by_session.pop(session_id, None)
+        self.model.set_lookup_presentation(
+            runtime_id,
+            status="CANCELLED",
+            message="Đã hủy lượt Load số container.",
+            session_id=None,
+        )
+        self.statusBar().showMessage(
+            "Đã hủy lượt Load số container; có thể bắt đầu lượt mới.",
+            7000,
+        )
+        return True
+
+    def start_container_load(self, source_row: int) -> bool:
+        controller = self._container_load_controller
+        if controller is None:
+            QMessageBox.warning(
+                self,
+                "Chưa khởi tạo Load số container",
+                "Bộ Load số container chưa được khởi tạo.",
+            )
+            return False
+        try:
+            row = self.model.row_at(source_row)
+            controller.start_load(
+                batch_id=self._batch_id,
+                source_row=source_row,
+                row_runtime_id=row.runtime_id,
+                row_snapshot=row.as_array(),
+            )
+            return True
+        except ContainerLoadBusyError as exc:
+            QMessageBox.information(self, "Load số container đang bận", str(exc))
+            return False
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Không thể Load số container",
+                str(exc),
+            )
+            return False
+
+    def _container_load_started(self, session: Any) -> None:
+        if _value(session, "batch_id") != self._batch_id:
+            return
+        session_id = str(_value(session, "session_id", default=""))
+        runtime_id = str(_value(session, "row_runtime_id", default=""))
+        if self.model.find_runtime_id(runtime_id) is None:
+            self._container_load_controller.finish(session_id)
+            return
+        self._load_runtime_by_session[session_id] = runtime_id
+        self.model.set_lookup_presentation(
+            runtime_id,
+            status="WAITING_RESULT",
+            message=(
+                "Đang chờ file JSON kết quả cho B/L "
+                f"{_value(session, 'requested_bl')}."
+            ),
+            session_id=session_id,
+        )
+
+    def _container_load_progress(
+        self,
+        session_id: str,
+        status: str,
+        message: str,
+    ) -> None:
+        runtime_id = self._load_runtime_by_session.get(session_id)
+        if runtime_id is None:
+            return
+        self.model.set_lookup_presentation(
+            runtime_id,
+            status=status,
+            message=message,
+            session_id=session_id,
+        )
+        self.statusBar().showMessage(message)
+
+    def _container_result_ready(self, session: Any, result: Any) -> None:
+        if _value(session, "batch_id") != self._batch_id:
+            return
+        session_id = str(_value(session, "session_id", default=""))
+        runtime_id = str(_value(session, "row_runtime_id", default=""))
+        source_row = self.model.find_runtime_id(runtime_id)
+        if (
+            source_row is None
+            or row_fingerprint(self.model.row_at(source_row).as_array())
+            != _value(session, "row_fingerprint")
+        ):
+            self._container_load_controller.finish(session_id)
+            QMessageBox.warning(
+                self,
+                "Không thể áp dụng số container",
+                "Dòng gốc đã thay đổi hoặc bị xóa trong lúc chờ kết quả.",
+            )
+            return
+        row = self.model.row_at(source_row)
+        containers = tuple(_value(result, "containers", default=()) or ())
+        allocations = allocate_amount(row.amount, containers)
+        dialog = ContainerLoadPreviewDialog(
+            bl=str(row.bl or ""),
+            source_path=_value(result, "source_path", default=""),
+            original_amount=row.amount,
+            allocations=allocations,
+            parent=self,
+        )
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            replacements = [
+                ReviewRow(
+                    allocation.container,
+                    row.bl,
+                    row.fee,
+                    row.rule,
+                    allocation.amount,
+                )
+                for allocation in allocations
+            ]
+            self.model.replace_row(source_row, replacements)
+            self._select_source_row(source_row)
+            self.statusBar().showMessage(
+                f"Đã áp dụng {len(replacements)} số container; "
+                "hãy bấm Lưu để ghi dữ liệu.",
+                8000,
+            )
+        finally:
+            self._load_runtime_by_session.pop(session_id, None)
+            self._container_load_controller.finish(session_id)
+
+    def _container_result_rejected(
+        self,
+        session: Any,
+        raw_path: str,
+        message: str,
+    ) -> None:
+        if _value(session, "batch_id") != self._batch_id:
+            return
+        session_id = str(_value(session, "session_id", default=""))
+        runtime_id = self._load_runtime_by_session.get(session_id)
+        if runtime_id is not None:
+            self.model.set_lookup_presentation(
+                runtime_id,
+                status="INVALID_RESULT",
+                message=message,
+                session_id=session_id,
+            )
+        QMessageBox.warning(
+            self,
+            "JSON số container không hợp lệ",
+            f"{raw_path}\n\n{message}\n\n"
+            "Lượt Load vẫn đang chờ; hãy tải lại file JSON đã sửa.",
+        )
+
+    def _container_load_failed(self, session: Any, message: str) -> None:
+        if _value(session, "batch_id") != self._batch_id:
+            return
+        session_id = str(_value(session, "session_id", default=""))
+        runtime_id = self._load_runtime_by_session.pop(session_id, None)
+        if runtime_id is not None:
+            self.model.set_lookup_presentation(
+                runtime_id,
+                status="FAILED",
+                message=message,
+                session_id=session_id,
+            )
+        QMessageBox.warning(self, "Load số container thất bại", message)

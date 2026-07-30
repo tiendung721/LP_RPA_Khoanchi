@@ -137,6 +137,7 @@ class AppSettings:
     output_dir: Path = field(default_factory=default_output_dir)
     daily_workbook_path: str = ""
     bk_workbook_path: str = ""
+    container_gpt_bat_path: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.data_root, (str, os.PathLike)) or not str(
@@ -151,6 +152,7 @@ class AppSettings:
             ("assistant_bat_path", "Đường dẫn BAT"),
             ("daily_workbook_path", "Đường dẫn file Hàng ngày"),
             ("bk_workbook_path", "Đường dẫn file BK"),
+            ("container_gpt_bat_path", "Đường dẫn BAT Load số container"),
         )
         for attribute, label in optional_paths:
             value = getattr(self, attribute)
@@ -177,6 +179,7 @@ class AppSettings:
             "output_dir": str(self.output_dir),
             "daily_workbook_path": self.daily_workbook_path,
             "bk_workbook_path": self.bk_workbook_path,
+            "container_gpt_bat_path": self.container_gpt_bat_path,
         }
 
     @classmethod
@@ -193,6 +196,7 @@ class AppSettings:
             output_dir=value.get("output_dir", fallback.output_dir),
             daily_workbook_path=value.get("daily_workbook_path", ""),
             bk_workbook_path=value.get("bk_workbook_path", ""),
+            container_gpt_bat_path=value.get("container_gpt_bat_path", ""),
         )
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 from collections.abc import Mapping
 from pathlib import Path
 from threading import RLock
@@ -28,6 +29,8 @@ from app.repositories.excel_run_repository import ExcelRunRepository
 from app.repositories.expense_posting_repository import ExpensePostingRepository
 from app.services.batch_service import BatchService
 from app.services.assistant_bat_launcher import AssistantBatLauncher
+from app.container_load.service import ContainerLoadService
+from app.container_load.validation import is_container_result_document
 from app.services.excel import (
     DailySyncService,
     ExcelConfigurationService,
@@ -38,6 +41,7 @@ from app.services.json_codec import JsonCodec
 from app.services.reviewed_batch_provider import ReviewedBatchProvider
 from app.services.validation_service import ValidationService
 from app.ui.excel_task_controller import ExcelTaskController
+from app.ui.container_load_controller import ContainerLoadController
 
 LOGGER = logging.getLogger(__name__)
 
@@ -59,6 +63,16 @@ class ApplicationRuntime:
         self.paths = self.settings.paths
         moved_roots = migrate_legacy_runtime_layout(self.paths)
         self.paths.ensure_directories()
+        legacy_lookup_dir = self.paths.system_dir / "ContainerLookup"
+        if legacy_lookup_dir.is_dir():
+            try:
+                shutil.rmtree(legacy_lookup_dir)
+                LOGGER.info("Đã xóa artifact tra cứu container cũ: %s", legacy_lookup_dir)
+            except OSError:
+                LOGGER.exception(
+                    "Không thể xóa artifact tra cứu container cũ: %s",
+                    legacy_lookup_dir,
+                )
         self.log_path = setup_logging(self.paths)
 
         self.database = Database(self.paths.database_path)
@@ -72,7 +86,7 @@ class ApplicationRuntime:
             changed_rows += self.database.rebase_paths(old_root, new_root)
         if moved_roots or changed_rows:
             LOGGER.info(
-                "Đã gom dữ liệu vào %s; chuyển %s thư mục và cập nhật %s batch",
+                "Đã gom dữ liệu vào %s; chuyển %s thư mục và cập nhật %s bản ghi",
                 self.paths.system_dir,
                 moved_roots,
                 changed_rows,
@@ -104,6 +118,14 @@ class ApplicationRuntime:
         )
         self.assistant_launcher = AssistantBatLauncher(self.settings)
         self.launcher = self.assistant_launcher
+        self.container_load_service = ContainerLoadService(
+            self.settings,
+            self.assistant_launcher,
+        )
+        self.container_load_controller = ContainerLoadController(
+            self.container_load_service,
+            self.settings,
+        )
         self.watcher = OutputWatcher(
             self.settings,
             on_file_ready=self._receive_watcher_file,
@@ -121,6 +143,15 @@ class ApplicationRuntime:
     def _receive_watcher_file(self, path: Path) -> object:
         """Nhận callback đã được watcher chuyển an toàn về Qt owner thread."""
 
+        if (
+            self.container_load_controller.is_busy
+            or is_container_result_document(path)
+        ):
+            LOGGER.info(
+                "Bỏ qua JSON thuộc lượt Load số container ở watcher khoản chi: %s",
+                path.name,
+            )
+            return None
         LOGGER.info("Watcher chuyển file ổn định sang BatchService: %s", path.name)
         return self.batch_service.receive_file(path)
 
@@ -154,6 +185,11 @@ class ApplicationRuntime:
         task_controller = getattr(self, "excel_task_controller", None)
         if task_controller is not None and task_controller.is_busy:
             raise ValueError("Không thể đổi cấu hình khi tác vụ Excel đang chạy.")
+        load_controller = getattr(self, "container_load_controller", None)
+        if load_controller is not None and load_controller.is_busy:
+            raise ValueError(
+                "Không thể đổi cấu hình khi đang chờ kết quả số container."
+            )
         new_paths.ensure_directories()
         self.config_manager.save(settings)
         self.settings = settings
@@ -161,6 +197,7 @@ class ApplicationRuntime:
         self.batch_service.update_paths(new_paths)
         self.batch_service.max_file_size_bytes = settings.max_file_size_bytes
         self.assistant_launcher.update_settings(settings)
+        self.container_load_controller.update_settings(settings)
         self._configure_excel_services(settings)
         if task_controller is not None:
             task_controller.update_services(
@@ -223,6 +260,10 @@ class ApplicationRuntime:
             self.excel_task_controller.shutdown(wait=True)
         except Exception:
             LOGGER.exception("Không thể dừng worker Excel sạch")
+        try:
+            self.container_load_controller.shutdown()
+        except Exception:
+            LOGGER.exception("Không thể dừng watcher Load số container sạch")
         try:
             self.database.close()
         except Exception:

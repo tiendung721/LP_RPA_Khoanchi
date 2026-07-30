@@ -7,5 +7,12 @@ htmlcov/
 .venv/
 venv/
 .codex-temp/
+.dotnet-sdk/
+tools/CustomGptBridge/bin/
+tools/CustomGptBridge/obj/
+tools/CustomGptBridge/publish/
+Config/*.lock
+Database/*.db-wal
+Database/*.db-shm
 *.log
 Output/

@@ -89,6 +89,7 @@ def test_settings_round_trip_utf8(tmp_path: Path) -> None:
         output_dir=tmp_path / "Kết quả",
         daily_workbook_path=root / "Hàng ngày 2026.xlsx",
         bk_workbook_path=root / "BK Tổng hợp 2026.xlsm",
+        container_gpt_bat_path=str(root / "Mở GPT số container.bat"),
     )
 
     manager.save(settings)
@@ -98,6 +99,7 @@ def test_settings_round_trip_utf8(tmp_path: Path) -> None:
     assert loaded.output_dir == settings.output_dir
     assert loaded.daily_workbook_path == settings.daily_workbook_path
     assert loaded.bk_workbook_path == settings.bk_workbook_path
+    assert loaded.container_gpt_bat_path == settings.container_gpt_bat_path
     assert manager.settings_path.read_bytes().startswith(b"{")
 
 
@@ -159,7 +161,30 @@ def test_legacy_settings_are_rewritten_without_browser_or_inbox_keys(
         "output_dir",
         "daily_workbook_path",
         "bk_workbook_path",
+        "container_gpt_bat_path",
     }
+
+
+def test_database_v6_removes_legacy_pad_lookup_jobs(tmp_path: Path) -> None:
+    path = tmp_path / "legacy-pad.db"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "CREATE TABLE container_lookup_jobs "
+        "(job_id TEXT PRIMARY KEY, requested_bl TEXT)"
+    )
+    connection.execute("PRAGMA user_version = 5")
+    connection.commit()
+    connection.close()
+
+    database = Database(path)
+    row = database.query_one(
+        "SELECT name FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'container_lookup_jobs'"
+    )
+
+    assert row is None
+    assert database.query_one("PRAGMA user_version")[0] == 6
+    database.close()
 
 
 def test_copied_settings_rebase_paths_inside_the_old_bundle(tmp_path: Path) -> None:

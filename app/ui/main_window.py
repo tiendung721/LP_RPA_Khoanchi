@@ -97,6 +97,7 @@ class MainWindow(QMainWindow):
         excel_task_controller: Any | None = None,
         excel_configuration_service: Any | None = None,
         excel_run_repository: Any | None = None,
+        container_load_controller: Any | None = None,
     ) -> None:
         if isinstance(controller, QWidget) and parent is None:
             parent = controller
@@ -129,6 +130,10 @@ class MainWindow(QMainWindow):
         )
         self._excel_run_repository = excel_run_repository or _attribute(
             controller, "excel_run_repository"
+        )
+        self._container_load_controller = (
+            container_load_controller
+            or _attribute(controller, "container_load_controller")
         )
         self._excel_operation: str | None = None
         self._excel_context: str | None = None
@@ -955,6 +960,14 @@ class MainWindow(QMainWindow):
                 settings_data.get("assistant_bat_path"),
                 settings_data.get("output_dir"),
             )
+            container_gpt_bat = str(
+                settings_data.get("container_gpt_bat_path") or ""
+            ).strip()
+            if container_gpt_bat:
+                launcher.validate_configuration(
+                    container_gpt_bat,
+                    settings_data.get("output_dir"),
+                )
         except Exception as exc:
             self.settings_page.show_check_result(False, str(exc))
             return
@@ -1193,6 +1206,7 @@ class MainWindow(QMainWindow):
             parent=self,
             batch_service=self._batch_service,
             validator=self._validator,
+            container_load_controller=self._container_load_controller,
         )
         key = batch_identifier if batch_identifier is not None else id(window)
         self._review_windows[key] = window
@@ -1312,6 +1326,16 @@ class MainWindow(QMainWindow):
             update_launcher = getattr(self._assistant_launcher, "update_settings", None)
             if callable(update_launcher):
                 update_launcher(new_settings)
+            load_controller = self._container_load_controller
+            if (
+                load_controller is not None
+                and _attribute(load_controller, "settings") is not new_settings
+            ):
+                update_container_load = getattr(
+                    load_controller, "update_settings", None
+                )
+                if callable(update_container_load):
+                    update_container_load(new_settings)
             if self._batch_service is not None and hasattr(
                 self._batch_service, "max_file_size_bytes"
             ):

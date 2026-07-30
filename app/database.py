@@ -81,6 +81,14 @@ class Database:
                 self._migration_4(connection)
                 connection.execute("PRAGMA user_version = 4")
                 current_version = 4
+            if current_version < 5:
+                self._migration_5(connection)
+                connection.execute("PRAGMA user_version = 5")
+                current_version = 5
+            if current_version < 6:
+                self._migration_6(connection)
+                connection.execute("PRAGMA user_version = 6")
+                current_version = 6
             if current_version != SQLITE_SCHEMA_VERSION:
                 raise DatabaseError("Không thể nâng cấp database đến phiên bản hiện tại.")
 
@@ -252,6 +260,18 @@ class Database:
                 WHERE status IN ('POSTED', 'ALREADY_EXISTS')
             """
         )
+
+    @staticmethod
+    def _migration_5(connection: sqlite3.Connection) -> None:
+        """Phiên bản lịch sử; không tạo dữ liệu tra cứu đã bị loại bỏ."""
+
+        del connection
+
+    @staticmethod
+    def _migration_6(connection: sqlite3.Connection) -> None:
+        """Loại bỏ bảng job của luồng tra cứu container cũ."""
+
+        connection.execute("DROP TABLE IF EXISTS container_lookup_jobs")
 
     @contextmanager
     def transaction(

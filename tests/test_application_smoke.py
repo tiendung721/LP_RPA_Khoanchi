@@ -55,14 +55,21 @@ def test_runtime_and_main_window_start_with_isolated_data_root(
             == "Nhập khoản chi vào BK"
         )
         settings_edits = window.settings_page.findChildren(QLineEdit)
-        assert len(settings_edits) == 4
         assert {
-            edit.objectName() for edit in settings_edits
+            "assistantBatEdit",
+            "outputDirEdit",
+            "containerGptBatEdit",
+        }.issubset({edit.objectName() for edit in settings_edits})
+        assert {
+            edit.objectName()
+            for edit in settings_edits
+            if not edit.objectName().startswith("qt_")
         } == {
             "assistantBatEdit",
             "outputDirEdit",
             "dailyWorkbookEdit",
             "bkWorkbookEdit",
+            "containerGptBatEdit",
         }
         visible_text = " ".join(
             widget.text()
@@ -70,7 +77,9 @@ def test_runtime_and_main_window_start_with_isolated_data_root(
             for widget in window.findChildren(widget_type)
         ).casefold()
         assert "inbox" not in visible_text
-        assert "gpt" not in visible_text
+        assert "outlook" not in visible_text
+        assert "power automate" not in visible_text
+        assert "webview2" not in visible_text
         runtime.record_output_scan(0)
         assert runtime.repository.get_app_state(APP_STATE_LAST_OUTPUT_SCAN)
     finally:
@@ -85,6 +94,23 @@ def test_configured_data_root_prefers_cli_then_environment(tmp_path: Path) -> No
     assert configured_data_root(cli, environment={"TRO_LY_DATA_ROOT": str(env)}) == cli
     assert configured_data_root(None, environment={"TRO_LY_DATA_ROOT": str(env)}) == env
     assert configured_data_root(None, environment={}) is None
+
+
+def test_expense_watcher_ignores_container_json_with_any_filename(
+    tmp_path: Path,
+) -> None:
+    runtime = _isolated_runtime(tmp_path)
+    result = runtime.paths.output_dir / "ket_qua_boc_tach_result.json"
+    result.write_text(
+        json.dumps({"containers": ["VSGU2250713"]}),
+        encoding="utf-8",
+    )
+
+    try:
+        assert runtime._receive_watcher_file(result) is None
+        assert runtime.repository.list_batches() == []
+    finally:
+        runtime.close()
 
 
 def test_new_download_automatically_opens_review_window(

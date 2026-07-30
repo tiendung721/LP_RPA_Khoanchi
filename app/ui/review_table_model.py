@@ -8,9 +8,10 @@ from __future__ import annotations
 
 from collections import Counter, OrderedDict
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import Enum
 from typing import Any, Final
+from uuid import uuid4
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt, Signal
 from PySide6.QtGui import QColor
@@ -84,6 +85,7 @@ class ReviewRow:
     fee: Any = "CXD"
     rule: Any = None
     amount: Any = None
+    runtime_id: str = field(default_factory=lambda: uuid4().hex)
 
     def as_array(self) -> list[Any]:
         return [self.cont, self.bl, self.fee, self.rule, self.amount]
@@ -124,6 +126,13 @@ class ReviewStats:
     fee_counts: dict[str, int]
 
 
+@dataclass(frozen=True, slots=True)
+class ContainerLoadPresentation:
+    status: str = ""
+    message: str = ""
+    session_id: str | None = None
+
+
 def _mapping_value(value: Mapping[str, Any], *names: str, default: Any = None) -> Any:
     for name in names:
         if name in value:
@@ -135,7 +144,7 @@ def coerce_review_row(value: Any) -> ReviewRow:
     """Chuyển dataclass/dict/list/object từ core thành ``ReviewRow``."""
 
     if isinstance(value, ReviewRow):
-        return ReviewRow(*value.as_array())
+        return ReviewRow(*value.as_array(), runtime_id=value.runtime_id)
     if isinstance(value, Mapping):
         return ReviewRow(
             _mapping_value(value, "cont", "container"),
@@ -225,6 +234,13 @@ class ReviewTableModel(QAbstractTableModel):
     COLUMN_AMOUNT = 7
     COLUMN_STATUS = 8
     COLUMN_MESSAGES = 9
+    COLUMN_LOOKUP_RESULT = 10
+    COLUMN_LOOKUP_ACTION = 11
+
+    ACTION_VISIBLE_ROLE = int(Qt.ItemDataRole.UserRole) + 10
+    ACTION_ENABLED_ROLE = int(Qt.ItemDataRole.UserRole) + 11
+    RUNTIME_ID_ROLE = int(Qt.ItemDataRole.UserRole) + 12
+    LOAD_SESSION_ID_ROLE = int(Qt.ItemDataRole.UserRole) + 13
 
     HEADERS: Final[tuple[str, ...]] = (
         "STT",
@@ -237,6 +253,8 @@ class ReviewTableModel(QAbstractTableModel):
         "Số tiền cuối cùng (VND)",
         "Trạng thái",
         "Cảnh báo / lỗi",
+        "Kết quả số cont",
+        "Load số cont",
     )
 
     def __init__(
@@ -252,6 +270,7 @@ class ReviewTableModel(QAbstractTableModel):
         self._stats = ReviewStats(0, 0, 0, 0, 0, 0, 0, 0, {})
         self._dirty = False
         self._validator = validator
+        self._lookup_presentations: dict[str, ContainerLoadPresentation] = {}
         if rows is not None:
             self.set_rows(rows, mark_dirty=False)
         else:
@@ -287,6 +306,9 @@ class ReviewTableModel(QAbstractTableModel):
             return None
         row = self._rows[index.row()]
         result = self._validation[index.row()]
+        lookup = self._lookup_presentations.get(
+            row.runtime_id, ContainerLoadPresentation()
+        )
         column = index.column()
 
         if role == Qt.ItemDataRole.UserRole:
@@ -295,9 +317,26 @@ class ReviewTableModel(QAbstractTableModel):
             return result.status.value
         if role == Qt.ItemDataRole.UserRole + 2:
             return row.as_array()
+        if role == self.RUNTIME_ID_ROLE:
+            return row.runtime_id
+        if role == self.LOAD_SESSION_ID_ROLE:
+            return lookup.session_id
+        if role == self.ACTION_VISIBLE_ROLE:
+            return self._lookup_eligible(row) and column == self.COLUMN_LOOKUP_ACTION
+        if role == self.ACTION_ENABLED_ROLE:
+            return self._lookup_eligible(row) and column == self.COLUMN_LOOKUP_ACTION
         if role == Qt.ItemDataRole.DisplayRole:
-            return self._display_value(row, result, column, index.row())
+            return self._display_value(row, result, lookup, column, index.row())
         if role == Qt.ItemDataRole.ToolTipRole:
+            if column == self.COLUMN_LOOKUP_RESULT:
+                return lookup.message or "Chưa Load số container."
+            if column == self.COLUMN_LOOKUP_ACTION:
+                if self._load_is_active(lookup):
+                    return (
+                        "Dừng chờ JSON số container. Cửa sổ Custom GPT "
+                        "đã mở sẽ không bị đóng."
+                    )
+                return "Mở Custom GPT và chờ một file JSON mới trong Output."
             messages = "\n".join(result.messages)
             return messages or "Dòng hợp lệ."
         if role == Qt.ItemDataRole.BackgroundRole:
@@ -312,15 +351,20 @@ class ReviewTableModel(QAbstractTableModel):
             ) is None:
                 return QColor(MUTED_TEXT)
         if role == Qt.ItemDataRole.TextAlignmentRole:
-            if column in (self.COLUMN_NO, self.COLUMN_FEE, self.COLUMN_RULE, self.COLUMN_STATUS):
+            if column in (
+                self.COLUMN_NO,
+                self.COLUMN_FEE,
+                self.COLUMN_RULE,
+                self.COLUMN_STATUS,
+                self.COLUMN_LOOKUP_ACTION,
+            ):
                 return int(Qt.AlignmentFlag.AlignCenter)
             if column == self.COLUMN_AMOUNT:
                 return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         return None
 
-    @classmethod
     def _raw_value(
-        cls, row: ReviewRow, result: RowValidation, column: int, source_row: int
+        self, row: ReviewRow, result: RowValidation, column: int, source_row: int
     ) -> Any:
         values: tuple[Any, ...] = (
             source_row + 1,
@@ -335,25 +379,42 @@ class ReviewTableModel(QAbstractTableModel):
             row.amount,
             result.status.value,
             "\n".join(result.messages),
+            "",
+            "",
         )
         return values[column] if 0 <= column < len(values) else None
 
-    @classmethod
     def _display_value(
-        cls, row: ReviewRow, result: RowValidation, column: int, source_row: int
+        self,
+        row: ReviewRow,
+        result: RowValidation,
+        lookup: ContainerLoadPresentation,
+        column: int,
+        source_row: int,
     ) -> str | int:
-        value = cls._raw_value(row, result, column, source_row)
-        if column in (cls.COLUMN_CONT, cls.COLUMN_BL, cls.COLUMN_RULE) and value is None:
+        if column == self.COLUMN_LOOKUP_RESULT:
+            labels = {
+                "WAITING_RESULT": "Đang chờ JSON…",
+                "INVALID_RESULT": "JSON không hợp lệ",
+                "RESULT_READY": "Đã nhận kết quả",
+                "FAILED": "Load số cont lỗi",
+                "CANCELLED": "Đã hủy Load",
+            }
+            return labels.get(lookup.status, "—")
+        if column == self.COLUMN_LOOKUP_ACTION:
+            return "Hủy Load" if self._load_is_active(lookup) else "Load số cont"
+        value = self._raw_value(row, result, column, source_row)
+        if column in (self.COLUMN_CONT, self.COLUMN_BL, self.COLUMN_RULE) and value is None:
             return "—"
-        if column == cls.COLUMN_AMOUNT:
+        if column == self.COLUMN_AMOUNT:
             if value is None:
                 return "—"
             if type(value) is int:
                 return f"{value:,}".replace(",", ".")
             return str(value)
-        if column == cls.COLUMN_STATUS:
+        if column == self.COLUMN_STATUS:
             return STATUS_LABELS[result.status]
-        if column == cls.COLUMN_MESSAGES:
+        if column == self.COLUMN_MESSAGES:
             return "; ".join(result.messages) if result.messages else "Không có"
         return "" if value is None else value
 
@@ -373,10 +434,31 @@ class ReviewTableModel(QAbstractTableModel):
 
     def row_at(self, row: int) -> ReviewRow:
         source = self._rows[row]
-        return ReviewRow(*source.as_array())
+        return ReviewRow(*source.as_array(), runtime_id=source.runtime_id)
 
     def rows(self) -> list[ReviewRow]:
-        return [ReviewRow(*row.as_array()) for row in self._rows]
+        return [
+            ReviewRow(*row.as_array(), runtime_id=row.runtime_id)
+            for row in self._rows
+        ]
+
+    def runtime_id_at(self, row: int) -> str:
+        return self._rows[row].runtime_id
+
+    def find_runtime_id(self, runtime_id: str) -> int | None:
+        return next(
+            (
+                index
+                for index, row in enumerate(self._rows)
+                if row.runtime_id == runtime_id
+            ),
+            None,
+        )
+
+    def lookup_presentation(self, runtime_id: str) -> ContainerLoadPresentation:
+        return self._lookup_presentations.get(
+            runtime_id, ContainerLoadPresentation()
+        )
 
     def rows_as_arrays(self) -> list[list[Any]]:
         return [row.as_array() for row in self._rows]
@@ -388,6 +470,7 @@ class ReviewTableModel(QAbstractTableModel):
         converted = [coerce_review_row(row) for row in rows]
         self.beginResetModel()
         self._rows = converted
+        self._lookup_presentations.clear()
         self._revalidate(emit_signal=False)
         self.endResetModel()
         self._set_dirty(mark_dirty)
@@ -422,10 +505,67 @@ class ReviewTableModel(QAbstractTableModel):
             raise IndexError("Dòng cần xóa không tồn tại.")
         self.beginRemoveRows(QModelIndex(), position, position)
         removed = self._rows.pop(position)
+        self._lookup_presentations.pop(removed.runtime_id, None)
         self._validation.pop(position)
         self.endRemoveRows()
         self._after_mutation()
         return removed
+
+    def replace_row(self, position: int, rows: Iterable[Any]) -> tuple[int, int]:
+        if not (0 <= position < len(self._rows)):
+            raise IndexError("Dòng cần thay thế không tồn tại.")
+        replacements = [coerce_review_row(row) for row in rows]
+        if not replacements:
+            raise ValueError("Cần ít nhất một dòng thay thế.")
+        removed_runtime_id = self._rows[position].runtime_id
+        self.beginResetModel()
+        self._rows[position : position + 1] = replacements
+        self._lookup_presentations.pop(removed_runtime_id, None)
+        self._revalidate(emit_signal=False)
+        self.endResetModel()
+        self._set_dirty(True)
+        self.validationChanged.emit(self._stats)
+        self.rowsChanged.emit()
+        return position, position + len(replacements) - 1
+
+    def set_lookup_presentation(
+        self,
+        runtime_id: str,
+        *,
+        status: str,
+        message: str = "",
+        session_id: str | None = None,
+    ) -> None:
+        source_row = self.find_runtime_id(runtime_id)
+        if source_row is None:
+            return
+        self._lookup_presentations[runtime_id] = ContainerLoadPresentation(
+            status=str(status).upper(),
+            message=str(message),
+            session_id=session_id,
+        )
+        self.dataChanged.emit(
+            self.index(source_row, self.COLUMN_LOOKUP_RESULT),
+            self.index(source_row, self.COLUMN_LOOKUP_ACTION),
+        )
+
+    def set_lookup_busy(self, busy: bool) -> None:
+        del busy
+
+    @staticmethod
+    def _load_is_active(presentation: ContainerLoadPresentation) -> bool:
+        return bool(presentation.session_id) and presentation.status in {
+            "WAITING_RESULT",
+            "INVALID_RESULT",
+        }
+
+    @staticmethod
+    def _lookup_eligible(row: ReviewRow) -> bool:
+        container_missing = row.cont is None or (
+            isinstance(row.cont, str) and not row.cont.strip()
+        )
+        bl_present = isinstance(row.bl, str) and bool(row.bl.strip())
+        return container_missing and bl_present
 
     def mark_clean(self) -> None:
         self._set_dirty(False)

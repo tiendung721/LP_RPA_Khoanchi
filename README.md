@@ -25,6 +25,13 @@ Bước 1 hoặc chọn JSON thủ công.
   file JSON hiện hành đã xác nhận vào workbook BK.
 - Mọi lần ghi BK đều dùng backup, working copy, kiểm tra lại và thay file
   nguyên tử; tác vụ chạy nền để không khóa giao diện.
+- Dòng thiếu container nhưng có B/L luôn có nút **Load số cont** để mở Custom
+  GPT bằng một BAT riêng, chờ JSON kết quả và áp dụng lại vào bảng.
+- Mỗi thời điểm chỉ có một lượt Load số cont. Nhấn nút ở dòng khác trong lúc
+  chờ chỉ hiện thông báo đang bận.
+- Trên dòng đang chờ, nút **Load số cont** đổi thành **Hủy Load**. Sau khi xác
+  nhận hủy, watcher dừng và phần mềm cho phép bắt đầu lượt mới; cửa sổ Custom
+  GPT đã mở không bị cưỡng chế đóng.
 
 ## Yêu cầu
 
@@ -83,6 +90,20 @@ Database, Logs và cây dữ liệu nội bộ bên dưới `Output\_system`.
 Nút **Kiểm tra cấu hình** chỉ đọc workbook/bản sao tạm, không lưu thử vào file
 gốc. Định dạng Excel cũ `.xls` không được hỗ trợ.
 
+Để dùng **Load số cont**, chọn thêm **BAT Load số container** trong Cài đặt.
+Đây là đường dẫn riêng, không dùng chung với BAT **Mở Trợ lý ảo**. BAT phải
+thuộc một bundle launcher tương thích như BAT chính để ứng dụng cấu hình thư
+mục tải về là `Output`.
+
+Khi nhấn **Load số cont**, ứng dụng xóa các JSON container cũ nhận diện được
+bằng schema, ghi nhận trạng thái các file đang có, mở Custom GPT qua BAT và bắt
+đầu chờ. Người dùng tải PDF lên Custom GPT rồi tải file kết quả về. Tên file là
+tùy ý, chỉ cần có đuôi `.json`.
+
+Ứng dụng chỉ xét file mới hoặc file đã được cập nhật sau khi lượt Load bắt đầu.
+JSON không mang schema container được bỏ qua và phần mềm tiếp tục chờ, nhờ đó
+không xử lý nhầm file dữ liệu khoản chi đang có trong `Output`.
+
 Ứng dụng không sửa file BAT, PowerShell, extension hay file ZIP. Chỉ Chrome
 `Preferences` trong `RPA_ChatGPT_Profile\Default` được cập nhật để đặt:
 
@@ -120,6 +141,29 @@ Root chỉ có `v` và `d`. Mỗi dòng trong `d` có đúng năm vị trí:
 Không dùng các root `metadata`, `du_lieu_boc_tach`, `canh_bao` hoặc
 `raw_data`.
 
+Kết quả riêng của **Load số cont** phải có đúng schema:
+
+```json
+{
+  "containers": ["VSGU2250713"]
+}
+```
+
+`containers` phải là mảng không rỗng. Ứng dụng chuẩn hóa, loại số trùng và kiểm
+tra ISO 6346. Khi file ổn định, popup tự mở để xem số container và khoản tiền
+được phân bổ:
+
+- Một container thay trực tiếp dòng gốc.
+- Nhiều container thay dòng gốc bằng nhiều dòng, giữ nguyên B/L, loại phí và
+  quy tắc.
+- Khoản tiền nguyên không âm được chia bằng `divmod`; phần dư cộng lần lượt từ
+  dòng đầu nên tổng sau chia luôn bằng tổng ban đầu.
+- Nếu khoản tiền không hợp lệ, popup vẫn hiển thị nhưng nút **Xác nhận** bị
+  khóa.
+
+Sau khi xác nhận, dữ liệu chỉ được đánh dấu đã thay đổi; người dùng vẫn bấm
+**Lưu** theo quy trình hiện có.
+
 ## Vòng đời file Output
 
 Thư mục mặc định là:
@@ -154,11 +198,12 @@ khoanchi_pm_project\                 (hoặc thư mục chứa file .exe)
 ├── Logs\
 └── Output\
     ├── ket_qua_boc_tach_YYYYMMDD_HHMMSS.json
+    ├── <tên bất kỳ>.json
     └── _system\
-        └── Excel\
-            ├── Temp\
-            ├── Backup\
-            └── Reports\
+        ├── Excel\
+        │   ├── Temp\
+        │   ├── Backup\
+        │   └── Reports\
 ```
 
 Khi cả bundle được chuyển vị trí, ứng dụng tự cập nhật `data_root`, `Output`
@@ -169,6 +214,8 @@ bundle do người dùng tự chọn vẫn được giữ nguyên.
 - `Output\_system\Excel\Temp`: snapshot nguồn và working copy ngắn hạn.
 - `Output\_system\Excel\Backup`: backup BK tạo ngay trước mỗi lần ghi.
 - `Output\_system\Excel\Reports`: vùng dành cho báo cáo xử lý Excel.
+- `Output\<tên bất kỳ>.json`: có thể là kết quả container nếu nội dung đúng
+  contract `{"containers": [...]}`; tên file không được dùng để phân loại.
 - `Database`: metadata batch và trạng thái ứng dụng.
 
 ## Chạy kiểm thử
@@ -192,6 +239,11 @@ extension vẫn đầy đủ. Dùng **Kiểm tra cấu hình** để xem thông 
 Kiểm tra tên file khớp `ket_qua_boc_tach*.json`, file đã tải xong và Output
 trong Cài đặt đúng với thư mục đang được theo dõi. Các hậu tố `.crdownload`,
 `.part`, `.tmp` và `.download` được xem là file tạm.
+
+Với **Load số cont**, mọi tên file `.json` đều được chấp nhận. File không mang
+schema container được bỏ qua. Nếu đã có root `containers` nhưng dữ liệu bên
+trong sai hoặc số container sai ISO 6346, ứng dụng báo lỗi và tiếp tục chờ một
+file đã sửa trong chính lượt đang chạy.
 
 ### JSON sai schema
 
