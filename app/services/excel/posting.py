@@ -374,7 +374,6 @@ class ExpensePostingService:
                 PostingItemStatus.UNRESOLVED,
             }
         ]
-        backup_path: Path | None = None
         working_path: Path | None = None
         after = plan.target_fingerprint
         update_timestamp: datetime | None = None
@@ -388,10 +387,6 @@ class ExpensePostingService:
                     plan.target_path,
                     plan.target_fingerprint,
                     label="File BK",
-                )
-                _progress(progress_callback, "Đang tạo backup file BK…")
-                backup_path = self.backups.create_backup(
-                    plan.target_path, run_id=plan.run_id
                 )
                 working_path = self.backups.create_working_copy(
                     plan.target_path, run_id=plan.run_id
@@ -464,7 +459,7 @@ class ExpensePostingService:
                 skipped_source_items=skipped_count,
                 already_existing_items=already_count,
                 conflict_count=len(plan.conflicts),
-                backup_path=backup_path,
+                backup_path=None,
                 fingerprint_before=plan.target_fingerprint,
                 fingerprint_after=after,
                 run_id=plan.run_id,

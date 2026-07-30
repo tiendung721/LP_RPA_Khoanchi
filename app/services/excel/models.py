@@ -41,6 +41,7 @@ class PostingItemStatus(str, Enum):
 class ConflictType(str, Enum):
     INVALID_SQT = "INVALID_SQT"
     DUPLICATE_SOURCE_ROW = "DUPLICATE_SOURCE_ROW"
+    SYNC_GROUP_COUNT_MISMATCH = "SYNC_GROUP_COUNT_MISMATCH"
     TARGET_MONTH_AMBIGUOUS = "TARGET_MONTH_AMBIGUOUS"
     TARGET_SHEET_AMBIGUOUS = "TARGET_SHEET_AMBIGUOUS"
     CONTAINER_NOT_FOUND = "CONTAINER_NOT_FOUND"
@@ -83,6 +84,13 @@ class TargetCellKind(str, Enum):
     NUMBER = "NUMBER"
     FORMULA = "FORMULA"
     TEXT = "TEXT"
+
+
+class SyncActionType(str, Enum):
+    INSERT = "INSERT"
+    UPDATE = "UPDATE"
+    UNCHANGED = "UNCHANGED"
+    TARGET_ONLY = "TARGET_ONLY"
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +143,10 @@ class MonthCandidate:
     source_sheet: str
     target_sheet: str
     new_row_count: int = 0
+    update_count: int = 0
+    unchanged_count: int = 0
+    target_only_count: int = 0
+    invalid_count: int = 0
     last_sqt: int = 0
     match_count: int = 0
     recently_synced: bool = False
@@ -157,6 +169,16 @@ class SyncRow:
     @property
     def container(self) -> Any:
         return self.values[2] if len(self.values) > 2 else None
+
+
+@dataclass(slots=True)
+class SyncAction:
+    action: SyncActionType
+    sqt: int
+    source: SyncRow | None = None
+    target_row: int | None = None
+    target_values: tuple[Any, ...] | None = None
+    protected_values: dict[int, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -200,7 +222,6 @@ class SyncResolution:
 @dataclass(slots=True)
 class SyncPlan:
     source_path: Path
-    source_snapshot_path: Path
     target_path: Path
     source_fingerprint: WorkbookFingerprint
     target_fingerprint: WorkbookFingerprint
@@ -209,6 +230,9 @@ class SyncPlan:
     source_year: int | None = None
     target_year: int | None = None
     rows_by_target: dict[str, list[SyncRow]] = field(default_factory=dict)
+    actions_by_target: dict[str, list[SyncAction]] = field(default_factory=dict)
+    invalid_rows: list[int] = field(default_factory=list)
+    source_snapshot_path: Path | None = None
     source_snapshot_fingerprint: WorkbookFingerprint | None = None
     conflicts: list[SyncConflict] = field(default_factory=list)
     selected_month: int | None = None
@@ -239,12 +263,50 @@ class SyncPlan:
     @property
     def has_changes(self) -> bool:
         return any(
-            (self.rows_by_target or self.rows_by_month).values()
+            action.action in {SyncActionType.INSERT, SyncActionType.UPDATE}
+            for actions in self.actions_by_target.values()
+            for action in actions
         )
 
     @property
     def requires_user_input(self) -> bool:
-        return self.selected_sheet is None or any(
+        return (
+            self.selected_sheet is None
+            or self.has_changes
+            or any(conflict.default_action is None for conflict in self.conflicts)
+        )
+
+    @property
+    def actions(self) -> list[SyncAction]:
+        sheet = self.selected_sheet
+        return list(self.actions_by_target.get(sheet, ())) if sheet else []
+
+    def _count(self, action: SyncActionType) -> int:
+        return sum(item.action is action for item in self.actions)
+
+    @property
+    def insert_count(self) -> int:
+        return self._count(SyncActionType.INSERT)
+
+    @property
+    def update_count(self) -> int:
+        return self._count(SyncActionType.UPDATE)
+
+    @property
+    def unchanged_count(self) -> int:
+        return self._count(SyncActionType.UNCHANGED)
+
+    @property
+    def target_only_count(self) -> int:
+        return self._count(SyncActionType.TARGET_ONLY)
+
+    @property
+    def invalid_count(self) -> int:
+        return len(self.invalid_rows)
+
+    @property
+    def conflict_count(self) -> int:
+        return sum(
             conflict.default_action is None for conflict in self.conflicts
         )
 
@@ -255,6 +317,11 @@ class SyncResult:
     target_path: Path
     sheet_name: str | None = None
     added_rows: int = 0
+    inserted_rows: int = 0
+    updated_rows: int = 0
+    unchanged_rows: int = 0
+    target_only_rows: int = 0
+    invalid_rows: int = 0
     skipped_rows: int = 0
     conflict_count: int = 0
     backup_path: Path | None = None

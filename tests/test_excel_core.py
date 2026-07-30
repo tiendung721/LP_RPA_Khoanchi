@@ -4,8 +4,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import PatternFill
 
+from app.services.excel.daily_sync import (
+    SOURCE_HEADER_ALIASES,
+    SYNC_FIELDS,
+    DailySyncService,
+)
 from app.services.excel.headers import (
     HeaderResolutionError,
     HeaderResolver,
@@ -236,6 +242,78 @@ def test_working_copy_is_created_next_to_target_for_atomic_replace(
         assert working.read_bytes() == target.read_bytes()
     finally:
         working.unlink(missing_ok=True)
+
+
+def test_backup_service_keeps_only_latest_valid_backup(tmp_path: Path) -> None:
+    target = tmp_path / "BK 2026.xlsx"
+    backup_dir = tmp_path / "Backup"
+    workbook = Workbook()
+    workbook.active["A1"] = "first"
+    workbook.save(target)
+    workbook.close()
+    service = ExcelBackupService(backup_dir)
+    backup_dir.mkdir()
+    legacy = backup_dir / "BK 2026_20260101_120000_1.xlsx"
+    legacy.write_bytes(target.read_bytes())
+
+    first_hash = target.read_bytes()
+    first_backup = service.create_backup(target)
+
+    workbook = load_workbook(target)
+    workbook.active["A1"] = "second"
+    workbook.save(target)
+    workbook.close()
+    second_hash = target.read_bytes()
+    second_backup = service.create_backup(target)
+
+    assert first_backup == second_backup
+    assert second_backup.name == "BK 2026_latest.xlsx"
+    assert second_backup.read_bytes() == second_hash
+    assert second_backup.read_bytes() != first_hash
+    assert list(backup_dir.glob("*.xlsx")) == [second_backup]
+    assert not legacy.exists()
+
+
+def test_excel_artifact_cleanup_is_narrowly_scoped(tmp_path: Path) -> None:
+    target = tmp_path / "BK 2026.xlsx"
+    source = tmp_path / "Hàng ngày 2026.xlsx"
+    temp_dir = tmp_path / "Temp"
+    workbook = Workbook()
+    workbook.save(target)
+    workbook.save(source)
+    workbook.close()
+    backups = ExcelBackupService(tmp_path / "Backup")
+    gateway = WorkbookGateway()
+    working = backups.create_working_copy(target, run_id=7)
+    snapshot = gateway.source_snapshot(source, temp_dir)
+    unrelated = temp_dir / "unrelated.snapshot.xlsx"
+    unrelated.write_bytes(source.read_bytes())
+
+    assert backups.cleanup_working_copies(target) == 1
+    assert gateway.cleanup_source_snapshots(source, temp_dir) == 1
+    assert not working.exists()
+    assert not snapshot.exists()
+    assert unrelated.exists()
+
+
+def test_daily_sync_real_data_boundary_ignores_phantom_max_row() -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    for column, aliases in enumerate(SOURCE_HEADER_ALIASES.values(), 1):
+        if column <= 11:
+            sheet.cell(1, column).value = aliases[0]
+    sheet["P1"] = SOURCE_HEADER_ALIASES["transport"][0]
+    sheet["A2"] = 700
+    sheet["A65000"].fill = PatternFill("solid", fgColor="FFFFFF")
+    resolution = HeaderResolver().resolve(
+        sheet,
+        SOURCE_HEADER_ALIASES,
+        required=SYNC_FIELDS,
+    )
+
+    assert sheet.max_row == 65000
+    assert DailySyncService._last_data_row(sheet, resolution) == 2
+    workbook.close()
 
 
 def test_lam_lenh_is_not_resolved_without_ghi_chu_boundary() -> None:

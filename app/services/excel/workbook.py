@@ -105,6 +105,22 @@ class WorkbookGateway:
         )
         return self.copy(source_path, destination)
 
+    @staticmethod
+    def cleanup_source_snapshots(
+        source: str | Path, temp_dir: str | Path
+    ) -> int:
+        source_path = ensure_supported_workbook(source)
+        directory = Path(temp_dir)
+        if not directory.is_dir():
+            return 0
+        removed = 0
+        pattern = f"{source_path.stem}.*.snapshot{source_path.suffix}"
+        for candidate in directory.glob(pattern):
+            if candidate.is_file():
+                candidate.unlink(missing_ok=True)
+                removed += 1
+        return removed
+
     def save(self, workbook: Any, path: str | Path) -> None:
         workbook.save(Path(path))
 
@@ -155,9 +171,26 @@ class ExcelBackupService:
         target_path = ensure_supported_workbook(target)
         self.backup_dir.mkdir(parents=True, exist_ok=True)
         backup = self.backup_dir / (
-            f"{target_path.stem}_{self._token(run_id)}{target_path.suffix}"
+            f"{target_path.stem}_latest{target_path.suffix}"
         )
-        shutil.copy2(target_path, backup)
+        temporary = self.backup_dir / (
+            f".{target_path.stem}_{self._token(run_id)}.backup"
+            f"{target_path.suffix}"
+        )
+        try:
+            shutil.copy2(target_path, temporary)
+            workbook = load_workbook(
+                temporary,
+                read_only=True,
+                data_only=False,
+                keep_vba=target_path.suffix.casefold() == ".xlsm",
+                keep_links=True,
+            )
+            workbook.close()
+            os.replace(temporary, backup)
+            self._cleanup_legacy_backups(target_path, keep=backup)
+        finally:
+            temporary.unlink(missing_ok=True)
         return backup
 
     def create_working_copy(
@@ -171,6 +204,28 @@ class ExcelBackupService:
         )
         shutil.copy2(target_path, working)
         return working
+
+    def cleanup_working_copies(self, target: str | Path) -> int:
+        target_path = ensure_supported_workbook(target)
+        directory = self.working_dir or target_path.parent
+        if not directory.is_dir():
+            return 0
+        removed = 0
+        pattern = (
+            f".{target_path.stem}_*.working{target_path.suffix}"
+        )
+        for candidate in directory.glob(pattern):
+            if candidate.is_file():
+                candidate.unlink(missing_ok=True)
+                removed += 1
+        return removed
+
+    def _cleanup_legacy_backups(self, target: Path, *, keep: Path) -> None:
+        pattern = f"{target.stem}_*{target.suffix}"
+        for candidate in self.backup_dir.glob(pattern):
+            if candidate == keep or not candidate.is_file():
+                continue
+            candidate.unlink(missing_ok=True)
 
 
 class ExcelLockService:
@@ -228,4 +283,3 @@ class ExcelLockService:
                     except OSError:
                         pass
                 handle.close()
-

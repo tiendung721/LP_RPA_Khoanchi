@@ -292,7 +292,7 @@ def test_parse_sqt_accepts_only_positive_integers(
     assert parse_sqt(raw) == expected
 
 
-def test_daily_sync_filters_by_max_sqt_preserves_order_and_is_idempotent(
+def test_daily_sync_compares_full_sheet_preserves_order_and_is_idempotent(
     tmp_path: Path,
 ) -> None:
     daily = tmp_path / "Hàng ngày 2026.xlsx"
@@ -329,34 +329,39 @@ def test_daily_sync_filters_by_max_sqt_preserves_order_and_is_idempotent(
 
     assert plan.selected_month == 7
     assert [row.sqt for row in plan.rows] == [700, 700, 701, 701]
-    assert {
-        conflict.conflict_type for conflict in plan.conflicts
-    } == {
-        ConflictType.INVALID_SQT,
-        ConflictType.DUPLICATE_SOURCE_ROW,
-    }
+    assert plan.conflicts == []
+    assert plan.insert_count == 4
+    assert plan.update_count == 0
+    assert plan.unchanged_count == 1
+    assert plan.invalid_count == 1
+    assert plan.requires_user_input
 
     result = service.apply(plan, {})
 
     assert result.status is ExcelRunStatus.SUCCEEDED
-    assert result.added_rows == 3
-    assert result.skipped_rows == 2
+    assert result.added_rows == 4
+    assert result.inserted_rows == 4
+    assert result.updated_rows == 0
+    assert result.skipped_rows == 1
     assert result.backup_path is not None
     assert result.backup_path.is_file()
+    assert result.backup_path.name == "BK 2026_latest.xlsx"
     assert _sha256(result.backup_path) == target_before
     assert _sha256(daily) == source_before
     workbook = load_workbook(target, data_only=False)
     try:
         sheet = workbook["T07 26"]
-        assert [sheet.cell(row, 1).value for row in range(2, 5)] == [
+        assert [sheet.cell(row, 1).value for row in range(2, 7)] == [
             699,
             700,
             700,
+            701,
+            701,
         ]
-        assert sheet["A5"].value == 701
-        assert [sheet.cell(row, 3).value for row in range(3, 6)] == [
+        assert [sheet.cell(row, 3).value for row in range(3, 7)] == [
             "NEWA0000001",
             "NEWB0000002",
+            "NEWC0000003",
             "NEWC0000003",
         ]
         assert sheet["F3"].value == "Kho A"
@@ -379,8 +384,122 @@ def test_daily_sync_filters_by_max_sqt_preserves_order_and_is_idempotent(
     assert not second_plan.has_changes
     assert second_result.status is ExcelRunStatus.NO_CHANGES
     assert second_result.backup_path is None
+    assert second_plan.invalid_count == 1
     assert _sha256(target) == target_after_first_apply
     assert len(list((runtime_dir / "Backup").iterdir())) == backup_count
+
+
+def test_daily_sync_updates_existing_rows_and_preserves_bk_only_columns(
+    tmp_path: Path,
+) -> None:
+    daily = tmp_path / "Hàng ngày 2026.xlsx"
+    target = tmp_path / "BK 2026.xlsx"
+    runtime_dir = tmp_path / "Excel"
+    updated = _sync_row(
+        699,
+        "NEWU0000001",
+        weight=28,
+        closing_place="Kho mới",
+        transport="Xe mới",
+    )
+    inserted = _sync_row(700, "NEWA0000002")
+    _save_daily(daily, [updated, inserted])
+    _save_target(
+        target,
+        [
+            _sync_row(698, "TARGET000001"),
+            _sync_row(699, "OLDU0000001"),
+        ],
+        month=7,
+    )
+    workbook = load_workbook(target)
+    sheet = workbook["T07 26"]
+    sheet["L3"] = 125_000
+    sheet["M3"] = "=1+1"
+    sheet["N3"] = "không được đổi"
+    sheet["O3"] = 0
+    sheet["Q3"] = "INV-001"
+    workbook.save(target)
+    workbook.close()
+
+    service = _sync_service(daily, target, runtime_dir)
+    plan = service.analyze(source_sheet_name="Tháng 7")
+
+    assert plan.update_count == 1
+    assert plan.insert_count == 1
+    assert plan.unchanged_count == 0
+    assert plan.target_only_count == 1
+
+    result = service.apply(plan, {})
+
+    assert result.updated_rows == 1
+    assert result.inserted_rows == 1
+    assert result.target_only_rows == 1
+    workbook = load_workbook(target, data_only=False)
+    try:
+        sheet = workbook["T07 26"]
+        assert sheet["A2"].value == 698
+        assert sheet["C2"].value == "TARGET000001"
+        assert sheet["C3"].value == "NEWU0000001"
+        assert sheet["D3"].value == 28
+        assert sheet["F3"].value == "Kho mới"
+        assert sheet["P3"].value == "Xe mới"
+        assert [sheet.cell(3, column).value for column in range(12, 16)] == [
+            125_000,
+            "=1+1",
+            "không được đổi",
+            0,
+        ]
+        assert sheet["Q3"].value == "INV-001"
+        assert sheet["A4"].value == 700
+        assert sheet["C4"].value == "NEWA0000002"
+    finally:
+        workbook.close()
+
+
+def test_daily_sync_blocks_mismatched_duplicate_sqt_without_backup(
+    tmp_path: Path,
+) -> None:
+    daily = tmp_path / "Hàng ngày 2026.xlsx"
+    target = tmp_path / "BK 2026.xlsx"
+    runtime_dir = tmp_path / "Excel"
+    _save_daily(
+        daily,
+        [
+            _sync_row(700, "NEWA0000001"),
+            _sync_row(700, "NEWB0000002"),
+        ],
+    )
+    _save_target(target, [_sync_row(700, "NEWA0000001")], month=7)
+    service = _sync_service(daily, target, runtime_dir)
+
+    plan = service.analyze(source_sheet_name="Tháng 7")
+
+    assert plan.conflict_count == 1
+    assert plan.conflicts[0].conflict_type is (
+        ConflictType.SYNC_GROUP_COUNT_MISMATCH
+    )
+    with pytest.raises(DailySyncError, match="số dòng"):
+        service.apply(plan, {})
+    assert not (runtime_dir / "Backup").exists()
+
+
+def test_daily_sync_aborts_when_source_changes_after_analysis(
+    tmp_path: Path,
+) -> None:
+    daily = tmp_path / "Hàng ngày 2026.xlsx"
+    target = tmp_path / "BK 2026.xlsx"
+    runtime_dir = tmp_path / "Excel"
+    _save_daily(daily, [_sync_row(700)])
+    _save_target(target, [_sync_row(699)], month=7)
+    service = _sync_service(daily, target, runtime_dir)
+    plan = service.analyze(source_sheet_name="Tháng 7")
+
+    _save_daily(daily, [_sync_row(700, "CHANGED00001")])
+
+    with pytest.raises(WorkbookChangedError):
+        service.apply(plan, {})
+    assert not (runtime_dir / "Backup").exists()
 
 
 def test_daily_sync_accepts_vt_bo_as_target_transport_header(
@@ -521,6 +640,7 @@ def test_daily_sync_creates_new_month_from_previous_nonempty_template(
         assert "R1:S1" in {str(item) for item in created.merged_cells.ranges}
         assert created["R1"].value == "Thông tin mẫu"
         assert len(created.data_validations.dataValidation) == 1
+        assert len(created.conditional_formatting) == 1
         assert created["L2"].value is None
         assert created["Q2"].value is None
     finally:
@@ -598,7 +718,8 @@ def test_posting_groups_normalized_container_and_keeps_bl_only_rows_separate(
     assert result.posted_source_items == 2
     assert result.written_cells == 1
     assert result.skipped_source_items == 2
-    assert result.backup_path is not None
+    assert result.backup_path is None
+    assert not (runtime_dir / "Backup").exists()
     workbook = load_workbook(target, data_only=False)
     try:
         assert workbook["T07 26"].cell(

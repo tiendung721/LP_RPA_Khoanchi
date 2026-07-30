@@ -159,7 +159,7 @@ class MonthSelectionDialog(QDialog):
         self.table = QTableWidget(0, 5)
         self.table.setObjectName("monthCandidateTable")
         self.table.setHorizontalHeaderLabels(
-            ["Sheet", "Tháng", "Năm", "Số dòng khớp/mới", "Gần nhất"]
+            ["Sheet", "Tháng", "Năm", "Cập nhật / mới", "Gần nhất"]
         )
         self.table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -196,13 +196,22 @@ class MonthSelectionDialog(QDialog):
                 2,
                 QTableWidgetItem(_display(_value(candidate, "year"))),
             )
-            count = _value(
-                candidate,
-                "new_row_count",
-                "match_count",
-                "row_count",
-                "count",
-            )
+            update_count = _value(candidate, "update_count", default=None)
+            if update_count is not None and _value(
+                candidate, "source_sheet", default=""
+            ):
+                count = (
+                    f"{int(update_count or 0)} / "
+                    f"{int(_value(candidate, 'new_row_count', default=0) or 0)}"
+                )
+            else:
+                count = _value(
+                    candidate,
+                    "new_row_count",
+                    "match_count",
+                    "row_count",
+                    "count",
+                )
             self.table.setItem(row, 3, QTableWidgetItem(_display(count)))
             recent = bool(
                 _value(
@@ -387,6 +396,7 @@ DEFAULT_ACTIONS: dict[str, tuple[str, ...]] = {
     "DUPLICATE": ("KEEP_ONE", "KEEP_ALL", "CANCEL_ALL"),
     "DUPLICATE_SYNC_ROW": ("KEEP_ONE", "KEEP_ALL", "CANCEL_ALL"),
     "DUPLICATE_SOURCE_ROW": ("KEEP_ONE", "KEEP_ALL", "CANCEL_ALL"),
+    "SYNC_GROUP_COUNT_MISMATCH": ("CANCEL_ALL",),
     "TARGET_MONTH_AMBIGUOUS": ("SELECT_MONTH", "CANCEL"),
     "TARGET_SHEET_AMBIGUOUS": ("SELECT_SHEET", "CANCEL"),
     "CONTAINER_NOT_FOUND": ("SKIP", "SELECT_ROW"),
@@ -407,6 +417,7 @@ DEFAULT_RESOLUTION: dict[str, str] = {
     "DUPLICATE": "KEEP_ONE",
     "DUPLICATE_SYNC_ROW": "KEEP_ONE",
     "DUPLICATE_SOURCE_ROW": "KEEP_ONE",
+    "SYNC_GROUP_COUNT_MISMATCH": "CANCEL_ALL",
     "TARGET_MONTH_AMBIGUOUS": "SELECT_MONTH",
     "TARGET_SHEET_AMBIGUOUS": "SELECT_SHEET",
     "CONTAINER_NOT_FOUND": "SKIP",

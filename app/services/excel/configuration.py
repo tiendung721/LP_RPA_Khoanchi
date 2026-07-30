@@ -85,7 +85,6 @@ class ExcelConfigurationService:
 
         source_book = None
         target_book = None
-        snapshot: Path | None = None
         try:
             progress("Đang kiểm tra file Hàng ngày…")
             source = ensure_supported_workbook(self.daily_path)
@@ -93,8 +92,8 @@ class ExcelConfigurationService:
                 raise FileNotFoundError(f"Không tìm thấy file Hàng ngày: {source}")
             self.stability_checker.wait(source)
             self.lock_service.ensure_readable(source)
-            snapshot = self.gateway.source_snapshot(source, self.temp_dir)
-            source_book = self.gateway.load(snapshot, read_only=True)
+            source_fingerprint = self.gateway.fingerprint(source)
+            source_book = self.gateway.load(source, read_only=False)
             daily_sheets = self.months.daily_sheets(source_book.sheetnames)
             if not daily_sheets:
                 raise ValueError("Không có sheet Tháng 1…Tháng 12.")
@@ -122,6 +121,13 @@ class ExcelConfigurationService:
                     "File Hàng ngày đọc được và có cấu trúc phù hợp.",
                 )
             )
+            source_book.close()
+            source_book = None
+            self.gateway.assert_unchanged(
+                source,
+                source_fingerprint,
+                label="File Hàng ngày",
+            )
         except Exception as exc:
             result.checks.append(
                 ConfigurationCheck("daily_workbook", False, str(exc))
@@ -129,8 +135,6 @@ class ExcelConfigurationService:
         finally:
             if source_book is not None:
                 source_book.close()
-            if snapshot is not None:
-                snapshot.unlink(missing_ok=True)
 
         try:
             progress("Đang kiểm tra file BK…")

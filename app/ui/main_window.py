@@ -487,6 +487,9 @@ class MainWindow(QMainWindow):
             resolutions: dict[str, Any] = {}
             handled_conflicts: set[str] = set()
             conflicts = list(_attribute(plan, "conflicts", default=()) or ())
+            selected_sync_sheet = _attribute(
+                plan, "selected_sheet", "selected_sheet_name"
+            )
 
             selected_month = _attribute(plan, "selected_month")
             month_candidates = list(
@@ -502,6 +505,10 @@ class MainWindow(QMainWindow):
                     self._excel_tasks.cancel_waiting()
                     return
                 selection = dialog.selection()
+                selected_sync_sheet = selection.get(
+                    "selected_sheet_name",
+                    selection.get("selected_sheet"),
+                )
                 for conflict in conflicts:
                     kind = str(
                         getattr(
@@ -584,6 +591,57 @@ class MainWindow(QMainWindow):
                 for conflict in conflicts
                 if str(_attribute(conflict, "conflict_id", "id"))
                 not in handled_conflicts
+                and not (
+                    operation == "sync"
+                    and selected_sync_sheet not in (None, "")
+                    and str(
+                        _attribute(
+                            _attribute(conflict, "details", default={}),
+                            "target_sheet",
+                            default="",
+                        )
+                    )
+                    not in ("", str(selected_sync_sheet))
+                )
+            ]
+            blocking_sync = [
+                conflict
+                for conflict in remaining
+                if str(
+                    getattr(
+                        _attribute(
+                            conflict,
+                            "conflict_type",
+                            "type",
+                            default="",
+                        ),
+                        "value",
+                        _attribute(
+                            conflict,
+                            "conflict_type",
+                            "type",
+                            default="",
+                        ),
+                    )
+                )
+                == "SYNC_GROUP_COUNT_MISMATCH"
+            ]
+            if blocking_sync:
+                detail = "\n".join(
+                    f"• {_attribute(conflict, 'message', default='')}"
+                    for conflict in blocking_sync
+                )
+                QMessageBox.warning(
+                    self,
+                    "Không thể đồng bộ",
+                    "Số dòng của cùng một SQT không khớp giữa nguồn và BK.\n"
+                    "Hãy sửa dữ liệu rồi chạy lại.\n\n"
+                    + detail,
+                )
+                self._excel_tasks.cancel_waiting()
+                return
+            remaining = [
+                conflict for conflict in remaining if conflict not in blocking_sync
             ]
             if remaining:
                 dialog = ConflictResolutionDialog(remaining, self)
@@ -591,6 +649,82 @@ class MainWindow(QMainWindow):
                     self._excel_tasks.cancel_waiting()
                     return
                 resolutions.update(dialog.resolution_map())
+            if operation == "sync":
+                candidate = next(
+                    (
+                        item
+                        for item in month_candidates
+                        if str(
+                            _attribute(
+                                item,
+                                "target_sheet",
+                                "sheet_name",
+                                default="",
+                            )
+                        )
+                        == str(selected_sync_sheet)
+                    ),
+                    None,
+                )
+                updates = int(
+                    _attribute(
+                        candidate,
+                        "update_count",
+                        default=_attribute(plan, "update_count", default=0),
+                    )
+                    or 0
+                )
+                inserts = int(
+                    _attribute(
+                        candidate,
+                        "new_row_count",
+                        default=_attribute(plan, "insert_count", default=0),
+                    )
+                    or 0
+                )
+                unchanged = int(
+                    _attribute(
+                        candidate,
+                        "unchanged_count",
+                        default=_attribute(plan, "unchanged_count", default=0),
+                    )
+                    or 0
+                )
+                target_only = int(
+                    _attribute(
+                        candidate,
+                        "target_only_count",
+                        default=_attribute(plan, "target_only_count", default=0),
+                    )
+                    or 0
+                )
+                invalid = int(
+                    _attribute(
+                        candidate,
+                        "invalid_count",
+                        default=_attribute(plan, "invalid_count", default=0),
+                    )
+                    or 0
+                )
+                answer = QMessageBox.question(
+                    self,
+                    "Xác nhận đồng bộ toàn sheet",
+                    (
+                        f"Sheet BK: {selected_sync_sheet or '—'}\n\n"
+                        f"Cập nhật: {updates} dòng\n"
+                        f"Thêm mới: {inserts} dòng\n"
+                        f"Không đổi: {unchanged} dòng\n"
+                        f"Chỉ có ở BK, được giữ lại: {target_only} dòng\n"
+                        f"Thiếu SQT, được bỏ qua: {invalid} dòng\n\n"
+                        "Tiếp tục ghi file BK?"
+                    ),
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    self._excel_tasks.cancel_waiting()
+                    return
             selector_actions = {
                 str(value.get("action", ""))
                 for value in resolutions.values()
@@ -650,8 +784,11 @@ class MainWindow(QMainWindow):
             detail = (
                 f"{message}\n\n"
                 f"Sheet: {_attribute(result, 'sheet_name', default='—')}\n"
-                f"Đã thêm: {_attribute(result, 'added_rows', default=0)} dòng\n"
-                f"Bỏ qua: {_attribute(result, 'skipped_rows', default=0)}"
+                f"Đã cập nhật: {_attribute(result, 'updated_rows', default=0)} dòng\n"
+                f"Đã thêm: {_attribute(result, 'inserted_rows', 'added_rows', default=0)} dòng\n"
+                f"Chỉ có ở BK, đã giữ: {_attribute(result, 'target_only_rows', default=0)} dòng\n"
+                "Thiếu SQT, đã bỏ qua: "
+                f"{_attribute(result, 'invalid_rows', 'skipped_rows', default=0)}"
             )
             title = "Đồng bộ thành công"
         else:
@@ -663,7 +800,23 @@ class MainWindow(QMainWindow):
                 f"Sheet: {_attribute(result, 'sheet_name', default='—')}"
             )
             title = "Nhập khoản chi hoàn tất"
-        QMessageBox.information(self, title, detail)
+        if operation != "sync":
+            QMessageBox.information(self, title, detail)
+            return
+
+        completion_message = QMessageBox(self)
+        completion_message.setIcon(QMessageBox.Icon.Information)
+        completion_message.setWindowTitle(title)
+        completion_message.setText(detail)
+        open_bk_button = completion_message.addButton(
+            "Mở file BK", QMessageBox.ButtonRole.ActionRole
+        )
+        completion_message.addButton(QMessageBox.StandardButton.Ok)
+        completion_message.exec()
+        if completion_message.clickedButton() is open_bk_button:
+            self._open_bk_workbook(
+                _attribute(result, "target_path", default=None)
+            )
 
     @Slot(object)
     def _excel_failed(self, error: Any) -> None:
@@ -880,6 +1033,29 @@ class MainWindow(QMainWindow):
             return
         if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory))):
             QMessageBox.warning(self, "Không mở được thư mục", str(directory))
+
+    @Slot(object)
+    def _open_bk_workbook(self, path: Any = None) -> None:
+        raw_path = path or _attribute(
+            self._settings, "bk_workbook_path", default=""
+        )
+        if not raw_path:
+            QMessageBox.information(
+                self,
+                "Chưa cấu hình file BK",
+                "Hãy chọn file BK trong trang Cài đặt.",
+            )
+            return
+        workbook = Path(raw_path).expanduser()
+        if not workbook.exists() or not workbook.is_file():
+            QMessageBox.warning(
+                self,
+                "Không tìm thấy file BK",
+                f"File chưa tồn tại hoặc không truy cập được:\n{workbook}",
+            )
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(workbook))):
+            QMessageBox.warning(self, "Không mở được file BK", str(workbook))
 
     @Slot(object)
     def open_containing_folder(self, path: Any) -> None:

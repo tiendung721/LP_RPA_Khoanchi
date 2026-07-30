@@ -92,6 +92,12 @@ class ApplicationRuntime:
         self.excel_run_repository = ExcelRunRepository(self.database)
         self.expense_posting_repository = ExpensePostingRepository(self.database)
         self._configure_excel_services(self.settings)
+        removed_excel_artifacts = self.daily_sync_service.cleanup_stale_files()
+        if removed_excel_artifacts:
+            LOGGER.info(
+                "Đã dọn %s file Excel tạm còn sót từ lần chạy trước.",
+                removed_excel_artifacts,
+            )
         self.excel_task_controller = ExcelTaskController(
             daily_sync_service=self.daily_sync_service,
             expense_posting_service=self.expense_posting_service,

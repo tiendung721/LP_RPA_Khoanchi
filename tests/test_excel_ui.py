@@ -6,7 +6,12 @@ from typing import Any
 
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QDialog, QDialogButtonBox, QPushButton
+from PySide6.QtWidgets import (
+    QDialog,
+    QDialogButtonBox,
+    QMessageBox,
+    QPushButton,
+)
 
 import app.ui.main_window as main_window_module
 from app.ui.excel_dialogs import (
@@ -108,6 +113,182 @@ def test_sync_button_requires_source_sheet_before_starting_analysis(
     assert captured["preselect_first"] is False
     assert captured["show_recommendations"] is False
     assert tasks.sync_calls == [{"source_sheet_name": "Tháng 8"}]
+
+
+def test_sync_analysis_always_shows_full_sheet_confirmation(
+    monkeypatch,
+) -> None:
+    candidate = SimpleNamespace(
+        month=7,
+        target_sheet="T07 26",
+        update_count=5,
+        new_row_count=2,
+        unchanged_count=10,
+        target_only_count=1,
+        invalid_count=3,
+    )
+    plan = SimpleNamespace(
+        operation="sync",
+        conflicts=[],
+        selected_month=7,
+        selected_sheet="T07 26",
+        month_candidates=[candidate],
+    )
+
+    class Tasks:
+        def __init__(self) -> None:
+            self.apply_calls: list[Any] = []
+            self.cancel_calls = 0
+
+        @staticmethod
+        def normalize_operation(_operation: Any) -> str:
+            return "sync"
+
+        def apply_plan(
+            self,
+            value: Any,
+            resolutions: Any,
+            *,
+            operation: str,
+        ) -> None:
+            self.apply_calls.append((value, resolutions, operation))
+
+        def cancel_waiting(self) -> None:
+            self.cancel_calls += 1
+
+    captured: dict[str, Any] = {}
+
+    def question(
+        _parent: Any,
+        title: str,
+        text: str,
+        *_args: Any,
+    ) -> QMessageBox.StandardButton:
+        captured["title"] = title
+        captured["text"] = text
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", question)
+    tasks = Tasks()
+    owner = SimpleNamespace(
+        _excel_tasks=tasks,
+        _excel_operation="sync",
+        _show_excel_error=lambda *_args, **_kwargs: None,
+    )
+
+    MainWindow._excel_analysis_ready(owner, plan)
+
+    assert len(tasks.apply_calls) == 1
+    assert tasks.cancel_calls == 0
+    assert captured["title"] == "Xác nhận đồng bộ toàn sheet"
+    assert "Cập nhật: 5 dòng" in captured["text"]
+    assert "Thêm mới: 2 dòng" in captured["text"]
+    assert "Chỉ có ở BK, được giữ lại: 1 dòng" in captured["text"]
+    assert "Thiếu SQT, được bỏ qua: 3 dòng" in captured["text"]
+
+
+def test_sync_completion_can_open_the_written_bk_file(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    bk_path = tmp_path / "BK 2026.xlsx"
+    bk_path.touch()
+    opened: list[Path] = []
+
+    class CompletionMessage:
+        class Icon:
+            Information = object()
+
+        class ButtonRole:
+            ActionRole = object()
+
+        class StandardButton:
+            Ok = object()
+
+        instance: Any = None
+
+        def __init__(self, _parent: Any) -> None:
+            CompletionMessage.instance = self
+            self.title = ""
+            self.text = ""
+            self.open_button = None
+            self.clicked = None
+
+        def setIcon(self, _icon: Any) -> None:
+            pass
+
+        def setWindowTitle(self, title: str) -> None:
+            self.title = title
+
+        def setText(self, text: str) -> None:
+            self.text = text
+
+        def addButton(self, button: Any, _role: Any = None) -> Any:
+            if button == "Mở file BK":
+                self.open_button = object()
+                return self.open_button
+            return object()
+
+        def exec(self) -> None:
+            self.clicked = self.open_button
+
+        def clickedButton(self) -> Any:
+            return self.clicked
+
+    class Tasks:
+        @staticmethod
+        def normalize_operation(_operation: Any) -> str:
+            return "sync"
+
+    monkeypatch.setattr(main_window_module, "QMessageBox", CompletionMessage)
+    owner = SimpleNamespace(
+        _excel_context="workflow",
+        _excel_operation="sync",
+        _excel_tasks=Tasks(),
+        workflow_page=SimpleNamespace(
+            set_excel_result=lambda *_args: None
+        ),
+        _load_excel_history=lambda: None,
+        _open_bk_workbook=lambda path: opened.append(Path(path)),
+    )
+    result = SimpleNamespace(
+        operation="sync",
+        target_path=bk_path,
+        message="Đồng bộ xong.",
+        sheet_name="T07 26",
+        updated_rows=2,
+        inserted_rows=1,
+        target_only_rows=3,
+        invalid_rows=0,
+    )
+
+    MainWindow._excel_completed(owner, result)
+
+    message = CompletionMessage.instance
+    assert message.title == "Đồng bộ thành công"
+    assert message.open_button is not None
+    assert "Sheet: T07 26" in message.text
+    assert opened == [bk_path]
+
+
+def test_open_bk_workbook_uses_the_default_desktop_application(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    bk_path = tmp_path / "BK 2026.xlsx"
+    bk_path.touch()
+    opened_urls: list[Any] = []
+    monkeypatch.setattr(
+        main_window_module.QDesktopServices,
+        "openUrl",
+        lambda url: opened_urls.append(url) or True,
+    )
+    owner = SimpleNamespace(_settings=None)
+
+    MainWindow._open_bk_workbook(owner, bk_path)
+
+    assert len(opened_urls) == 1
+    assert Path(opened_urls[0].toLocalFile()) == bk_path
 
 
 def test_settings_round_trip_optional_excel_paths_and_reject_xls(

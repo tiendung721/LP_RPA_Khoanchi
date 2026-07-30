@@ -1,11 +1,11 @@
-"""Two-phase synchronization from the read-only daily workbook into BK."""
+"""Đồng bộ toàn bộ dữ liệu sheet Hàng ngày vào các cột nghiệp vụ của BK."""
 
 from __future__ import annotations
 
 import copy
 import hashlib
 import json
-from collections import Counter
+from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -23,6 +23,8 @@ from .models import (
     MonthCandidate,
     ResolutionAction,
     SourceSheetCandidate,
+    SyncAction,
+    SyncActionType,
     SyncConflict,
     SyncPlan,
     SyncResolution,
@@ -34,7 +36,6 @@ from .resolvers import MonthSheetService, YearResolver
 from .workbook import (
     ExcelBackupService,
     ExcelLockService,
-    WorkbookChangedError,
     WorkbookGateway,
     ensure_supported_workbook,
 )
@@ -76,6 +77,7 @@ TARGET_EXPECTED_COLUMNS: dict[str, int] = {
     **{field: index for index, field in enumerate(SYNC_FIELDS[:11], 1)},
     "transport": 16,
 }
+SYNC_TARGET_COLUMNS = frozenset(TARGET_EXPECTED_COLUMNS.values())
 
 
 class DailySyncError(RuntimeError):
@@ -130,8 +132,7 @@ class DailySyncService:
     ) -> None:
         paths = getattr(settings, "paths", None)
         self.daily_path = Path(
-            daily_path
-            or _settings_value(settings, "daily_workbook_path", "")
+            daily_path or _settings_value(settings, "daily_workbook_path", "")
         )
         self.bk_path = Path(
             bk_path or _settings_value(settings, "bk_workbook_path", "")
@@ -152,13 +153,21 @@ class DailySyncService:
         self.months = month_service or MonthSheetService()
         self.years = year_resolver or YearResolver()
         self.run_repository = run_repository
-        # Working copy phải nằm cạnh BK để os.replace luôn cùng filesystem.
-        # Temp vẫn chỉ dùng cho snapshot nguồn LAN.
         self.backups = ExcelBackupService(self.backup_dir)
 
-    def source_sheet_candidates(self) -> list[SourceSheetCandidate]:
-        """Liệt kê các sheet tháng nguồn trước khi bắt đầu phân tích dữ liệu."""
+    def cleanup_stale_files(self) -> int:
+        """Dọn đúng các artifact do luồng Excel của ứng dụng tạo ra."""
 
+        removed = 0
+        if self.bk_path.suffix.casefold() in {".xlsx", ".xlsm"}:
+            removed += self.backups.cleanup_working_copies(self.bk_path)
+        if self.daily_path.suffix.casefold() in {".xlsx", ".xlsm"}:
+            removed += self.gateway.cleanup_source_snapshots(
+                self.daily_path, self.temp_dir
+            )
+        return removed
+
+    def source_sheet_candidates(self) -> list[SourceSheetCandidate]:
         source = ensure_supported_workbook(self.daily_path)
         if not source.is_file():
             raise DailySyncError(f"Không tìm thấy file Hàng ngày: {source}")
@@ -191,7 +200,8 @@ class DailySyncService:
             raise DailySyncError(f"Không tìm thấy file BK: {target}")
 
         run_id = self._create_run(source, target)
-        source_snapshot: Path | None = None
+        source_book = None
+        target_book = None
         try:
             _progress(progress_callback, "Đang chờ file Hàng ngày ổn định…")
             self.stability_checker.wait(source)
@@ -200,121 +210,134 @@ class DailySyncService:
             source_fingerprint = self.gateway.fingerprint(source)
             target_fingerprint = self.gateway.fingerprint(target)
 
-            _progress(progress_callback, "Đang tạo bản đọc tạm của file Hàng ngày…")
-            source_snapshot = self.gateway.source_snapshot(source, self.temp_dir)
-            source_snapshot_fingerprint = self.gateway.fingerprint(source_snapshot)
-            source_book = self.gateway.load(source_snapshot, read_only=True)
+            # Workbook nguồn nhỏ và cần truy cập header/cell nhiều lần. Chế độ
+            # normal nhanh hơn rất nhiều so với random access trên ReadOnlyWorksheet.
+            source_book = self.gateway.load(source, read_only=False)
             target_book = self.gateway.load(target, read_only=False)
-            try:
-                source_sheets = self.months.daily_sheets(source_book.sheetnames)
+            source_sheets = self.months.daily_sheets(source_book.sheetnames)
+            if not source_sheets:
+                raise DailySyncError(
+                    "File Hàng ngày không có sheet Tháng 1…Tháng 12."
+                )
+            if source_sheet_name is not None:
+                source_sheets = {
+                    month: sheet_name
+                    for month, sheet_name in source_sheets.items()
+                    if sheet_name == source_sheet_name
+                }
                 if not source_sheets:
                     raise DailySyncError(
-                        "File Hàng ngày không có sheet Tháng 1…Tháng 12."
+                        f"Không tìm thấy sheet nguồn {source_sheet_name!r} "
+                        "trong file Hàng ngày."
                     )
-                if source_sheet_name is not None:
-                    selected_sources = {
-                        month: sheet_name
-                        for month, sheet_name in source_sheets.items()
-                        if sheet_name == source_sheet_name
-                    }
-                    if not selected_sources:
-                        raise DailySyncError(
-                            f"Không tìm thấy sheet nguồn {source_sheet_name!r} "
-                            "trong file Hàng ngày."
-                        )
-                    source_sheets = selected_sources
-                target_sheets = self._target_sheets(target_book.sheetnames)
-                target_years = sorted(
-                    {
-                        year
-                        for sheets in target_sheets.values()
-                        for year, _name in sheets
-                    }
+
+            target_sheets = self._target_sheets(target_book.sheetnames)
+            target_years = sorted(
+                {
+                    year
+                    for sheets in target_sheets.values()
+                    for year, _name in sheets
+                }
+            )
+            if not target_years:
+                raise DailySyncError("File BK không có sheet tháng TMM YY.")
+
+            rows_by_month: dict[int, list[SyncRow]] = {}
+            rows_by_target: dict[str, list[SyncRow]] = {}
+            actions_by_target: dict[str, list[SyncAction]] = {}
+            candidates: list[MonthCandidate] = []
+            conflicts: list[SyncConflict] = []
+            invalid_rows: list[int] = []
+            source_row_count = 0
+
+            for month, current_source_name in sorted(source_sheets.items()):
+                _progress(
+                    progress_callback,
+                    f"Đang đối chiếu toàn bộ {current_source_name}…",
                 )
-                if not target_years:
-                    raise DailySyncError("File BK không có sheet tháng TMM YY.")
-                rows_by_month: dict[int, list[SyncRow]] = {}
-                rows_by_target: dict[str, list[SyncRow]] = {}
-                candidates: list[MonthCandidate] = []
-                conflicts: list[SyncConflict] = []
-                conflict_ids: set[str] = set()
-                for month, current_source_sheet_name in sorted(
-                    source_sheets.items()
-                ):
-                    _progress(
-                        progress_callback,
-                        f"Đang phân tích {current_source_sheet_name}…",
+                source_sheet = source_book[current_source_name]
+                source_header = self.headers.resolve(
+                    source_sheet, SOURCE_HEADER_ALIASES, required=SYNC_FIELDS
+                )
+                source_rows, current_invalid = self._source_rows(
+                    source_sheet,
+                    source_header,
+                    month=month,
+                )
+                source_row_count += len(source_rows)
+                invalid_rows.extend(current_invalid)
+
+                existing_targets = list(target_sheets.get(month, ()))
+                target_options = (
+                    existing_targets
+                    if existing_targets
+                    else [
+                        (year, self.months.target_name(month, year))
+                        for year in target_years
+                    ]
+                )
+                existing_names = {name for _year, name in existing_targets}
+                for target_year, target_name in target_options:
+                    target_rows: list[SyncRow] = []
+                    if target_name in existing_names:
+                        target_sheet = target_book[target_name]
+                        target_header = self._resolve_target_headers(target_sheet)
+                        target_rows = self._target_rows(
+                            target_sheet, target_header, month=month
+                        )
+                    actions, action_conflicts = self._build_actions(
+                        source_rows,
+                        target_rows,
+                        source_fingerprint=source_fingerprint.sha256,
+                        target_sheet=target_name,
+                        target_worksheet=(
+                            target_book[target_name]
+                            if target_name in existing_names
+                            else None
+                        ),
                     )
-                    source_sheet = source_book[current_source_sheet_name]
-                    source_headers = self.headers.resolve(
-                        source_sheet, SOURCE_HEADER_ALIASES, required=SYNC_FIELDS
-                    )
-                    existing_targets = list(target_sheets.get(month, ()))
-                    target_options = (
-                        existing_targets
-                        if existing_targets
-                        else [
-                            (
-                                target_year,
-                                self.months.target_name(month, target_year),
-                            )
-                            for target_year in target_years
-                        ]
-                    )
-                    existing_by_year = dict(existing_targets)
-                    target_analyses: list[
-                        tuple[int, str, int, list[SyncRow]]
-                    ] = []
-                    for target_year, target_sheet_name in target_options:
-                        last_sqt = 0
-                        if target_year in existing_by_year:
-                            target_sheet = target_book[target_sheet_name]
-                            target_headers = self._resolve_target_headers(target_sheet)
-                            last_sqt = self._last_sqt(target_sheet, target_headers)
-                        month_rows, month_conflicts = self._source_rows(
-                            source_sheet,
-                            source_headers,
+                    actions_by_target[target_name] = actions
+                    inserts = [
+                        action.source
+                        for action in actions
+                        if action.action is SyncActionType.INSERT
+                        and action.source is not None
+                    ]
+                    rows_by_target[target_name] = inserts
+                    rows_by_month.setdefault(month, inserts)
+                    conflicts.extend(action_conflicts)
+                    counts = self._action_counts(actions)
+                    candidates.append(
+                        MonthCandidate(
                             month=month,
-                            last_sqt=last_sqt,
-                            source_fingerprint=source_fingerprint.sha256,
+                            year=target_year,
+                            source_sheet=current_source_name,
+                            target_sheet=target_name,
+                            new_row_count=counts[SyncActionType.INSERT],
+                            update_count=counts[SyncActionType.UPDATE],
+                            unchanged_count=counts[SyncActionType.UNCHANGED],
+                            target_only_count=counts[SyncActionType.TARGET_ONLY],
+                            invalid_count=len(current_invalid),
+                            last_sqt=max(
+                                (row.sqt for row in target_rows), default=0
+                            ),
+                            match_count=(
+                                counts[SyncActionType.UPDATE]
+                                + counts[SyncActionType.UNCHANGED]
+                            ),
                         )
-                        for conflict in month_conflicts:
-                            if conflict.conflict_id not in conflict_ids:
-                                conflict_ids.add(conflict.conflict_id)
-                                conflicts.append(conflict)
-                        rows_by_target[target_sheet_name] = month_rows
-                        target_analyses.append(
-                            (
-                                target_year,
-                                target_sheet_name,
-                                last_sqt,
-                                month_rows,
-                            )
-                        )
-                    if any(rows for *_metadata, rows in target_analyses):
-                        for (
-                            target_year,
-                            target_sheet_name,
-                            last_sqt,
-                            month_rows,
-                        ) in target_analyses:
-                            rows_by_month.setdefault(month, month_rows)
-                            candidates.append(
-                                MonthCandidate(
-                                    month=month,
-                                    year=target_year,
-                                    source_sheet=current_source_sheet_name,
-                                    target_sheet=target_sheet_name,
-                                    new_row_count=len(month_rows),
-                                    last_sqt=last_sqt,
-                                )
-                            )
-            finally:
-                source_book.close()
-                target_book.close()
+                    )
+
+            source_book.close()
+            source_book = None
+            self.gateway.assert_unchanged(
+                source, source_fingerprint, label="File Hàng ngày"
+            )
+            target_book.close()
+            target_book = None
 
             selected_month = candidates[0].month if len(candidates) == 1 else None
-            selected_target_sheet = (
+            selected_target = (
                 candidates[0].target_sheet if len(candidates) == 1 else None
             )
             if len(candidates) > 1:
@@ -323,12 +346,11 @@ class DailySyncService:
                         conflict_id=_stable_id(
                             "sync-month",
                             source_fingerprint.sha256,
-                            [candidate.month for candidate in candidates],
+                            [candidate.target_sheet for candidate in candidates],
                         ),
                         conflict_type=ConflictType.TARGET_MONTH_AMBIGUOUS,
                         message=(
-                            "Có dữ liệu mới ở nhiều tháng hoặc nhiều sheet BK; "
-                            "hãy chọn một sheet đích."
+                            "Có nhiều sheet BK phù hợp; hãy chọn một sheet đích."
                         ),
                         allowed_actions=(
                             ResolutionAction.SELECT_MONTH,
@@ -349,7 +371,6 @@ class DailySyncService:
             )
             plan = SyncPlan(
                 source_path=source,
-                source_snapshot_path=source_snapshot,
                 target_path=target,
                 source_fingerprint=source_fingerprint,
                 target_fingerprint=target_fingerprint,
@@ -358,18 +379,17 @@ class DailySyncService:
                 month_candidates=candidates,
                 rows_by_month=rows_by_month,
                 rows_by_target=rows_by_target,
-                source_snapshot_fingerprint=source_snapshot_fingerprint,
+                actions_by_target=actions_by_target,
+                invalid_rows=invalid_rows,
                 conflicts=conflicts,
                 selected_month=selected_month,
-                selected_target_sheet=selected_target_sheet,
+                selected_target_sheet=selected_target,
                 run_id=run_id,
             )
             status = (
-                ExcelRunStatus.NO_CHANGES
-                if not plan.has_changes
-                else ExcelRunStatus.WAITING_USER
-                if plan.conflicts or selected_month is None
-                else ExcelRunStatus.ANALYZING
+                ExcelRunStatus.WAITING_USER
+                if plan.requires_user_input
+                else ExcelRunStatus.NO_CHANGES
             )
             self._update_run(
                 run_id,
@@ -377,15 +397,18 @@ class DailySyncService:
                 source_fingerprint=source_fingerprint,
                 target_fingerprint_before=target_fingerprint,
                 sheet_name=plan.selected_sheet,
-                total_items=sum(len(rows) for rows in rows_by_month.values()),
-                conflict_count=len(conflicts),
+                total_items=source_row_count + len(invalid_rows),
+                conflict_count=plan.conflict_count,
             )
             return plan
         except Exception as exc:
-            if source_snapshot is not None:
-                source_snapshot.unlink(missing_ok=True)
             self._finish_failed(run_id, exc)
             raise
+        finally:
+            if source_book is not None:
+                source_book.close()
+            if target_book is not None:
+                target_book.close()
 
     def apply(
         self,
@@ -396,103 +419,139 @@ class DailySyncService:
         resolved = resolution_map(resolutions)
         try:
             candidate = self._selected_candidate(plan, resolved)
-            if candidate is None:
-                if not plan.has_changes:
-                    result = SyncResult(
-                        status=ExcelRunStatus.NO_CHANGES,
-                        target_path=plan.target_path,
-                        conflict_count=len(plan.conflicts),
-                        fingerprint_before=plan.target_fingerprint,
-                        fingerprint_after=plan.target_fingerprint,
-                        run_id=plan.run_id,
-                        message="Không có dòng SQT mới.",
-                    )
-                    self._finish_result(result)
-                    plan.source_snapshot_path.unlink(missing_ok=True)
-                    return result
-                raise DailySyncError("Chưa chọn tháng cần đồng bộ.")
-            month = candidate.month
-            target_year = candidate.year
-            if target_year is None:
-                raise DailySyncError("Không xác định được năm của sheet BK đích.")
-            target_name = candidate.target_sheet
-            rows, skipped = self._resolved_rows(plan, candidate, resolved)
-            if not rows:
-                result = SyncResult(
-                    status=ExcelRunStatus.NO_CHANGES,
-                    target_path=plan.target_path,
-                    sheet_name=target_name,
-                    skipped_rows=skipped,
-                    conflict_count=len(plan.conflicts),
-                    fingerprint_before=plan.target_fingerprint,
-                    fingerprint_after=plan.target_fingerprint,
-                    run_id=plan.run_id,
-                    message="Không còn dòng nào sau khi áp dụng lựa chọn.",
-                )
-                self._finish_result(result)
-                plan.source_snapshot_path.unlink(missing_ok=True)
-                return result
         except Exception as exc:
-            plan.source_snapshot_path.unlink(missing_ok=True)
             self._finish_failed(plan.run_id, exc)
             raise
+        if candidate is None:
+            exc = DailySyncError("Chưa chọn sheet BK cần đồng bộ.")
+            self._finish_failed(plan.run_id, exc)
+            raise exc
+
+        target_name = candidate.target_sheet
+        blocking = [
+            conflict
+            for conflict in plan.conflicts
+            if conflict.conflict_type is ConflictType.SYNC_GROUP_COUNT_MISMATCH
+            and conflict.details.get("target_sheet") == target_name
+        ]
+        if blocking:
+            exc = DailySyncError(
+                "Không thể đồng bộ vì số dòng của cùng một SQT không khớp "
+                "giữa file Hàng ngày và BK."
+            )
+            self._finish_failed(plan.run_id, exc)
+            raise exc
+
+        actions = list(plan.actions_by_target.get(target_name, ()))
+        counts = self._action_counts(actions)
+        inserted = counts[SyncActionType.INSERT]
+        updated = counts[SyncActionType.UPDATE]
+        unchanged = counts[SyncActionType.UNCHANGED]
+        target_only = counts[SyncActionType.TARGET_ONLY]
+        invalid = candidate.invalid_count
+        if not inserted and not updated:
+            result = SyncResult(
+                status=ExcelRunStatus.NO_CHANGES,
+                target_path=plan.target_path,
+                sheet_name=target_name,
+                unchanged_rows=unchanged,
+                target_only_rows=target_only,
+                invalid_rows=invalid,
+                skipped_rows=invalid,
+                conflict_count=len(blocking),
+                fingerprint_before=plan.target_fingerprint,
+                fingerprint_after=plan.target_fingerprint,
+                run_id=plan.run_id,
+                message=(
+                    "Dữ liệu A–K/P đã đồng bộ; không có ô nào cần ghi."
+                ),
+            )
+            self._finish_result(result)
+            return result
 
         self._update_run(plan.run_id, status=ExcelRunStatus.APPLYING)
         _progress(progress_callback, "Đang kiểm tra file chưa thay đổi…")
         try:
             self.gateway.assert_unchanged(
-                plan.source_snapshot_path,
-                plan.source_snapshot_fingerprint or plan.source_fingerprint,
-                label="Bản đọc tạm Hàng ngày",
+                plan.source_path,
+                plan.source_fingerprint,
+                label="File Hàng ngày",
             )
             self.gateway.assert_unchanged(
-                plan.target_path, plan.target_fingerprint, label="File BK"
+                plan.target_path,
+                plan.target_fingerprint,
+                label="File BK",
             )
         except Exception as exc:
-            plan.source_snapshot_path.unlink(missing_ok=True)
             self._finish_failed(plan.run_id, exc)
             raise
+
         backup_path: Path | None = None
         working_path: Path | None = None
         try:
-            # Probe the Windows byte lock, then release our own handle before
-            # hashing/copying/replacing. Holding it would make this process block
-            # itself on Windows.
             with self.lock_service.acquire(plan.target_path):
                 pass
             self.gateway.assert_unchanged(
                 plan.target_path, plan.target_fingerprint, label="File BK"
             )
-            _progress(progress_callback, "Đang tạo backup file BK…")
-            backup_path = self.backups.create_backup(
-                plan.target_path, run_id=plan.run_id
-            )
             working_path = self.backups.create_working_copy(
                 plan.target_path, run_id=plan.run_id
             )
             workbook = self.gateway.load(working_path, read_only=False)
+            expected_cells: dict[tuple[int, int], Any] = {}
+            protected_cells: dict[tuple[int, int], Any] = {}
             try:
                 created = target_name not in workbook.sheetnames
                 if created:
                     worksheet = self._create_month_sheet(
-                        workbook, month, target_year, target_name
+                        workbook,
+                        candidate.month,
+                        int(candidate.year),
+                        target_name,
                     )
                 else:
                     worksheet = workbook[target_name]
                 header = self._resolve_target_headers(worksheet)
-                old_snapshot = self._worksheet_snapshot(worksheet)
+
+                for action in actions:
+                    if (
+                        action.action is not SyncActionType.UPDATE
+                        or action.source is None
+                        or action.target_row is None
+                    ):
+                        continue
+                    self._write_sync_values(
+                        worksheet,
+                        action.target_row,
+                        action.source.values,
+                        expected_cells,
+                    )
+                    for column, value in action.protected_values.items():
+                        protected_cells[(action.target_row, column)] = value
+
+                insert_actions = [
+                    action
+                    for action in actions
+                    if action.action is SyncActionType.INSERT
+                    and action.source is not None
+                ]
                 append_at = self._last_data_row(worksheet, header) + 1
                 template_row = max(header.row_end + 1, append_at - 1)
-                for offset, sync_row in enumerate(rows):
+                max_style_column = self._actual_max_column(worksheet)
+                for offset, action in enumerate(insert_actions):
                     target_row = append_at + offset
                     self._copy_row_style(
-                        worksheet, template_row, target_row
+                        worksheet,
+                        template_row,
+                        target_row,
+                        max_column=max_style_column,
                     )
-                    for source_index, field in enumerate(SYNC_FIELDS[:11]):
-                        worksheet.cell(target_row, source_index + 1).value = (
-                            sync_row.values[source_index]
-                        )
-                    worksheet.cell(target_row, 16).value = sync_row.values[11]
+                    self._write_sync_values(
+                        worksheet,
+                        target_row,
+                        action.source.values,
+                        expected_cells,
+                    )
                 self.gateway.save(workbook, working_path)
             finally:
                 workbook.close()
@@ -501,11 +560,11 @@ class DailySyncService:
             self._verify_saved_sync(
                 working_path,
                 target_name,
-                old_snapshot,
-                append_at,
-                rows,
-                created=created,
+                expected_cells,
+                protected_cells,
             )
+            _progress(progress_callback, "Đang cập nhật backup gần nhất…")
+            backup_path = self.backups.create_backup(plan.target_path)
             after = self.gateway.atomic_replace(
                 working_path,
                 plan.target_path,
@@ -516,14 +575,22 @@ class DailySyncService:
                 status=ExcelRunStatus.SUCCEEDED,
                 target_path=plan.target_path,
                 sheet_name=target_name,
-                added_rows=len(rows),
-                skipped_rows=skipped,
-                conflict_count=len(plan.conflicts),
+                added_rows=inserted,
+                inserted_rows=inserted,
+                updated_rows=updated,
+                unchanged_rows=unchanged,
+                target_only_rows=target_only,
+                invalid_rows=invalid,
+                skipped_rows=invalid,
+                conflict_count=len(blocking),
                 backup_path=backup_path,
                 fingerprint_before=plan.target_fingerprint,
                 fingerprint_after=after,
                 run_id=plan.run_id,
-                message=f"Đã thêm {len(rows)} dòng vào {target_name}.",
+                message=(
+                    f"Đã cập nhật {updated} dòng, thêm {inserted} dòng, "
+                    f"giữ {target_only} dòng chỉ có ở BK."
+                ),
             )
             self._finish_result(result)
             return result
@@ -533,22 +600,22 @@ class DailySyncService:
         finally:
             if working_path is not None and working_path.exists():
                 working_path.unlink()
-            plan.source_snapshot_path.unlink(missing_ok=True)
 
     def cancel(self, plan: SyncPlan) -> None:
-        """Đánh dấu plan chờ người dùng là đã hủy và dọn snapshot tạm."""
-
-        plan.source_snapshot_path.unlink(missing_ok=True)
         if self.run_repository is not None and plan.run_id is not None:
             self.run_repository.finish_run(
                 plan.run_id,
                 status=ExcelRunStatus.CANCELLED,
-                total_items=sum(
-                    len(rows) for rows in plan.rows_by_month.values()
+                total_items=(
+                    plan.insert_count
+                    + plan.update_count
+                    + plan.unchanged_count
+                    + plan.target_only_count
+                    + plan.invalid_count
                 ),
                 changed_items=0,
-                skipped_items=0,
-                conflict_count=len(plan.conflicts),
+                skipped_items=plan.invalid_count,
+                conflict_count=plan.conflict_count,
             )
 
     def _source_rows(
@@ -557,52 +624,21 @@ class DailySyncService:
         header: HeaderResolution,
         *,
         month: int,
-        last_sqt: int,
-        source_fingerprint: str,
-    ) -> tuple[list[SyncRow], list[SyncConflict]]:
+    ) -> tuple[list[SyncRow], list[int]]:
         rows: list[SyncRow] = []
-        conflicts: list[SyncConflict] = []
-        for row_index in range(header.row_end + 1, worksheet.max_row + 1):
+        invalid_rows: list[int] = []
+        columns = tuple(header.columns[field] for field in SYNC_FIELDS)
+        for row_index in self._populated_rows(
+            worksheet, columns, min_row=header.row_end + 1
+        ):
             values = tuple(
                 worksheet.cell(row_index, header.columns[field]).value
                 for field in SYNC_FIELDS
             )
-            if not any(value not in (None, "") for value in values):
-                continue
             sqt = parse_sqt(values[0])
             if sqt is None:
-                conflicts.append(
-                    SyncConflict(
-                        conflict_id=_stable_id(
-                            "invalid-sqt",
-                            source_fingerprint,
-                            worksheet.title,
-                            row_index,
-                        ),
-                        conflict_type=ConflictType.INVALID_SQT,
-                        message=f"SQT không hợp lệ tại dòng {row_index}.",
-                        source_sheet=worksheet.title,
-                        source_row=row_index,
-                        container=(
-                            str(values[2]) if values[2] is not None else None
-                        ),
-                        allowed_actions=(
-                            ResolutionAction.SKIP_INVALID,
-                            ResolutionAction.CANCEL_ALL,
-                        ),
-                        default_action=ResolutionAction.SKIP_INVALID,
-                    )
-                )
+                invalid_rows.append(row_index)
                 continue
-            if sqt <= last_sqt:
-                continue
-            duplicate_key = (
-                sqt,
-                self._key(values[2]),
-                self._key(values[4]),
-                self._key(values[3]),
-                self._key(values[1]),
-            )
             rows.append(
                 SyncRow(
                     source_sheet=worksheet.title,
@@ -610,37 +646,169 @@ class DailySyncService:
                     month=month,
                     sqt=sqt,
                     values=values,
-                    duplicate_key=duplicate_key,
+                    duplicate_key=(sqt,),
                 )
             )
-        counts = Counter(row.duplicate_key for row in rows)
-        for key, count in counts.items():
-            if count < 2:
+        return rows, invalid_rows
+
+    def _target_rows(
+        self,
+        worksheet: Worksheet,
+        header: HeaderResolution,
+        *,
+        month: int,
+    ) -> list[SyncRow]:
+        rows: list[SyncRow] = []
+        columns = tuple(header.columns[field] for field in SYNC_FIELDS)
+        for row_index in self._populated_rows(
+            worksheet, columns, min_row=header.row_end + 1
+        ):
+            values = tuple(
+                worksheet.cell(row_index, header.columns[field]).value
+                for field in SYNC_FIELDS
+            )
+            sqt = parse_sqt(values[0])
+            if sqt is None:
                 continue
-            first = next(row for row in rows if row.duplicate_key == key)
-            conflicts.append(
-                SyncConflict(
-                    conflict_id=_stable_id(
-                        "duplicate", source_fingerprint, worksheet.title, key
-                    ),
-                    conflict_type=ConflictType.DUPLICATE_SOURCE_ROW,
-                    message=f"Có {count} dòng nguồn trùng hoàn toàn (SQT {first.sqt}).",
+            rows.append(
+                SyncRow(
                     source_sheet=worksheet.title,
-                    source_row=first.source_row,
-                    sqt=first.sqt,
-                    container=(
-                        str(first.container) if first.container is not None else None
-                    ),
-                    allowed_actions=(
-                        ResolutionAction.KEEP_ONE,
-                        ResolutionAction.KEEP_ALL,
-                        ResolutionAction.CANCEL_ALL,
-                    ),
-                    default_action=ResolutionAction.KEEP_ONE,
-                    details={"duplicate_key": key, "count": count},
+                    source_row=row_index,
+                    month=month,
+                    sqt=sqt,
+                    values=values,
+                    duplicate_key=(sqt,),
                 )
             )
-        return rows, conflicts
+        return rows
+
+    def _build_actions(
+        self,
+        source_rows: Sequence[SyncRow],
+        target_rows: Sequence[SyncRow],
+        *,
+        source_fingerprint: str,
+        target_sheet: str,
+        target_worksheet: Worksheet | None,
+    ) -> tuple[list[SyncAction], list[SyncConflict]]:
+        source_groups: dict[int, list[SyncRow]] = defaultdict(list)
+        target_groups: dict[int, list[SyncRow]] = defaultdict(list)
+        for row in source_rows:
+            source_groups[row.sqt].append(row)
+        for row in target_rows:
+            target_groups[row.sqt].append(row)
+
+        actions: list[SyncAction] = []
+        conflicts: list[SyncConflict] = []
+        seen_sqt: set[int] = set()
+        for source in source_rows:
+            if source.sqt in seen_sqt:
+                continue
+            seen_sqt.add(source.sqt)
+            source_group = source_groups[source.sqt]
+            target_group = target_groups.get(source.sqt, [])
+            if not target_group:
+                actions.extend(
+                    SyncAction(
+                        action=SyncActionType.INSERT,
+                        sqt=item.sqt,
+                        source=item,
+                    )
+                    for item in source_group
+                )
+                continue
+            if len(source_group) != len(target_group):
+                conflicts.append(
+                    SyncConflict(
+                        conflict_id=_stable_id(
+                            "sync-count",
+                            source_fingerprint,
+                            target_sheet,
+                            source.sqt,
+                            len(source_group),
+                            len(target_group),
+                        ),
+                        conflict_type=ConflictType.SYNC_GROUP_COUNT_MISMATCH,
+                        message=(
+                            f"SQT {source.sqt}: nguồn có {len(source_group)} dòng, "
+                            f"BK có {len(target_group)} dòng."
+                        ),
+                        source_sheet=source.source_sheet,
+                        source_row=source.source_row,
+                        sqt=source.sqt,
+                        allowed_actions=(ResolutionAction.CANCEL_ALL,),
+                        details={
+                            "target_sheet": target_sheet,
+                            "source_count": len(source_group),
+                            "target_count": len(target_group),
+                        },
+                    )
+                )
+                continue
+            for source_item, target_item in zip(source_group, target_group):
+                action_type = (
+                    SyncActionType.UNCHANGED
+                    if source_item.values == target_item.values
+                    else SyncActionType.UPDATE
+                )
+                actions.append(
+                    SyncAction(
+                        action=action_type,
+                        sqt=source_item.sqt,
+                        source=source_item,
+                        target_row=target_item.source_row,
+                        target_values=target_item.values,
+                        protected_values=self._protected_values(
+                            target_worksheet,
+                            target_item.source_row,
+                        ),
+                    )
+                )
+
+        source_sqts = set(source_groups)
+        for target in target_rows:
+            if target.sqt in source_sqts:
+                continue
+            actions.append(
+                SyncAction(
+                    action=SyncActionType.TARGET_ONLY,
+                    sqt=target.sqt,
+                    target_row=target.source_row,
+                    target_values=target.values,
+                )
+            )
+        source_actions = sorted(
+            (action for action in actions if action.source is not None),
+            key=lambda action: int(action.source.source_row),
+        )
+        target_only_actions = sorted(
+            (action for action in actions if action.source is None),
+            key=lambda action: int(action.target_row or 0),
+        )
+        return [*source_actions, *target_only_actions], conflicts
+
+    @staticmethod
+    def _protected_values(
+        worksheet: Worksheet | None, row: int
+    ) -> dict[int, Any]:
+        if worksheet is None:
+            return {}
+        return {
+            column: cell.value
+            for (cell_row, column), cell in worksheet._cells.items()
+            if cell_row == row
+            and column not in SYNC_TARGET_COLUMNS
+            and cell.value is not None
+        }
+
+    @staticmethod
+    def _action_counts(
+        actions: Sequence[SyncAction],
+    ) -> dict[SyncActionType, int]:
+        return {
+            kind: sum(action.action is kind for action in actions)
+            for kind in SyncActionType
+        }
 
     def _resolve_target_headers(self, worksheet: Worksheet) -> HeaderResolution:
         resolution = self.headers.resolve(
@@ -679,25 +847,44 @@ class DailySyncService:
         return result
 
     @staticmethod
-    def _last_sqt(worksheet: Worksheet, header: HeaderResolution) -> int:
-        values = (
-            parse_sqt(worksheet.cell(row, header.columns["sqt"]).value)
-            for row in range(header.row_end + 1, worksheet.max_row + 1)
+    def _populated_rows(
+        worksheet: Worksheet,
+        columns: Sequence[int],
+        *,
+        min_row: int,
+    ) -> list[int]:
+        wanted = set(columns)
+        cells = getattr(worksheet, "_cells", {})
+        return sorted(
+            {
+                row
+                for (row, column), cell in cells.items()
+                if row >= min_row
+                and column in wanted
+                and cell.value not in (None, "")
+            }
         )
-        return max((value for value in values if value is not None), default=0)
+
+    @classmethod
+    def _last_data_row(
+        cls, worksheet: Worksheet, header: HeaderResolution
+    ) -> int:
+        rows = cls._populated_rows(
+            worksheet,
+            tuple(TARGET_EXPECTED_COLUMNS.values()),
+            min_row=header.row_end + 1,
+        )
+        return rows[-1] if rows else header.row_end
 
     @staticmethod
-    def _last_data_row(
-        worksheet: Worksheet, header: HeaderResolution
-    ) -> int:
-        columns = tuple(TARGET_EXPECTED_COLUMNS.values())
-        for row in range(worksheet.max_row, header.row_end, -1):
-            if any(
-                worksheet.cell(row, column).value not in (None, "")
-                for column in columns
-            ):
-                return row
-        return header.row_end
+    def _actual_max_column(worksheet: Worksheet) -> int:
+        cells = getattr(worksheet, "_cells", {})
+        used = [
+            column
+            for (_row, column), cell in cells.items()
+            if cell.value is not None or cell.has_style
+        ]
+        return max(used, default=max(TARGET_EXPECTED_COLUMNS.values()))
 
     def _create_month_sheet(
         self, workbook: Any, month: int, year: int, target_name: str
@@ -711,11 +898,11 @@ class DailySyncService:
             )
         template = workbook[template_name]
         header = self._resolve_target_headers(template)
-        if self._last_data_row(template, header) <= header.row_end:
+        data_row = self._last_data_row(template, header)
+        if data_row <= header.row_end:
             raise DailySyncError(f"Sheet mẫu {template_name} không có dòng dữ liệu.")
-        worksheet = workbook.copy_worksheet(template)
-        worksheet.title = target_name
-        # openpyxl's copy_worksheet omits a few worksheet-level collections.
+
+        worksheet = workbook.create_sheet(target_name)
         for attribute in (
             "freeze_panes",
             "sheet_format",
@@ -725,86 +912,124 @@ class DailySyncService:
             "print_options",
             "auto_filter",
             "data_validations",
+            "conditional_formatting",
         ):
             try:
-                setattr(worksheet, attribute, copy.copy(getattr(template, attribute)))
+                setattr(
+                    worksheet,
+                    attribute,
+                    copy.copy(getattr(template, attribute)),
+                )
             except (AttributeError, TypeError):
                 pass
-        for row in worksheet.iter_rows(
-            min_row=header.row_end + 1,
-            max_row=worksheet.max_row,
-            max_col=worksheet.max_column,
-        ):
-            for cell in row:
-                if isinstance(cell, MergedCell):
-                    continue
-                cell.value = None
-                cell.comment = None
+        for attribute in ("print_area", "print_title_rows", "print_title_cols"):
+            try:
+                setattr(worksheet, attribute, getattr(template, attribute))
+            except (AttributeError, TypeError, ValueError):
+                pass
+        for key, dimension in template.column_dimensions.items():
+            worksheet.column_dimensions[key] = copy.copy(dimension)
+
+        for (row, column), source in list(template._cells.items()):
+            if row > header.row_end:
+                continue
+            if isinstance(source, MergedCell):
+                continue
+            target = worksheet.cell(row, column)
+            self._copy_cell(source, target, copy_value=True)
+        for merged in template.merged_cells.ranges:
+            if merged.max_row <= header.row_end:
+                worksheet.merge_cells(str(merged))
+        for row in range(1, header.row_end + 1):
+            if row in template.row_dimensions:
+                worksheet.row_dimensions[row] = copy.copy(
+                    template.row_dimensions[row]
+                )
+
+        template_target_row = header.row_end + 1
+        max_column = self._actual_max_column(template)
+        if data_row in template.row_dimensions:
+            worksheet.row_dimensions[template_target_row] = copy.copy(
+                template.row_dimensions[data_row]
+            )
+        for column in range(1, max_column + 1):
+            source = template.cell(data_row, column)
+            target = worksheet.cell(template_target_row, column)
+            self._copy_cell(source, target, copy_value=False)
         return worksheet
 
     @staticmethod
+    def _copy_cell(source: Any, target: Any, *, copy_value: bool) -> None:
+        if source.has_style:
+            target._style = copy.copy(source._style)
+        if source.number_format:
+            target.number_format = source.number_format
+        if source.hyperlink is not None and copy_value:
+            target._hyperlink = copy.copy(source.hyperlink)
+        if source.comment is not None and copy_value:
+            target.comment = copy.copy(source.comment)
+        target.value = source.value if copy_value else None
+
+    @classmethod
     def _copy_row_style(
-        worksheet: Worksheet, source_row: int, target_row: int
+        cls,
+        worksheet: Worksheet,
+        source_row: int,
+        target_row: int,
+        *,
+        max_column: int | None = None,
     ) -> None:
         if source_row <= 0:
             return
         worksheet.row_dimensions[target_row].height = (
             worksheet.row_dimensions[source_row].height
         )
-        for column in range(1, worksheet.max_column + 1):
+        for column in range(
+            1, (max_column or cls._actual_max_column(worksheet)) + 1
+        ):
             source = worksheet.cell(source_row, column)
             target = worksheet.cell(target_row, column)
-            if source.has_style:
-                target._style = copy.copy(source._style)
-            if source.number_format:
-                target.number_format = source.number_format
+            cls._copy_cell(source, target, copy_value=False)
 
     @staticmethod
-    def _worksheet_snapshot(worksheet: Worksheet) -> dict[tuple[int, int], Any]:
-        return {
-            (row, column): worksheet.cell(row, column).value
-            for row in range(1, worksheet.max_row + 1)
-            for column in range(1, worksheet.max_column + 1)
-        }
+    def _write_sync_values(
+        worksheet: Worksheet,
+        target_row: int,
+        values: Sequence[Any],
+        expected: dict[tuple[int, int], Any],
+    ) -> None:
+        for index, field in enumerate(SYNC_FIELDS):
+            column = TARGET_EXPECTED_COLUMNS[field]
+            value = values[index]
+            worksheet.cell(target_row, column).value = value
+            expected[(target_row, column)] = value
 
     def _verify_saved_sync(
         self,
         path: Path,
         sheet_name: str,
-        old_snapshot: Mapping[tuple[int, int], Any],
-        append_at: int,
-        rows: Sequence[SyncRow],
-        *,
-        created: bool,
+        expected_cells: Mapping[tuple[int, int], Any],
+        protected_cells: Mapping[tuple[int, int], Any],
     ) -> None:
         workbook = self.gateway.load(path, read_only=False)
         try:
             if sheet_name not in workbook.sheetnames:
                 raise DailySyncError("Bản lưu thiếu sheet đích.")
             worksheet = workbook[sheet_name]
-            for coordinate, old_value in old_snapshot.items():
-                row, column = coordinate
-                if row >= append_at and column in TARGET_EXPECTED_COLUMNS.values():
-                    continue
-                if worksheet.cell(row, column).value != old_value:
+            for (row, column), value in expected_cells.items():
+                if worksheet.cell(row, column).value != value:
                     raise DailySyncError(
-                        f"Ô cũ {worksheet.cell(row, column).coordinate} bị thay đổi."
+                        f"Ô {worksheet.cell(row, column).coordinate} "
+                        "không giữ đúng giá trị đồng bộ."
                     )
-            actual = [
-                parse_sqt(worksheet.cell(append_at + offset, 1).value)
-                for offset in range(len(rows))
-            ]
-            expected = [row.sqt for row in rows]
-            if actual != expected:
-                raise DailySyncError("Thứ tự SQT sau khi lưu không đúng.")
+            for (row, column), value in protected_cells.items():
+                if worksheet.cell(row, column).value != value:
+                    raise DailySyncError(
+                        f"Ô được bảo vệ {worksheet.cell(row, column).coordinate} "
+                        "đã bị thay đổi."
+                    )
         finally:
             workbook.close()
-
-    @staticmethod
-    def _key(value: Any) -> Any:
-        if isinstance(value, str):
-            return " ".join(value.split()).casefold()
-        return value
 
     def _selected_candidate(
         self, plan: SyncPlan, resolutions: Mapping[str, Any]
@@ -855,57 +1080,6 @@ class DailySyncService:
                         return matching[0]
         return None
 
-    def _resolved_rows(
-        self,
-        plan: SyncPlan,
-        candidate: MonthCandidate,
-        resolutions: Mapping[str, Any],
-    ) -> tuple[list[SyncRow], int]:
-        month = candidate.month
-        rows = list(
-            plan.rows_by_target.get(
-                candidate.target_sheet,
-                plan.rows_by_month.get(month, ()),
-            )
-        )
-        skipped = 0
-        for conflict in plan.conflicts:
-            if (
-                conflict.conflict_type is ConflictType.INVALID_SQT
-                and conflict.source_sheet
-                != next(
-                    (
-                        candidate.source_sheet
-                        for candidate in plan.month_candidates
-                        if candidate.month == month
-                    ),
-                    None,
-                )
-            ):
-                continue
-            value = resolutions.get(conflict.conflict_id)
-            action = (
-                self._action(value)
-                if value is not None
-                else conflict.default_action
-            )
-            if action in {ResolutionAction.CANCEL, ResolutionAction.CANCEL_ALL}:
-                raise DailySyncError("Người dùng đã hủy đồng bộ.")
-            if conflict.conflict_type is ConflictType.INVALID_SQT:
-                skipped += 1
-            elif conflict.conflict_type is ConflictType.DUPLICATE_SOURCE_ROW:
-                key = tuple(conflict.details.get("duplicate_key", ()))
-                matching = [row for row in rows if row.duplicate_key == key]
-                if action is ResolutionAction.KEEP_ONE and len(matching) > 1:
-                    keep = matching[0]
-                    rows = [
-                        row
-                        for row in rows
-                        if row.duplicate_key != key or row is keep
-                    ]
-                    skipped += len(matching) - 1
-        return rows, skipped
-
     @staticmethod
     def _action(value: Any) -> ResolutionAction:
         if isinstance(value, (ResolutionAction, str)):
@@ -933,15 +1107,22 @@ class DailySyncService:
     def _finish_result(self, result: SyncResult) -> None:
         if self.run_repository is None or result.run_id is None:
             return
+        total = (
+            result.inserted_rows
+            + result.updated_rows
+            + result.unchanged_rows
+            + result.target_only_rows
+            + result.invalid_rows
+        )
         self.run_repository.finish_run(
             result.run_id,
             status=result.status,
             sheet_name=result.sheet_name,
             backup_path=result.backup_path,
             target_fingerprint_after=result.fingerprint_after,
-            total_items=result.added_rows + result.skipped_rows,
-            changed_items=result.added_rows,
-            skipped_items=result.skipped_rows,
+            total_items=total,
+            changed_items=result.inserted_rows + result.updated_rows,
+            skipped_items=result.invalid_rows,
             conflict_count=result.conflict_count,
         )
 
