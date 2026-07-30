@@ -35,6 +35,7 @@ from app.services.excel import (
     DailySyncService,
     ExcelConfigurationService,
     ExpensePostingService,
+    PaymentSyncService,
 )
 from app.services.output_watcher import OutputWatcher
 from app.services.json_codec import JsonCodec
@@ -115,6 +116,7 @@ class ApplicationRuntime:
         self.excel_task_controller = ExcelTaskController(
             daily_sync_service=self.daily_sync_service,
             expense_posting_service=self.expense_posting_service,
+            payment_sync_service=self.payment_sync_service,
         )
         self.assistant_launcher = AssistantBatLauncher(self.settings)
         self.launcher = self.assistant_launcher
@@ -168,6 +170,10 @@ class ApplicationRuntime:
             run_repository=self.excel_run_repository,
             posting_repository=self.expense_posting_repository,
         )
+        self.payment_sync_service = PaymentSyncService(
+            settings,
+            run_repository=self.excel_run_repository,
+        )
         self.excel_configuration_service = ExcelConfigurationService(settings)
 
     def apply_settings(self, settings: AppSettings) -> AppSettings:
@@ -203,6 +209,7 @@ class ApplicationRuntime:
             task_controller.update_services(
                 daily_sync_service=self.daily_sync_service,
                 expense_posting_service=self.expense_posting_service,
+                payment_sync_service=self.payment_sync_service,
             )
         LOGGER.info(
             "Đã áp dụng cấu hình; bat=%s, output=%s",

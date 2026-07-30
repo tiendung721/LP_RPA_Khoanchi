@@ -33,6 +33,7 @@ from .workflow_page import WorkflowPage
 from .excel_dialogs import (
     ConflictResolutionDialog,
     MonthSelectionDialog,
+    PaymentNewRowsDialog,
     RepostSelectionDialog,
 )
 
@@ -248,6 +249,9 @@ class MainWindow(QMainWindow):
         self.workflow_page.post_expenses_requested.connect(
             self.start_expense_posting
         )
+        self.workflow_page.sync_payment_requested.connect(
+            self.start_payment_sync
+        )
 
         self.history_page.refresh_requested.connect(self.refresh_history)
         self.history_page.open_batch_requested.connect(self.open_review)
@@ -383,14 +387,31 @@ class MainWindow(QMainWindow):
     def open_assistant(self) -> None:
         self._launch_assistant(self._settings)
 
-    def _missing_excel_configuration(self, *, require_daily: bool) -> bool:
+    def _missing_excel_configuration(
+        self,
+        *,
+        require_daily: bool,
+        require_payment: bool = False,
+    ) -> bool:
         daily = str(
             _attribute(self._settings, "daily_workbook_path", default="") or ""
         ).strip()
         bk = str(
             _attribute(self._settings, "bk_workbook_path", default="") or ""
         ).strip()
-        if bk and (daily or not require_daily):
+        payment = str(
+            _attribute(
+                self._settings,
+                "payment_workbook_path",
+                default="",
+            )
+            or ""
+        ).strip()
+        if (
+            bk
+            and (daily or not require_daily)
+            and (payment or not require_payment)
+        ):
             return False
         message = QMessageBox(self)
         message.setIcon(QMessageBox.Icon.Warning)
@@ -466,6 +487,49 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._show_excel_error(exc, operation="posting")
 
+    @Slot()
+    def start_payment_sync(self) -> None:
+        if self._missing_excel_configuration(
+            require_daily=False,
+            require_payment=True,
+        ):
+            return
+        if self._excel_tasks is None:
+            QMessageBox.warning(
+                self,
+                "Chưa thể đồng bộ",
+                "Dịch vụ đồng bộ BK sang Thanh toán chưa được khởi tạo.",
+            )
+            return
+        self._excel_context = "workflow"
+        try:
+            service = _attribute(self._excel_tasks, "payment_sync_service")
+            list_candidates = getattr(service, "source_sheet_candidates", None)
+            if not callable(list_candidates):
+                raise RuntimeError(
+                    "Dịch vụ đồng bộ Thanh toán chưa hỗ trợ chọn sheet BK."
+                )
+            candidates = list(list_candidates())
+            dialog = MonthSelectionDialog(
+                candidates,
+                self,
+                title="Chọn sheet BK đồng bộ sang Thanh toán",
+                preselect_first=False,
+                show_recommendations=False,
+            )
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                self._excel_context = None
+                return
+            source_sheet_name = dialog.selected_sheet_name
+            if not source_sheet_name:
+                self._excel_context = None
+                return
+            self._excel_tasks.start_payment_sync(
+                source_sheet_name=source_sheet_name
+            )
+        except Exception as exc:
+            self._show_excel_error(exc, operation="payment_sync")
+
     @Slot(str)
     def _excel_started(self, operation: str) -> None:
         self._excel_operation = operation
@@ -489,6 +553,9 @@ class MainWindow(QMainWindow):
             operation = self._excel_tasks.normalize_operation(
                 _attribute(plan, "operation", "operation_type", default=self._excel_operation)
             )
+            if operation == "payment_sync":
+                self._handle_payment_sync_plan(plan)
+                return
             resolutions: dict[str, Any] = {}
             handled_conflicts: set[str] = set()
             conflicts = list(_attribute(plan, "conflicts", default=()) or ())
@@ -755,6 +822,80 @@ class MainWindow(QMainWindow):
             self._excel_tasks.cancel_waiting()
             self._show_excel_error(exc, operation=self._excel_operation)
 
+    def _handle_payment_sync_plan(self, plan: Any) -> None:
+        """Thu thập lựa chọn rồi xác nhận một lần trước khi ghi."""
+
+        if self._excel_tasks is None:
+            return
+        resolutions: dict[str, Any] = {}
+        conflicts = list(_attribute(plan, "conflicts", default=()) or ())
+        if conflicts:
+            conflict_dialog = ConflictResolutionDialog(conflicts, self)
+            if conflict_dialog.exec() != QDialog.DialogCode.Accepted:
+                self._excel_tasks.cancel_waiting()
+                return
+            resolutions.update(conflict_dialog.resolution_map())
+
+        new_rows = list(_attribute(plan, "new_rows", default=()) or ())
+        if new_rows:
+            new_dialog = PaymentNewRowsDialog(new_rows, self)
+            if new_dialog.exec() != QDialog.DialogCode.Accepted:
+                self._excel_tasks.cancel_waiting()
+                return
+            resolutions["selected_new_rows"] = new_dialog.selected_item_ids
+
+        source_sheet = _attribute(plan, "source_sheet", default="—")
+        target_sheet = _attribute(plan, "target_sheet", default="—")
+        updates = int(_attribute(plan, "update_count", default=0) or 0)
+        unchanged = int(_attribute(plan, "unchanged_count", default=0) or 0)
+        new_count = int(_attribute(plan, "new_count", default=0) or 0)
+        selected_new_count = len(
+            resolutions.get("selected_new_rows", [None] * new_count)
+        )
+        skipped_new = max(0, new_count - selected_new_count)
+        conflict_count = int(
+            _attribute(plan, "conflict_count", default=len(conflicts)) or 0
+        )
+        normalize_sheets = int(
+            _attribute(plan, "normalization_sheet_count", default=0) or 0
+        )
+        target_sheet_created = bool(
+            _attribute(plan, "target_sheet_created", default=False)
+        )
+        template_sheet = _attribute(plan, "template_sheet", default="—")
+        creation_detail = (
+            f"Sheet Thanh toán mới: Có, tạo từ {template_sheet}\n"
+            if target_sheet_created
+            else "Sheet Thanh toán mới: Không\n"
+        )
+        answer = QMessageBox.question(
+            self,
+            "Xác nhận đồng bộ BK → Thanh toán",
+            (
+                f"Sheet BK: {source_sheet}\n"
+                f"Sheet Thanh toán: {target_sheet}\n\n"
+                f"{creation_detail}"
+                f"Cập nhật: {updates} dòng\n"
+                f"Không đổi: {unchanged} dòng\n"
+                f"Dòng mới được chọn: {selected_new_count}/{new_count}\n"
+                f"Bỏ qua dòng mới: {skipped_new}\n"
+                f"Xung đột: {conflict_count}\n"
+                f"Sheet BK cần chuẩn hóa: {normalize_sheets}\n\n"
+                "Tiếp tục ghi hai workbook?"
+            ),
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self._excel_tasks.cancel_waiting()
+            return
+        self._excel_tasks.apply_plan(
+            plan,
+            resolutions,
+            operation="payment_sync",
+        )
+
     @Slot(object)
     def _excel_completed(self, result: Any) -> None:
         if self._excel_context == "configuration":
@@ -785,6 +926,36 @@ class MainWindow(QMainWindow):
         message = str(
             _attribute(result, "message", default="Hoàn tất xử lý Excel.") or ""
         )
+        if operation == "payment_sync":
+            detail = (
+                f"{message}\n\n"
+                f"Sheet BK: {_attribute(result, 'source_sheet_name', default='—')}\n"
+                f"Sheet Thanh toán: {_attribute(result, 'sheet_name', default='—')}\n"
+                f"Đã tạo sheet mới: "
+                f"{'Có' if bool(_attribute(result, 'sheet_created', default=False)) else 'Không'}\n"
+                f"Đã cập nhật: {_attribute(result, 'updated_rows', default=0)} dòng\n"
+                f"Đã thêm: {_attribute(result, 'inserted_rows', default=0)} dòng\n"
+                f"Không đổi: {_attribute(result, 'unchanged_rows', default=0)} dòng\n"
+                f"Bỏ qua: {_attribute(result, 'skipped_rows', default=0)} dòng"
+            )
+            completion_message = QMessageBox(self)
+            completion_message.setIcon(QMessageBox.Icon.Information)
+            completion_message.setWindowTitle(
+                "Đồng bộ BK → Thanh toán hoàn tất"
+            )
+            completion_message.setText(detail)
+            open_payment = completion_message.addButton(
+                "Mở file Thanh toán",
+                QMessageBox.ButtonRole.ActionRole,
+            )
+            completion_message.addButton(QMessageBox.StandardButton.Ok)
+            completion_message.exec()
+            if completion_message.clickedButton() is open_payment:
+                self._open_workbook_path(
+                    _attribute(result, "target_path", default=None),
+                    label="file Thanh toán",
+                )
+            return
         if operation == "sync":
             detail = (
                 f"{message}\n\n"
@@ -898,6 +1069,8 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(0, self.start_daily_sync)
             elif retry_operation == "posting":
                 QTimer.singleShot(0, self.start_expense_posting)
+            elif retry_operation == "payment_sync":
+                QTimer.singleShot(0, self.start_payment_sync)
         elif (
             title == "Không có JSON đã xác nhận"
             and review_button is not None
@@ -914,6 +1087,7 @@ class MainWindow(QMainWindow):
         for operation, ui_operation in (
             ("DAILY_SYNC", "sync"),
             ("EXPENSE_POSTING", "posting"),
+            ("PAYMENT_SYNC", "payment_sync"),
         ):
             try:
                 record = repository.get_latest(
@@ -939,11 +1113,17 @@ class MainWindow(QMainWindow):
                     f"{_attribute(record, 'changed_items', default=0)} dòng vào "
                     f"{_attribute(record, 'sheet_name', default='—')}"
                 )
-            else:
+            elif ui_operation == "posting":
                 summary = (
                     f"{timestamp_text} – nhập "
                     f"{_attribute(record, 'changed_items', default=0)} khoản, bỏ qua "
                     f"{_attribute(record, 'skipped_items', default=0)}"
+                )
+            else:
+                summary = (
+                    f"{timestamp_text} – thay đổi "
+                    f"{_attribute(record, 'changed_items', default=0)} dòng, "
+                    f"bỏ qua {_attribute(record, 'skipped_items', default=0)}"
                 )
             self.workflow_page.set_excel_result(ui_operation, summary)
 
@@ -974,7 +1154,10 @@ class MainWindow(QMainWindow):
 
         daily = str(settings_data.get("daily_workbook_path") or "").strip()
         bk = str(settings_data.get("bk_workbook_path") or "").strip()
-        if not daily or not bk:
+        payment = str(
+            settings_data.get("payment_workbook_path") or ""
+        ).strip()
+        if not daily or not bk or not payment:
             self.settings_page.show_check_result(
                 False,
                 "Cấu hình Trợ lý hợp lệ, nhưng chưa chọn đủ file Hàng ngày và file BK.",
@@ -1069,6 +1252,29 @@ class MainWindow(QMainWindow):
             return
         if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(workbook))):
             QMessageBox.warning(self, "Không mở được file BK", str(workbook))
+
+    def _open_workbook_path(self, path: Any, *, label: str) -> None:
+        if not path:
+            QMessageBox.information(
+                self,
+                f"Chưa cấu hình {label}",
+                f"Hãy chọn {label} trong trang Cài đặt.",
+            )
+            return
+        workbook = Path(path).expanduser()
+        if not workbook.is_file():
+            QMessageBox.warning(
+                self,
+                f"Không tìm thấy {label}",
+                str(workbook),
+            )
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(workbook))):
+            QMessageBox.warning(
+                self,
+                f"Không mở được {label}",
+                str(workbook),
+            )
 
     @Slot(object)
     def open_containing_folder(self, path: Any) -> None:

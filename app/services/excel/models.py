@@ -16,6 +16,7 @@ from typing import Any, Mapping, Sequence
 class ExcelOperation(str, Enum):
     DAILY_SYNC = "DAILY_SYNC"
     EXPENSE_POSTING = "EXPENSE_POSTING"
+    PAYMENT_SYNC = "PAYMENT_SYNC"
 
 
 class ExcelRunStatus(str, Enum):
@@ -55,6 +56,8 @@ class ConflictType(str, Enum):
     BATCH_ALREADY_POSTED = "BATCH_ALREADY_POSTED"
     FILE_CHANGED = "FILE_CHANGED"
     FILE_LOCKED = "FILE_LOCKED"
+    PARTIAL_KEY_MATCH = "PARTIAL_KEY_MATCH"
+    PAYMENT_SOURCE_INVALID = "PAYMENT_SOURCE_INVALID"
 
 
 class ResolutionAction(str, Enum):
@@ -499,8 +502,158 @@ class PostingResult:
         return ExcelOperation.EXPENSE_POSTING
 
 
-Plan = SyncPlan | PostingPlan
-Result = SyncResult | PostingResult
+@dataclass(slots=True)
+class PaymentSyncItem:
+    item_id: str
+    source_row: int
+    source_rows: tuple[int, ...]
+    sqt: int
+    container: str
+    values: dict[str, Any]
+    target_row: int | None = None
+    status: str = "NEW"
+    differences: dict[str, tuple[Any, Any]] = field(default_factory=dict)
+
+    @property
+    def is_new(self) -> bool:
+        return self.status == "NEW"
+
+    @property
+    def is_update(self) -> bool:
+        return self.status == "UPDATE"
+
+    @property
+    def is_unchanged(self) -> bool:
+        return self.status == "UNCHANGED"
+
+
+@dataclass(slots=True)
+class PaymentSyncConflict:
+    conflict_id: str
+    conflict_type: ConflictType
+    message: str
+    item_id: str
+    source_row: int
+    sqt: int
+    container: str
+    allowed_actions: tuple[ResolutionAction, ...] = (
+        ResolutionAction.SKIP,
+        ResolutionAction.SELECT_ROW,
+        ResolutionAction.CANCEL_ALL,
+    )
+    default_action: ResolutionAction = ResolutionAction.SKIP
+    row_candidates: list[RowCandidate] = field(default_factory=list)
+    details: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def id(self) -> str:
+        return self.conflict_id
+
+    @property
+    def type(self) -> ConflictType:
+        return self.conflict_type
+
+
+@dataclass(slots=True)
+class PaymentSyncPlan:
+    source_path: Path
+    target_path: Path
+    source_fingerprint: WorkbookFingerprint
+    target_fingerprint: WorkbookFingerprint
+    source_sheet: str
+    target_sheet: str
+    items: list[PaymentSyncItem]
+    conflicts: list[PaymentSyncConflict] = field(default_factory=list)
+    normalization_required: bool = False
+    normalization_sheet_count: int = 0
+    target_sheet_created: bool = False
+    template_sheet: str | None = None
+    run_id: int | None = None
+
+    @property
+    def operation(self) -> ExcelOperation:
+        return ExcelOperation.PAYMENT_SYNC
+
+    @property
+    def selected_sheet(self) -> str:
+        return self.target_sheet
+
+    @property
+    def new_rows(self) -> list[PaymentSyncItem]:
+        return [item for item in self.items if item.is_new]
+
+    @property
+    def update_rows(self) -> list[PaymentSyncItem]:
+        return [item for item in self.items if item.is_update]
+
+    @property
+    def unchanged_rows(self) -> list[PaymentSyncItem]:
+        return [item for item in self.items if item.is_unchanged]
+
+    @property
+    def new_count(self) -> int:
+        return len(self.new_rows)
+
+    @property
+    def update_count(self) -> int:
+        return len(self.update_rows)
+
+    @property
+    def unchanged_count(self) -> int:
+        return len(self.unchanged_rows)
+
+    @property
+    def conflict_count(self) -> int:
+        return len(self.conflicts)
+
+    @property
+    def has_changes(self) -> bool:
+        return (
+            self.target_sheet_created
+            or self.normalization_required
+            or bool(self.new_rows)
+            or bool(self.update_rows)
+        )
+
+    @property
+    def requires_user_input(self) -> bool:
+        return bool(
+            self.target_sheet_created
+            or self.conflicts
+            or self.new_rows
+            or self.update_rows
+        )
+
+
+@dataclass(slots=True)
+class PaymentSyncResult:
+    status: ExcelRunStatus
+    source_path: Path
+    target_path: Path
+    sheet_name: str
+    source_sheet_name: str
+    sheet_created: bool = False
+    template_sheet_name: str | None = None
+    inserted_rows: int = 0
+    updated_rows: int = 0
+    unchanged_rows: int = 0
+    skipped_rows: int = 0
+    conflict_count: int = 0
+    backup_path: Path | None = None
+    source_backup_path: Path | None = None
+    fingerprint_before: WorkbookFingerprint | None = None
+    fingerprint_after: WorkbookFingerprint | None = None
+    source_fingerprint_after: WorkbookFingerprint | None = None
+    run_id: int | None = None
+    message: str = ""
+
+    @property
+    def operation(self) -> ExcelOperation:
+        return ExcelOperation.PAYMENT_SYNC
+
+
+Plan = SyncPlan | PostingPlan | PaymentSyncPlan
+Result = SyncResult | PostingResult | PaymentSyncResult
 Resolution = SyncResolution | PostingResolution
 
 

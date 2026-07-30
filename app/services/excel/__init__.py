@@ -30,6 +30,10 @@ from .models import (
     PostingPlan,
     PostingResolution,
     PostingResult,
+    PaymentSyncConflict,
+    PaymentSyncItem,
+    PaymentSyncPlan,
+    PaymentSyncResult,
     ResolutionAction,
     RowCandidate,
     SourceSheetCandidate,
@@ -51,6 +55,14 @@ from .posting import (
     ExpensePostingError,
     ExpensePostingService,
     classify_target_cell,
+)
+from .payment_sync import (
+    DATE_HEADER,
+    SUMMARY_HEADERS,
+    PaymentSyncError,
+    PaymentSyncService,
+    normalize_bk_workbook,
+    refresh_bk_summary_formulas,
 )
 from .resolvers import (
     MonthSheetService,
@@ -99,6 +111,12 @@ __all__ = [
     "PostingPlan",
     "PostingResolution",
     "PostingResult",
+    "PaymentSyncConflict",
+    "PaymentSyncError",
+    "PaymentSyncItem",
+    "PaymentSyncPlan",
+    "PaymentSyncResult",
+    "PaymentSyncService",
     "ResolutionAction",
     "RowCandidate",
     "SourceSheetCandidate",
@@ -124,4 +142,8 @@ __all__ = [
     "parse_sqt",
     "validate_configuration",
     "workbook_fingerprint",
+    "DATE_HEADER",
+    "SUMMARY_HEADERS",
+    "normalize_bk_workbook",
+    "refresh_bk_summary_formulas",
 ]

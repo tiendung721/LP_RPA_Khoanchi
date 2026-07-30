@@ -26,7 +26,7 @@ from app.ui.settings_page import SettingsPage
 from app.ui.workflow_page import WorkflowPage
 
 
-def test_step_three_has_exactly_two_primary_actions_and_two_statuses(qtbot) -> None:
+def test_step_three_has_three_primary_actions_and_statuses(qtbot) -> None:
     page = WorkflowPage()
     qtbot.addWidget(page)
 
@@ -36,14 +36,20 @@ def test_step_three_has_exactly_two_primary_actions_and_two_statuses(qtbot) -> N
     assert primary_buttons == [
         page.sync_daily_button,
         page.post_expenses_button,
+        page.sync_payment_button,
     ]
     assert page.sync_daily_button.text() == "Đồng bộ dữ liệu Hàng ngày"
     assert page.post_expenses_button.text() == "Nhập khoản chi vào BK"
+    assert page.sync_payment_button.text() == "Đồng bộ BK → Thanh toán"
     assert page.sync_status_label.text() == "Đồng bộ gần nhất: —"
     assert page.posting_status_label.text() == "Nhập khoản chi gần nhất: —"
+    assert (
+        page.payment_sync_status_label.text()
+        == "Đồng bộ BK → Thanh toán gần nhất: —"
+    )
 
 
-def test_step_three_locks_both_actions_while_running(qtbot) -> None:
+def test_step_three_locks_all_excel_actions_while_running(qtbot) -> None:
     page = WorkflowPage()
     qtbot.addWidget(page)
 
@@ -51,6 +57,7 @@ def test_step_three_locks_both_actions_while_running(qtbot) -> None:
 
     assert not page.sync_daily_button.isEnabled()
     assert not page.post_expenses_button.isEnabled()
+    assert not page.sync_payment_button.isEnabled()
     assert page.sync_daily_button.text() == "Đang đồng bộ…"
     assert "Đang đọc file Hàng ngày" in page.sync_status_label.text()
 
@@ -58,6 +65,7 @@ def test_step_three_locks_both_actions_while_running(qtbot) -> None:
 
     assert page.sync_daily_button.isEnabled()
     assert page.post_expenses_button.isEnabled()
+    assert page.sync_payment_button.isEnabled()
     assert page.sync_daily_button.text() == "Đồng bộ dữ liệu Hàng ngày"
 
 
@@ -185,6 +193,63 @@ def test_sync_analysis_always_shows_full_sheet_confirmation(
     assert "Thêm mới: 2 dòng" in captured["text"]
     assert "Chỉ có ở BK, được giữ lại: 1 dòng" in captured["text"]
     assert "Thiếu SQT, được bỏ qua: 3 dòng" in captured["text"]
+
+
+def test_payment_sync_confirmation_discloses_new_sheet_template(
+    monkeypatch,
+) -> None:
+    plan = SimpleNamespace(
+        conflicts=[],
+        new_rows=[],
+        source_sheet="T06 26",
+        target_sheet="T06 26",
+        target_sheet_created=True,
+        template_sheet="T05 26",
+        update_count=0,
+        unchanged_count=0,
+        new_count=0,
+        conflict_count=0,
+        normalization_sheet_count=0,
+    )
+
+    class Tasks:
+        def __init__(self) -> None:
+            self.apply_calls: list[Any] = []
+
+        def apply_plan(
+            self,
+            value: Any,
+            resolutions: Any,
+            *,
+            operation: str,
+        ) -> None:
+            self.apply_calls.append((value, resolutions, operation))
+
+        @staticmethod
+        def cancel_waiting() -> None:
+            raise AssertionError("Không được hủy khi người dùng xác nhận.")
+
+    captured: dict[str, str] = {}
+
+    def question(
+        _parent: Any,
+        title: str,
+        text: str,
+        *_args: Any,
+    ) -> QMessageBox.StandardButton:
+        captured["title"] = title
+        captured["text"] = text
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", question)
+    tasks = Tasks()
+    owner = SimpleNamespace(_excel_tasks=tasks)
+
+    MainWindow._handle_payment_sync_plan(owner, plan)
+
+    assert len(tasks.apply_calls) == 1
+    assert captured["title"] == "Xác nhận đồng bộ BK → Thanh toán"
+    assert "Sheet Thanh toán mới: Có, tạo từ T05 26" in captured["text"]
 
 
 def test_sync_completion_can_open_the_written_bk_file(

@@ -407,6 +407,8 @@ DEFAULT_ACTIONS: dict[str, tuple[str, ...]] = {
     "UNKNOWN_FEE_CODE": ("SELECT_FEE", "SKIP"),
     "FEE_COLUMN_MISSING": ("SKIP", "CANCEL_ALL"),
     "BL_ONLY_NO_CONTAINER": ("SKIP", "SELECT_ROW"),
+    "PARTIAL_KEY_MATCH": ("SKIP", "SELECT_ROW", "CANCEL_ALL"),
+    "PAYMENT_SOURCE_INVALID": ("SKIP", "CANCEL_ALL"),
     "BATCH_ALREADY_POSTED": ("POST_UNPOSTED_ONLY", "CANCEL"),
     "FILE_CHANGED": ("REANALYZE", "CANCEL"),
     "FILE_LOCKED": ("RETRY", "CANCEL"),
@@ -428,6 +430,8 @@ DEFAULT_RESOLUTION: dict[str, str] = {
     "UNKNOWN_FEE_CODE": "SKIP",
     "FEE_COLUMN_MISSING": "SKIP",
     "BL_ONLY_NO_CONTAINER": "SKIP",
+    "PARTIAL_KEY_MATCH": "SKIP",
+    "PAYMENT_SOURCE_INVALID": "SKIP",
     "BATCH_ALREADY_POSTED": "POST_UNPOSTED_ONLY",
     "FILE_CHANGED": "REANALYZE",
     "FILE_LOCKED": "RETRY",
@@ -762,6 +766,7 @@ class ConflictResolutionDialog(QDialog):
             "CONTAINER_NOT_FOUND",
             "MULTIPLE_CONTAINER_MATCH",
             "BL_ONLY_NO_CONTAINER",
+            "PARTIAL_KEY_MATCH",
         }:
             button = QPushButton("Chọn dòng…")
             button.setObjectName(f"selectConflictRow_{row}")
@@ -932,6 +937,141 @@ class ConflictResolutionDialog(QDialog):
         self.accept()
 
 
+class PaymentNewRowsDialog(QDialog):
+    """Cho phép chọn các dòng BK mới sẽ được thêm vào file Thanh toán."""
+
+    COLUMNS = (
+        "Nhập",
+        "Dòng BK",
+        "SQT",
+        "Container",
+        "Các khoản sẽ ghi",
+        "Trạng thái",
+    )
+
+    def __init__(
+        self,
+        items: Sequence[Any],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.items = list(items)
+        self._checkbox_items: list[QTableWidgetItem] = []
+        self.setObjectName("paymentNewRowsDialog")
+        self.setWindowTitle("Quản lý dòng mới BK → Thanh toán")
+        self.resize(980, 560)
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        note = QLabel(
+            f"Có {len(self.items)} dòng chưa tồn tại trong file Thanh toán. "
+            "Mặc định chọn tất cả; dòng bỏ chọn sẽ xuất hiện lại ở lần đồng bộ sau."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        selection = QHBoxLayout()
+        select_all = QPushButton("Chọn tất cả")
+        select_none = QPushButton("Bỏ chọn tất cả")
+        select_all.clicked.connect(
+            lambda: self._set_all(Qt.CheckState.Checked)
+        )
+        select_none.clicked.connect(
+            lambda: self._set_all(Qt.CheckState.Unchecked)
+        )
+        selection.addWidget(select_all)
+        selection.addWidget(select_none)
+        selection.addStretch()
+        layout.addLayout(selection)
+
+        self.table = QTableWidget(0, len(self.COLUMNS))
+        self.table.setObjectName("paymentNewRowsTable")
+        self.table.setHorizontalHeaderLabels(list(self.COLUMNS))
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            4, QHeaderView.ResizeMode.Stretch
+        )
+        layout.addWidget(self.table, 1)
+
+        labels = {
+            "sea_freight": "Cước biển",
+            "north_freight": "Cước MB",
+            "empty_lift": "Nâng vỏ",
+            "loaded_drop": "Hạ hàng",
+            "loaded_lift": "Nâng hàng",
+            "empty_drop": "Hạ vỏ",
+            "south_freight": "VTN",
+            "storage": "Lưu cont",
+            "overweight": "Quá tải",
+            "vs_do": "VS + D/O",
+            "command_fee": "Làm lệnh",
+            "repair": "Sửa chữa",
+        }
+        for source in self.items:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            checkbox = QTableWidgetItem()
+            checkbox.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsUserCheckable
+                | Qt.ItemFlag.ItemIsSelectable
+            )
+            checkbox.setCheckState(Qt.CheckState.Checked)
+            checkbox.setData(
+                Qt.ItemDataRole.UserRole,
+                str(_value(source, "item_id", "id", default="")),
+            )
+            self._checkbox_items.append(checkbox)
+            self.table.setItem(row, 0, checkbox)
+            values = _value(source, "values", default={}) or {}
+            amounts = "; ".join(
+                f"{labels.get(key, key)}: {_format_amount(value)}"
+                for key, value in values.items()
+                if value not in (None, "", 0)
+            )
+            cells = (
+                _value(source, "source_row"),
+                _value(source, "sqt"),
+                _value(source, "container"),
+                amounts or "Không có khoản tiền",
+                "Hợp lệ",
+            )
+            for column, value in enumerate(cells, 1):
+                item = QTableWidgetItem(_display(value))
+                item.setToolTip(_display(value))
+                self.table.setItem(row, column, item)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Xác nhận")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Hủy")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _set_all(self, state: Qt.CheckState) -> None:
+        for item in self._checkbox_items:
+            item.setCheckState(state)
+
+    @property
+    def selected_item_ids(self) -> list[str]:
+        return [
+            str(item.data(Qt.ItemDataRole.UserRole))
+            for item in self._checkbox_items
+            if item.checkState() == Qt.CheckState.Checked
+        ]
+
+
 ExcelConflictDialog = ConflictResolutionDialog
 AggregateConflictDialog = ConflictResolutionDialog
 TargetMonthDialog = MonthSelectionDialog
@@ -943,6 +1083,7 @@ __all__ = [
     "ExcelConflictDialog",
     "ManualRowPickerDialog",
     "MonthSelectionDialog",
+    "PaymentNewRowsDialog",
     "RepostSelectionDialog",
     "TargetMonthDialog",
     "VALID_FEE_CODES",

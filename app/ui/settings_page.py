@@ -136,11 +136,30 @@ class SettingsPage(QWidget):
         bk_widget.setLayout(bk_row)
         form.addRow("File BK Tổng hợp:", bk_widget)
 
+        payment_row = QHBoxLayout()
+        self.payment_workbook_edit = QLineEdit()
+        self.payment_workbook_edit.setObjectName("paymentWorkbookEdit")
+        self.payment_workbook_edit.setPlaceholderText(
+            "Chọn file Thanh toán Nâng hạ/VS D/O (.xlsx hoặc .xlsm)"
+        )
+        self.payment_workbook_edit.setClearButtonEnabled(True)
+        self.browse_payment_workbook_button = QPushButton("Chọn…")
+        self.browse_payment_workbook_button.setObjectName(
+            "browsePaymentWorkbookButton"
+        )
+        payment_row.addWidget(self.payment_workbook_edit, 1)
+        payment_row.addWidget(self.browse_payment_workbook_button)
+        payment_widget = QWidget()
+        payment_widget.setLayout(payment_row)
+        form.addRow("File Thanh toán Nâng hạ/VS D/O:", payment_widget)
+
         # Các alias giúp phần tích hợp không phụ thuộc hậu tố ``_workbook``.
         self.daily_edit = self.daily_workbook_edit
         self.bk_edit = self.bk_workbook_edit
         self.browse_daily_button = self.browse_daily_workbook_button
         self.browse_bk_button = self.browse_bk_workbook_button
+        self.payment_edit = self.payment_workbook_edit
+        self.browse_payment_button = self.browse_payment_workbook_button
         card_layout.addLayout(form)
         layout.addWidget(card)
 
@@ -172,6 +191,9 @@ class SettingsPage(QWidget):
             self._browse_daily_workbook
         )
         self.browse_bk_workbook_button.clicked.connect(self._browse_bk_workbook)
+        self.browse_payment_workbook_button.clicked.connect(
+            self._browse_payment_workbook
+        )
         self.save_button.clicked.connect(self._request_save)
         self.check_button.clicked.connect(
             lambda: self.check_requested.emit(self.settings_data())
@@ -186,6 +208,7 @@ class SettingsPage(QWidget):
         self.container_gpt_bat_edit.textChanged.connect(self._validate_form)
         self.daily_workbook_edit.textChanged.connect(self._validate_form)
         self.bk_workbook_edit.textChanged.connect(self._validate_form)
+        self.payment_workbook_edit.textChanged.connect(self._validate_form)
 
     def set_settings(self, settings: Any | None) -> None:
         self.bat_edit.setText(str(_setting(settings, "assistant_bat_path") or ""))
@@ -195,6 +218,9 @@ class SettingsPage(QWidget):
         )
         self.bk_workbook_edit.setText(
             str(_setting(settings, "bk_workbook_path") or "")
+        )
+        self.payment_workbook_edit.setText(
+            str(_setting(settings, "payment_workbook_path") or "")
         )
         self.container_gpt_bat_edit.setText(
             str(_setting(settings, "container_gpt_bat_path") or "")
@@ -207,6 +233,7 @@ class SettingsPage(QWidget):
             "output_dir": self.output_edit.text().strip(),
             "daily_workbook_path": self.daily_workbook_edit.text().strip(),
             "bk_workbook_path": self.bk_workbook_edit.text().strip(),
+            "payment_workbook_path": self.payment_workbook_edit.text().strip(),
             "container_gpt_bat_path": self.container_gpt_bat_edit.text().strip(),
         }
 
@@ -235,6 +262,10 @@ class SettingsPage(QWidget):
         for label, path_text in (
             ("File Hàng ngày", self.daily_workbook_edit.text().strip()),
             ("File BK Tổng hợp", self.bk_workbook_edit.text().strip()),
+            (
+                "File Thanh toán Nâng hạ/VS D/O",
+                self.payment_workbook_edit.text().strip(),
+            ),
         ):
             if path_text and Path(path_text).suffix.casefold() not in {".xlsx", ".xlsm"}:
                 problems.append(f"{label} phải có đuôi .xlsx hoặc .xlsm.")
@@ -308,6 +339,12 @@ class SettingsPage(QWidget):
         self._browse_workbook(
             self.bk_workbook_edit,
             "Chọn file BK Tổng hợp",
+        )
+
+    def _browse_payment_workbook(self) -> None:
+        self._browse_workbook(
+            self.payment_workbook_edit,
+            "Chọn file Thanh toán Nâng hạ/VS D/O",
         )
 
     def _browse_workbook(self, target: QLineEdit, title: str) -> None:

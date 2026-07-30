@@ -716,7 +716,10 @@ class ExpensePostingService:
     def _resolve_fee_columns(
         self, worksheet: Any, base: HeaderResolution
     ) -> dict[str, int]:
+        from .payment_sync import find_summary_start
+
         normalized = base.headers
+        summary_start = find_summary_start(worksheet)
         result: dict[str, int] = {}
         notes_candidates = [
             column
@@ -733,6 +736,7 @@ class ExpensePostingService:
                 column
                 for column, header in normalized.items()
                 if header in alias_keys
+                and (summary_start is None or column < summary_start)
             ]
             if len(matches) != 1:
                 continue

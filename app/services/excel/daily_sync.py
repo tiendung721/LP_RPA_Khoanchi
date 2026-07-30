@@ -552,6 +552,13 @@ class DailySyncService:
                         action.source.values,
                         expected_cells,
                     )
+                from .payment_sync import (
+                    find_summary_start,
+                    refresh_bk_summary_formulas,
+                )
+
+                if find_summary_start(worksheet) is not None:
+                    refresh_bk_summary_formulas(worksheet)
                 self.gateway.save(workbook, working_path)
             finally:
                 workbook.close()

@@ -47,6 +47,7 @@ class ExcelConfigurationService:
         *,
         daily_path: str | Path | None = None,
         bk_path: str | Path | None = None,
+        payment_path: str | Path | None = None,
         temp_dir: str | Path | None = None,
         gateway: WorkbookGateway | None = None,
         lock_service: ExcelLockService | None = None,
@@ -61,6 +62,9 @@ class ExcelConfigurationService:
         )
         self.bk_path = Path(
             bk_path or getattr(settings, "bk_workbook_path", "")
+        )
+        self.payment_path = Path(
+            payment_path or getattr(settings, "payment_workbook_path", "")
         )
         system_dir = getattr(paths, "system_dir", Path("Output") / "_system")
         self.temp_dir = Path(
@@ -182,6 +186,45 @@ class ExcelConfigurationService:
         finally:
             if target_book is not None:
                 target_book.close()
+
+        payment_book = None
+        try:
+            progress("Đang kiểm tra file Thanh toán Nâng hạ/VS D/O…")
+            if not str(self.payment_path):
+                raise FileNotFoundError(
+                    "Chưa cấu hình file Thanh toán Nâng hạ/VS D/O."
+                )
+            payment = ensure_supported_workbook(self.payment_path)
+            if not payment.is_file():
+                raise FileNotFoundError(
+                    f"Không tìm thấy file Thanh toán: {payment}"
+                )
+            with self.lock_service.acquire(payment):
+                pass
+            payment_book = self.gateway.load(payment, read_only=True)
+            payment_sheets = [
+                name
+                for name in payment_book.sheetnames
+                if self.months.parse_target_sheet(name) is not None
+            ]
+            if not payment_sheets:
+                raise ValueError(
+                    "File Thanh toán không có sheet dạng TMM YY."
+                )
+            result.checks.append(
+                ConfigurationCheck(
+                    "payment_workbook",
+                    True,
+                    "File Thanh toán đọc được, có sheet tháng và có quyền ghi.",
+                )
+            )
+        except Exception as exc:
+            result.checks.append(
+                ConfigurationCheck("payment_workbook", False, str(exc))
+            )
+        finally:
+            if payment_book is not None:
+                payment_book.close()
 
         return result
 

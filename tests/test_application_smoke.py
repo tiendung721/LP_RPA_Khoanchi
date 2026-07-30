@@ -41,6 +41,7 @@ def test_runtime_and_main_window_start_with_isolated_data_root(
         assert runtime.paths.excel_reports_dir.is_dir()
         assert runtime.daily_sync_service is not None
         assert runtime.expense_posting_service is not None
+        assert runtime.payment_sync_service is not None
         assert runtime.excel_task_controller is not None
         assert window.pages.count() == 4
         assert window.workflow_page.open_assistant_button.text() == "Mở Trợ lý ảo"
@@ -53,6 +54,10 @@ def test_runtime_and_main_window_start_with_isolated_data_root(
         assert (
             window.workflow_page.post_expenses_button.text()
             == "Nhập khoản chi vào BK"
+        )
+        assert (
+            window.workflow_page.sync_payment_button.text()
+            == "Đồng bộ BK → Thanh toán"
         )
         settings_edits = window.settings_page.findChildren(QLineEdit)
         assert {
@@ -69,6 +74,7 @@ def test_runtime_and_main_window_start_with_isolated_data_root(
             "outputDirEdit",
             "dailyWorkbookEdit",
             "bkWorkbookEdit",
+            "paymentWorkbookEdit",
             "containerGptBatEdit",
         }
         visible_text = " ".join(

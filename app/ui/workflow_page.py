@@ -51,9 +51,11 @@ class WorkflowPage(QWidget):
     open_review_requested = Signal(object)
     sync_daily_requested = Signal()
     post_expenses_requested = Signal()
+    sync_payment_requested = Signal()
 
     SYNC_OPERATION = "sync"
     POSTING_OPERATION = "posting"
+    PAYMENT_SYNC_OPERATION = "payment_sync"
 
     def __init__(
         self,
@@ -71,6 +73,7 @@ class WorkflowPage(QWidget):
         )
         self.sync_daily_button.clicked.connect(self.sync_daily_requested)
         self.post_expenses_button.clicked.connect(self.post_expenses_requested)
+        self.sync_payment_button.clicked.connect(self.sync_payment_requested)
         self.set_configuration(settings)
         self.set_active_batch(active_batch)
 
@@ -188,6 +191,12 @@ class WorkflowPage(QWidget):
         self.posting_status_label.setObjectName("expensePostingStatusLabel")
         self.posting_status_label.setWordWrap(True)
         self.posting_status_label.setProperty("muted", True)
+        self.payment_sync_status_label = QLabel(
+            "Đồng bộ BK → Thanh toán gần nhất: —"
+        )
+        self.payment_sync_status_label.setObjectName("paymentSyncStatusLabel")
+        self.payment_sync_status_label.setWordWrap(True)
+        self.payment_sync_status_label.setProperty("muted", True)
         actions3 = QHBoxLayout()
         self.sync_daily_button = QPushButton("Đồng bộ dữ liệu Hàng ngày")
         self.sync_daily_button.setObjectName("syncDailyWorkbookButton")
@@ -195,12 +204,17 @@ class WorkflowPage(QWidget):
         self.post_expenses_button = QPushButton("Nhập khoản chi vào BK")
         self.post_expenses_button.setObjectName("postExpensesWorkbookButton")
         self.post_expenses_button.setProperty("primary", True)
+        self.sync_payment_button = QPushButton("Đồng bộ BK → Thanh toán")
+        self.sync_payment_button.setObjectName("syncPaymentWorkbookButton")
+        self.sync_payment_button.setProperty("primary", True)
         actions3.addWidget(self.sync_daily_button)
         actions3.addWidget(self.post_expenses_button)
+        actions3.addWidget(self.sync_payment_button)
         actions3.addStretch()
         step3.addLayout(actions3)
         step3.addWidget(self.sync_status_label)
         step3.addWidget(self.posting_status_label)
+        step3.addWidget(self.payment_sync_status_label)
         layout.addWidget(self.step3_card)
 
         # Aliases có chủ ý để lớp điều phối có thể dùng cách đặt tên theo nghiệp vụ
@@ -213,6 +227,7 @@ class WorkflowPage(QWidget):
         self._excel_button_texts = {
             self.SYNC_OPERATION: self.sync_daily_button.text(),
             self.POSTING_OPERATION: self.post_expenses_button.text(),
+            self.PAYMENT_SYNC_OPERATION: self.sync_payment_button.text(),
         }
         layout.addStretch(1)
 
@@ -300,6 +315,13 @@ class WorkflowPage(QWidget):
             "expenses",
         }:
             return WorkflowPage.POSTING_OPERATION
+        if value in {
+            "payment_sync",
+            "sync_payment",
+            "bk_to_payment",
+            "payment",
+        }:
+            return WorkflowPage.PAYMENT_SYNC_OPERATION
         raise ValueError(f"Nghiệp vụ Excel không hợp lệ: {operation!r}")
 
     def set_excel_running(self, operation: Any, message: str = "") -> None:
@@ -309,23 +331,34 @@ class WorkflowPage(QWidget):
         self._excel_running_operation = normalized
         self.sync_daily_button.setEnabled(False)
         self.post_expenses_button.setEnabled(False)
+        self.sync_payment_button.setEnabled(False)
         if normalized == self.SYNC_OPERATION:
             self.sync_daily_button.setText("Đang đồng bộ…")
             self.sync_status_label.setText(
                 f"Đồng bộ: {message or 'Đang phân tích dữ liệu…'}"
             )
-        else:
+        elif normalized == self.POSTING_OPERATION:
             self.post_expenses_button.setText("Đang nhập…")
             self.posting_status_label.setText(
                 f"Nhập khoản chi: {message or 'Đang phân tích dữ liệu…'}"
+            )
+        else:
+            self.sync_payment_button.setText("Đang đồng bộ…")
+            self.payment_sync_status_label.setText(
+                "Đồng bộ BK → Thanh toán: "
+                f"{message or 'Đang phân tích dữ liệu…'}"
             )
 
     def set_excel_progress(self, operation: Any, message: str) -> None:
         normalized = self._excel_operation(operation)
         if normalized == self.SYNC_OPERATION:
             self.sync_status_label.setText(f"Đồng bộ: {message}")
-        else:
+        elif normalized == self.POSTING_OPERATION:
             self.posting_status_label.setText(f"Nhập khoản chi: {message}")
+        else:
+            self.payment_sync_status_label.setText(
+                f"Đồng bộ BK → Thanh toán: {message}"
+            )
 
     def set_excel_result(self, operation: Any, result: Any = None) -> None:
         """Cập nhật kết quả gần nhất từ dataclass, mapping hoặc chuỗi."""
@@ -339,9 +372,13 @@ class WorkflowPage(QWidget):
             )
         if normalized == self.SYNC_OPERATION:
             self.sync_status_label.setText(f"Đồng bộ gần nhất: {message}")
-        else:
+        elif normalized == self.POSTING_OPERATION:
             self.posting_status_label.setText(
                 f"Nhập khoản chi gần nhất: {message}"
+            )
+        else:
+            self.payment_sync_status_label.setText(
+                f"Đồng bộ BK → Thanh toán gần nhất: {message}"
             )
 
     def set_excel_idle(self, operation: Any | None = None) -> None:
@@ -356,14 +393,19 @@ class WorkflowPage(QWidget):
         self.post_expenses_button.setText(
             self._excel_button_texts[self.POSTING_OPERATION]
         )
+        self.sync_payment_button.setText(
+            self._excel_button_texts[self.PAYMENT_SYNC_OPERATION]
+        )
         self.sync_daily_button.setEnabled(True)
         self.post_expenses_button.setEnabled(True)
+        self.sync_payment_button.setEnabled(True)
 
     def set_excel_actions_enabled(self, enabled: bool) -> None:
         if self._excel_running_operation is not None and enabled:
             return
         self.sync_daily_button.setEnabled(enabled)
         self.post_expenses_button.setEnabled(enabled)
+        self.sync_payment_button.setEnabled(enabled)
 
     @property
     def excel_running_operation(self) -> str | None:

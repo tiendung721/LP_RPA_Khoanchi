@@ -155,12 +155,14 @@ def test_legacy_settings_are_rewritten_without_browser_or_inbox_keys(
     assert loaded.output_dir == paths.output_dir
     assert loaded.daily_workbook_path == ""
     assert loaded.bk_workbook_path == ""
+    assert loaded.payment_workbook_path == ""
     assert set(rewritten) == {
         "data_root",
         "assistant_bat_path",
         "output_dir",
         "daily_workbook_path",
         "bk_workbook_path",
+        "payment_workbook_path",
         "container_gpt_bat_path",
     }
 

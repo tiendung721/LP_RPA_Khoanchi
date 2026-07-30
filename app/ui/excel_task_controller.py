@@ -69,16 +69,19 @@ class ExcelTaskController(QObject):
 
     SYNC_OPERATION = "sync"
     POSTING_OPERATION = "posting"
+    PAYMENT_SYNC_OPERATION = "payment_sync"
 
     def __init__(
         self,
         daily_sync_service: Any | None = None,
         expense_posting_service: Any | None = None,
+        payment_sync_service: Any | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self.daily_sync_service = daily_sync_service
         self.expense_posting_service = expense_posting_service
+        self.payment_sync_service = payment_sync_service
         self._executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="excel-worker",
@@ -103,6 +106,13 @@ class ExcelTaskController(QObject):
             "expenses",
         }:
             return cls.POSTING_OPERATION
+        if value in {
+            "payment_sync",
+            "sync_payment",
+            "bk_to_payment",
+            "payment",
+        }:
+            return cls.PAYMENT_SYNC_OPERATION
         raise ValueError(f"Nghiệp vụ Excel không hợp lệ: {operation!r}")
 
     @property
@@ -124,6 +134,7 @@ class ExcelTaskController(QObject):
         *,
         daily_sync_service: Any | None = None,
         expense_posting_service: Any | None = None,
+        payment_sync_service: Any | None = None,
     ) -> None:
         """Thay service sau khi settings/runtime được cập nhật."""
 
@@ -133,6 +144,8 @@ class ExcelTaskController(QObject):
             self.daily_sync_service = daily_sync_service
         if expense_posting_service is not None:
             self.expense_posting_service = expense_posting_service
+        if payment_sync_service is not None:
+            self.payment_sync_service = payment_sync_service
 
     def submit(
         self,
@@ -189,11 +202,23 @@ class ExcelTaskController(QObject):
     analyze_posting = start_posting
     submit_posting = start_posting
 
+    def start_payment_sync(self, **analyze_kwargs: Any) -> Future[Any]:
+        return self._start_analysis(
+            self.PAYMENT_SYNC_OPERATION,
+            self.payment_sync_service,
+            analyze_kwargs,
+        )
+
+    analyze_payment_sync = start_payment_sync
+    submit_payment_sync = start_payment_sync
+
     def start(self, operation: Any, **analyze_kwargs: Any) -> Future[Any]:
         normalized = self.normalize_operation(operation)
         if normalized == self.SYNC_OPERATION:
             return self.start_sync(**analyze_kwargs)
-        return self.start_posting(**analyze_kwargs)
+        if normalized == self.POSTING_OPERATION:
+            return self.start_posting(**analyze_kwargs)
+        return self.start_payment_sync(**analyze_kwargs)
 
     def _start_analysis(
         self,
@@ -474,11 +499,11 @@ class ExcelTaskController(QObject):
         return report
 
     def _service_for(self, operation: str) -> Any:
-        return (
-            self.daily_sync_service
-            if operation == self.SYNC_OPERATION
-            else self.expense_posting_service
-        )
+        if operation == self.SYNC_OPERATION:
+            return self.daily_sync_service
+        if operation == self.POSTING_OPERATION:
+            return self.expense_posting_service
+        return self.payment_sync_service
 
     def _operation_for_plan(self, plan: Any) -> str:
         explicit = _value(plan, "operation", "operation_type")
@@ -487,6 +512,8 @@ class ExcelTaskController(QObject):
         name = type(plan).__name__.casefold()
         if "post" in name or "expense" in name:
             return self.POSTING_OPERATION
+        if "payment" in name:
+            return self.PAYMENT_SYNC_OPERATION
         if "sync" in name:
             return self.SYNC_OPERATION
         active = self.active_operation
