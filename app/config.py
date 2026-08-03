@@ -49,6 +49,7 @@ class AppPaths:
     excel_temp_dir: Path
     excel_backup_dir: Path
     excel_reports_dir: Path
+    rpa_dir: Path
     database_dir: Path
     database_path: Path
     logs_dir: Path
@@ -81,6 +82,7 @@ class AppPaths:
             excel_temp_dir=excel_dir / "Temp",
             excel_backup_dir=excel_dir / "Backup",
             excel_reports_dir=excel_dir / "Reports",
+            rpa_dir=system_dir / "RPA",
             database_dir=database_dir,
             database_path=database_dir / "app_state.db",
             logs_dir=logs_dir,
@@ -106,6 +108,7 @@ class AppPaths:
             self.excel_temp_dir,
             self.excel_backup_dir,
             self.excel_reports_dir,
+            self.rpa_dir,
             self.database_dir,
             self.logs_dir,
         )
@@ -139,6 +142,7 @@ class AppSettings:
     bk_workbook_path: str = ""
     payment_workbook_path: str = ""
     container_gpt_bat_path: str = ""
+    rpa_expense_bat_path: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.data_root, (str, os.PathLike)) or not str(
@@ -158,6 +162,7 @@ class AppSettings:
                 "Đường dẫn file Thanh toán Nâng hạ/VS D/O",
             ),
             ("container_gpt_bat_path", "Đường dẫn BAT Load số container"),
+            ("rpa_expense_bat_path", "Đường dẫn BAT RPA nhập quyết toán"),
         )
         for attribute, label in optional_paths:
             value = getattr(self, attribute)
@@ -186,6 +191,7 @@ class AppSettings:
             "bk_workbook_path": self.bk_workbook_path,
             "payment_workbook_path": self.payment_workbook_path,
             "container_gpt_bat_path": self.container_gpt_bat_path,
+            "rpa_expense_bat_path": self.rpa_expense_bat_path,
         }
 
     @classmethod
@@ -204,6 +210,7 @@ class AppSettings:
             bk_workbook_path=value.get("bk_workbook_path", ""),
             payment_workbook_path=value.get("payment_workbook_path", ""),
             container_gpt_bat_path=value.get("container_gpt_bat_path", ""),
+            rpa_expense_bat_path=value.get("rpa_expense_bat_path", ""),
         )
 
 

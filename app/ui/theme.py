@@ -5,14 +5,17 @@ from __future__ import annotations
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication
 
+from .feedback import ButtonPressFeedback
+
 PRIMARY = "#2563EB"
 PRIMARY_DARK = "#1D4ED8"
+PRIMARY_PRESSED = "#1E40AF"
 PRIMARY_LIGHT = "#EFF6FF"
-TEXT = "#172033"
-MUTED_TEXT = "#64748B"
-BORDER = "#D8E0EA"
+TEXT = "#162033"
+MUTED_TEXT = "#667085"
+BORDER = "#D9E2EC"
 SURFACE = "#FFFFFF"
-SURFACE_ALT = "#F7F9FC"
+SURFACE_ALT = "#F4F7FB"
 SUCCESS = "#15803D"
 SUCCESS_BG = "#ECFDF3"
 WARNING = "#A16207"
@@ -31,12 +34,27 @@ QMainWindow, QDialog, QWidget#applicationRoot {{
     background: {SURFACE_ALT};
 }}
 QLabel#pageTitle {{
-    font-size: 20pt;
+    font-size: 22pt;
     font-weight: 700;
-    color: #111827;
+    color: #101828;
 }}
 QLabel#pageSubtitle, QLabel[muted="true"] {{
     color: {MUTED_TEXT};
+}}
+QLabel[sectionTitle="true"] {{
+    color: #172B4D;
+    font-size: 13pt;
+    font-weight: 700;
+}}
+QLabel[cardCategory="true"] {{
+    color: {PRIMARY};
+    font-size: 8.5pt;
+    font-weight: 700;
+}}
+QLabel[actionTitle="true"] {{
+    color: #243B5A;
+    font-size: 10.5pt;
+    font-weight: 700;
 }}
 QLabel[status="error"] {{
     color: {ERROR};
@@ -50,15 +68,24 @@ QLabel[status="success"] {{
 QFrame[card="true"], QGroupBox {{
     background: {SURFACE};
     border: 1px solid {BORDER};
-    border-radius: 9px;
+    border-radius: 12px;
 }}
 QFrame[card="true"] {{
     padding: 1px;
 }}
+QFrame[actionRow="true"] {{
+    background: #F8FAFD;
+    border: 1px solid #E1E8F0;
+    border-radius: 9px;
+}}
+QFrame[actionRow="true"]:hover {{
+    background: #F4F8FE;
+    border-color: #BED1EC;
+}}
 QFrame[upcoming="true"] {{
     background: #F1F5F9;
     border: 1px dashed #B9C4D2;
-    border-radius: 9px;
+    border-radius: 12px;
 }}
 QGroupBox {{
     margin-top: 14px;
@@ -72,43 +99,71 @@ QGroupBox::title {{
     color: #334155;
 }}
 QPushButton, QToolButton {{
-    min-height: 30px;
-    padding: 2px 13px;
-    border: 1px solid #C6D0DD;
-    border-radius: 6px;
+    min-height: 34px;
+    padding: 1px 15px;
+    border: 1px solid #C8D2DF;
+    border-radius: 8px;
     background: {SURFACE};
+    font-weight: 600;
 }}
 QPushButton:hover, QToolButton:hover {{
-    border-color: #8FA0B5;
-    background: #F8FAFC;
+    color: #1D4ED8;
+    border-color: #93B4E8;
+    background: #F5F9FF;
 }}
 QPushButton:pressed, QToolButton:pressed {{
-    background: #EEF2F7;
+    background: #E8EFF8;
+    border-color: #7E9FCB;
+    padding-top: 3px;
+    padding-bottom: 0px;
 }}
 QPushButton:disabled, QToolButton:disabled {{
     color: #98A2B3;
     background: #F2F4F7;
-    border-color: #E4E7EC;
+    border-color: #E1E6ED;
+}}
+QPushButton[loading="true"], QToolButton[loading="true"],
+QPushButton[loading="true"]:disabled, QToolButton[loading="true"]:disabled {{
+    color: #1D4ED8;
+    background: {PRIMARY_LIGHT};
+    border-color: #93B4E8;
 }}
 QPushButton[primary="true"] {{
     color: white;
     background: {PRIMARY};
     border-color: {PRIMARY};
-    font-weight: 600;
+    font-weight: 700;
 }}
 QPushButton[primary="true"]:hover {{
+    color: white;
     background: {PRIMARY_DARK};
     border-color: {PRIMARY_DARK};
+}}
+QPushButton[primary="true"]:pressed {{
+    color: white;
+    background: {PRIMARY_PRESSED};
+    border-color: {PRIMARY_PRESSED};
+}}
+QPushButton[primary="true"][loading="true"],
+QPushButton[primary="true"][loading="true"]:disabled {{
+    color: white;
+    background: #3B82F6;
+    border-color: #3B82F6;
 }}
 QPushButton[danger="true"] {{
     color: {ERROR};
     border-color: #F3B3AE;
 }}
+QPushButton[danger="true"]:hover {{
+    color: #912018;
+    background: #FFF6F5;
+    border-color: #E99892;
+}}
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QPlainTextEdit {{
-    min-height: 30px;
-    padding: 1px 7px;
-    border: 1px solid #C6D0DD;
-    border-radius: 6px;
+    min-height: 34px;
+    padding: 1px 9px;
+    border: 1px solid #C8D2DF;
+    border-radius: 8px;
     background: {SURFACE};
     selection-background-color: #BFDBFE;
 }}
@@ -131,7 +186,7 @@ QTableView {{
     background: {SURFACE};
     alternate-background-color: #F8FAFC;
     border: 1px solid {BORDER};
-    border-radius: 7px;
+    border-radius: 9px;
     gridline-color: #E8EDF3;
     selection-background-color: #DBEAFE;
     selection-color: {TEXT};
@@ -150,16 +205,16 @@ QHeaderView::section {{
 }}
 QListWidget#navigation {{
     border: 0;
-    background: #12233F;
+    background: transparent;
     color: #DCE6F5;
     outline: 0;
     padding: 10px 7px;
 }}
 QListWidget#navigation::item {{
-    min-height: 38px;
-    border-radius: 7px;
-    padding: 3px 10px;
-    margin: 2px 0;
+    min-height: 40px;
+    border-radius: 9px;
+    padding: 3px 11px;
+    margin: 3px 0;
 }}
 QListWidget#navigation::item:hover {{
     background: #203A60;
@@ -172,6 +227,29 @@ QListWidget#navigation::item:selected {{
 QStatusBar {{
     background: {SURFACE};
     border-top: 1px solid {BORDER};
+    color: {MUTED_TEXT};
+}}
+QMenu {{
+    background: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 8px;
+    padding: 6px;
+}}
+QMenu::item {{
+    min-height: 28px;
+    border-radius: 6px;
+    padding: 2px 18px 2px 10px;
+}}
+QMenu::item:selected {{
+    color: #1D4ED8;
+    background: {PRIMARY_LIGHT};
+}}
+QToolTip {{
+    color: white;
+    background: #26364D;
+    border: 0;
+    border-radius: 5px;
+    padding: 5px 8px;
 }}
 QScrollBar:vertical {{
     width: 11px;
@@ -205,8 +283,15 @@ def apply_application_theme(application: QApplication) -> None:
     palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor("#98A2B3"))
     application.setPalette(palette)
     application.setStyleSheet(APP_STYLESHEET)
+    # Giữ tham chiếu trên QApplication để event filter tồn tại suốt vòng đời app.
+    previous_feedback = getattr(application, "_button_press_feedback", None)
+    if previous_feedback is not None:
+        application.removeEventFilter(previous_feedback)
+        previous_feedback.deleteLater()
+    feedback = ButtonPressFeedback(application)
+    application.installEventFilter(feedback)
+    application._button_press_feedback = feedback  # type: ignore[attr-defined]
 
 
 # Tên ngắn thuận tiện cho mã khởi động và tương thích với các bản tích hợp cũ.
 apply_theme = apply_application_theme
-

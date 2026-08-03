@@ -6,16 +6,19 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
+
+from .feedback import LinearLoadingBar, set_button_loading
 
 
 def _get(source: Any, *names: str, default: Any = None) -> Any:
@@ -52,6 +55,7 @@ class WorkflowPage(QWidget):
     sync_daily_requested = Signal()
     post_expenses_requested = Signal()
     sync_payment_requested = Signal()
+    run_rpa_expense_requested = Signal()
 
     SYNC_OPERATION = "sync"
     POSTING_OPERATION = "posting"
@@ -74,73 +78,106 @@ class WorkflowPage(QWidget):
         self.sync_daily_button.clicked.connect(self.sync_daily_requested)
         self.post_expenses_button.clicked.connect(self.post_expenses_requested)
         self.sync_payment_button.clicked.connect(self.sync_payment_requested)
+        self.run_rpa_expense_button.clicked.connect(
+            self.run_rpa_expense_requested
+        )
         self.set_configuration(settings)
         self.set_active_batch(active_batch)
 
     def _build_ui(self) -> None:
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        outer.addWidget(scroll)
+        self.setObjectName("workflowPage")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 12, 18, 14)
+        layout.setSpacing(4)
 
-        body = QWidget()
-        layout = QVBoxLayout(body)
-        layout.setContentsMargins(24, 20, 24, 26)
-        layout.setSpacing(14)
-        scroll.setWidget(body)
-
-        title = QLabel("Quy trình")
+        title = QLabel("Tác vụ quyết toán")
         title.setObjectName("pageTitle")
         subtitle = QLabel(
-            "Mở Trợ lý ảo, tải file kết quả và kiểm tra dữ liệu bóc tách."
+            "Chọn đúng nhóm công việc cần thực hiện. Trạng thái gần nhất luôn được hiển thị ngay tại từng tác vụ."
         )
         subtitle.setProperty("muted", True)
+        subtitle.setWordWrap(True)
         layout.addWidget(title)
         layout.addWidget(subtitle)
 
+        workflow_grid = QGridLayout()
+        workflow_grid.setContentsMargins(0, 6, 0, 0)
+        workflow_grid.setHorizontalSpacing(10)
+        workflow_grid.setVerticalSpacing(10)
+        workflow_grid.setColumnStretch(0, 1)
+        workflow_grid.setRowStretch(0, 1)
+        workflow_grid.setRowStretch(1, 1)
+        workflow_grid.setRowStretch(2, 1)
+        workflow_grid.setRowStretch(3, 1)
+        layout.addLayout(workflow_grid, 1)
+
         self.step1_card = QFrame()
         self.step1_card.setProperty("card", True)
-        step1 = QVBoxLayout(self.step1_card)
-        step1.setContentsMargins(18, 15, 18, 16)
-        step1.setSpacing(10)
-        header1 = QHBoxLayout()
-        name1 = QLabel("Bước 1 – Mở Trợ lý ảo")
-        name1.setStyleSheet("font-size: 13pt; font-weight: 700;")
+        self.step1_card.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        step1 = QHBoxLayout(self.step1_card)
+        step1.setContentsMargins(14, 11, 14, 12)
+        step1.setSpacing(16)
+        step1_details = QVBoxLayout()
+        step1_details.setSpacing(4)
+        category1 = QLabel("BÓC TÁCH CHỨNG TỪ")
+        category1.setProperty("cardCategory", True)
+        step1_details.addWidget(category1)
         self.assistant_status = QLabel()
-        header1.addWidget(name1)
-        header1.addStretch()
-        header1.addWidget(self.assistant_status)
-        step1.addLayout(header1)
+        name1 = QLabel("Bóc tách chứng từ với Trợ lý ảo")
+        name1.setProperty("sectionTitle", True)
+        name1.setWordWrap(True)
+        step1_details.addWidget(name1)
         guide = QLabel(
-            "Gửi chứng từ cho Trợ lý ảo và tải file kết quả. "
-            "Phần mềm sẽ tự nhận file mới."
+            "Mở Trợ lý ảo, gửi chứng từ cần xử lý và tải file kết quả. "
+            "Ứng dụng sẽ tự nhận file mới trong thư mục Output."
         )
         guide.setWordWrap(True)
-        step1.addWidget(guide)
-        actions1 = QHBoxLayout()
+        guide.setProperty("muted", True)
+        step1_details.addWidget(guide)
+        step1.addLayout(step1_details, 1)
+
+        step1_controls = QVBoxLayout()
+        step1_controls.setSpacing(5)
+        step1_controls.addWidget(
+            self.assistant_status,
+            0,
+            Qt.AlignmentFlag.AlignRight,
+        )
+        step1_controls.addStretch(1)
         self.open_assistant_button = QPushButton("Mở Trợ lý ảo")
         self.open_assistant_button.setObjectName("openAssistantButton")
         self.open_assistant_button.setProperty("primary", True)
-        actions1.addWidget(self.open_assistant_button)
-        actions1.addStretch()
-        step1.addLayout(actions1)
-        layout.addWidget(self.step1_card)
+        self.open_assistant_button.setFixedWidth(180)
+        step1_controls.addWidget(
+            self.open_assistant_button,
+            0,
+            Qt.AlignmentFlag.AlignRight,
+        )
+        step1.addLayout(step1_controls)
+        workflow_grid.addWidget(self.step1_card, 0, 0)
 
         self.step2_card = QFrame()
         self.step2_card.setProperty("card", True)
-        step2 = QVBoxLayout(self.step2_card)
-        step2.setContentsMargins(18, 15, 18, 16)
-        step2.setSpacing(10)
-        header2 = QHBoxLayout()
-        name2 = QLabel("Bước 2 – Xem file bóc tách dữ liệu")
-        name2.setStyleSheet("font-size: 13pt; font-weight: 700;")
+        self.step2_card.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        step2 = QHBoxLayout(self.step2_card)
+        step2.setContentsMargins(14, 11, 14, 12)
+        step2.setSpacing(16)
+        step2_details = QVBoxLayout()
+        step2_details.setSpacing(3)
+        category2 = QLabel("KIỂM TRA DỮ LIỆU")
+        category2.setProperty("cardCategory", True)
+        step2_details.addWidget(category2)
         self.file_status_badge = QLabel()
-        header2.addWidget(name2)
-        header2.addStretch()
-        header2.addWidget(self.file_status_badge)
-        step2.addLayout(header2)
+        name2 = QLabel("Kiểm tra dữ liệu đã bóc tách")
+        name2.setProperty("sectionTitle", True)
+        name2.setWordWrap(True)
+        step2_details.addWidget(name2)
 
         self.file_name_label = QLabel("Chưa có file bóc tách")
         self.file_name_label.setObjectName("fileNameLabel")
@@ -151,53 +188,94 @@ class WorkflowPage(QWidget):
         self.file_note_label.setProperty("muted", True)
         self.saved_label = QLabel("Lưu thành công lần cuối: —")
         self.saved_label.setProperty("muted", True)
-        step2.addWidget(self.file_name_label)
-        step2.addWidget(self.file_note_label)
-        step2.addWidget(self.saved_label)
+        step2_details.addWidget(self.file_name_label)
+        step2_details.addWidget(self.file_note_label)
+        step2_details.addWidget(self.saved_label)
+        step2.addLayout(step2_details, 1)
 
-        actions2 = QHBoxLayout()
-        actions2.addStretch()
+        step2_controls = QVBoxLayout()
+        step2_controls.setSpacing(5)
+        step2_controls.addWidget(
+            self.file_status_badge,
+            0,
+            Qt.AlignmentFlag.AlignRight,
+        )
+        step2_controls.addStretch(1)
         self.review_button = QPushButton("Xem file bóc tách")
         self.review_button.setObjectName("openReviewButton")
         self.review_button.setProperty("primary", True)
-        actions2.addWidget(self.review_button)
-        step2.addLayout(actions2)
-        layout.addWidget(self.step2_card)
+        self.review_button.setFixedWidth(180)
+        step2_controls.addWidget(
+            self.review_button,
+            0,
+            Qt.AlignmentFlag.AlignRight,
+        )
+        step2.addLayout(step2_controls)
+        workflow_grid.addWidget(self.step2_card, 1, 0)
 
         self.step3_card = QFrame()
         self.step3_card.setObjectName("excelWorkflowCard")
         self.step3_card.setProperty("card", True)
-        step3 = QVBoxLayout(self.step3_card)
-        step3.setContentsMargins(18, 15, 18, 16)
+        self.step3_card.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        step3 = QHBoxLayout(self.step3_card)
+        step3.setContentsMargins(14, 11, 14, 12)
         step3.setSpacing(10)
 
-        name3 = QLabel("Bước 3 – Xử lý dữ liệu Excel")
-        name3.setStyleSheet("font-size: 13pt; font-weight: 700;")
-        step3.addWidget(name3)
-
-        guide3 = QLabel(
-            "Đồng bộ dữ liệu từ file Hàng ngày hoặc nhập các khoản chi đã xác nhận "
-            "vào file BK Tổng hợp."
+        step3_intro = QWidget()
+        step3_intro.setMinimumWidth(190)
+        step3_intro.setMaximumWidth(220)
+        step3_intro.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Expanding,
         )
-        guide3.setWordWrap(True)
-        guide3.setProperty("muted", True)
-        step3.addWidget(guide3)
+        intro3 = QVBoxLayout(step3_intro)
+        intro3.setContentsMargins(0, 0, 0, 0)
+        intro3.setSpacing(4)
+        category3 = QLabel("XỬ LÝ EXCEL")
+        category3.setProperty("cardCategory", True)
+        intro3.addWidget(category3)
+        name3 = QLabel("Xử lý và đồng bộ dữ liệu Excel")
+        name3.setProperty("sectionTitle", True)
+        name3.setWordWrap(True)
+        intro3.addWidget(name3)
+
+        self.step3_card.setToolTip(
+            "Mỗi tác vụ sử dụng một luồng dữ liệu riêng và hiển thị "
+            "kết quả gần nhất ngay trong cùng hàng."
+        )
 
         self.sync_status_label = QLabel("Đồng bộ gần nhất: —")
         self.sync_status_label.setObjectName("dailySyncStatusLabel")
         self.sync_status_label.setWordWrap(True)
         self.sync_status_label.setProperty("muted", True)
+        self.sync_status_label.setMinimumWidth(0)
+        self.sync_status_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
         self.posting_status_label = QLabel("Nhập khoản chi gần nhất: —")
         self.posting_status_label.setObjectName("expensePostingStatusLabel")
         self.posting_status_label.setWordWrap(True)
         self.posting_status_label.setProperty("muted", True)
+        self.posting_status_label.setMinimumWidth(0)
+        self.posting_status_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
         self.payment_sync_status_label = QLabel(
             "Đồng bộ BK → Thanh toán gần nhất: —"
         )
         self.payment_sync_status_label.setObjectName("paymentSyncStatusLabel")
         self.payment_sync_status_label.setWordWrap(True)
         self.payment_sync_status_label.setProperty("muted", True)
-        actions3 = QHBoxLayout()
+        self.payment_sync_status_label.setMinimumWidth(0)
+        self.payment_sync_status_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
         self.sync_daily_button = QPushButton("Đồng bộ dữ liệu Hàng ngày")
         self.sync_daily_button.setObjectName("syncDailyWorkbookButton")
         self.sync_daily_button.setProperty("primary", True)
@@ -207,15 +285,127 @@ class WorkflowPage(QWidget):
         self.sync_payment_button = QPushButton("Đồng bộ BK → Thanh toán")
         self.sync_payment_button.setObjectName("syncPaymentWorkbookButton")
         self.sync_payment_button.setProperty("primary", True)
-        actions3.addWidget(self.sync_daily_button)
-        actions3.addWidget(self.post_expenses_button)
-        actions3.addWidget(self.sync_payment_button)
-        actions3.addStretch()
-        step3.addLayout(actions3)
-        step3.addWidget(self.sync_status_label)
-        step3.addWidget(self.posting_status_label)
-        step3.addWidget(self.payment_sync_status_label)
-        layout.addWidget(self.step3_card)
+        for button in (
+            self.sync_daily_button,
+            self.post_expenses_button,
+            self.sync_payment_button,
+        ):
+            button.setMinimumWidth(0)
+            button.setMaximumWidth(205)
+            button.setSizePolicy(
+                QSizePolicy.Policy.Ignored,
+                QSizePolicy.Policy.Fixed,
+        )
+        self.excel_loading_bar = LinearLoadingBar()
+        self.excel_loading_bar.setAccessibleName("Tiến trình xử lý Excel")
+        intro3.addWidget(self.excel_loading_bar)
+        intro3.addStretch(1)
+        step3.addWidget(step3_intro)
+
+        def add_excel_action(
+            title_text: str,
+            description: str,
+            status_label: QLabel,
+            button: QPushButton,
+        ) -> QFrame:
+            action = QFrame()
+            action.setProperty("actionRow", True)
+            action.setToolTip(description)
+            action_layout = QVBoxLayout(action)
+            action_layout.setContentsMargins(10, 6, 10, 6)
+            action_layout.setSpacing(5)
+            details = QVBoxLayout()
+            details.setSpacing(1)
+            action_title = QLabel(title_text)
+            action_title.setProperty("actionTitle", True)
+            action_title.setToolTip(description)
+            action_title.setMinimumWidth(0)
+            action_title.setSizePolicy(
+                QSizePolicy.Policy.Ignored,
+                QSizePolicy.Policy.Preferred,
+            )
+            details.addWidget(action_title)
+            details.addWidget(status_label)
+            action_layout.addLayout(details)
+            action_layout.addWidget(
+                button,
+                0,
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            )
+            step3.addWidget(action, 1)
+            return action
+
+        self.daily_sync_action = add_excel_action(
+            "Hàng ngày → BK",
+            "Cập nhật dữ liệu từ workbook Hàng ngày vào BK Tổng hợp.",
+            self.sync_status_label,
+            self.sync_daily_button,
+        )
+        self.expense_posting_action = add_excel_action(
+            "Khoản chi → BK",
+            "Ghi các khoản chi đã kiểm tra và xác nhận vào BK Tổng hợp.",
+            self.posting_status_label,
+            self.post_expenses_button,
+        )
+        self.payment_sync_action = add_excel_action(
+            "BK → Thanh toán",
+            "Chuyển dữ liệu từ BK Tổng hợp sang workbook Thanh toán.",
+            self.payment_sync_status_label,
+            self.sync_payment_button,
+        )
+        workflow_grid.addWidget(self.step3_card, 2, 0)
+
+        self.step4_card = QFrame()
+        self.step4_card.setObjectName("rpaExpenseWorkflowCard")
+        self.step4_card.setProperty("card", True)
+        self.step4_card.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        step4 = QHBoxLayout(self.step4_card)
+        step4.setContentsMargins(14, 11, 14, 12)
+        step4.setSpacing(16)
+        step4_details = QVBoxLayout()
+        step4_details.setSpacing(4)
+        category4 = QLabel("TỰ ĐỘNG HÓA RPA")
+        category4.setProperty("cardCategory", True)
+        step4_details.addWidget(category4)
+        name4 = QLabel("Nhập khoản chi lên phần mềm quyết toán")
+        name4.setProperty("sectionTitle", True)
+        name4.setWordWrap(True)
+        step4_details.addWidget(name4)
+        guide4 = QLabel(
+            "Chọn sheet BK, chọn một hoặc nhiều số quyết toán, sau đó khởi chạy "
+            "flow PAD để nhập các khoản chi đã tổng hợp lên phần mềm quyết toán."
+        )
+        guide4.setWordWrap(True)
+        guide4.setProperty("muted", True)
+        step4_details.addWidget(guide4)
+        step4.addLayout(step4_details, 1)
+
+        step4_controls = QVBoxLayout()
+        step4_controls.setSpacing(5)
+        self.rpa_configuration_status = QLabel()
+        step4_controls.addWidget(
+            self.rpa_configuration_status,
+            0,
+            Qt.AlignmentFlag.AlignRight,
+        )
+        self.run_rpa_expense_button = QPushButton("Nhập PM quyết toán")
+        self.run_rpa_expense_button.setObjectName("runRpaExpenseButton")
+        self.run_rpa_expense_button.setProperty("primary", True)
+        self.run_rpa_expense_button.setFixedWidth(220)
+        step4_controls.addWidget(self.run_rpa_expense_button)
+        self.rpa_loading_bar = LinearLoadingBar()
+        self.rpa_loading_bar.setAccessibleName("Tiến trình chuẩn bị RPA")
+        step4_controls.addWidget(self.rpa_loading_bar)
+        self.rpa_expense_status_label = QLabel("Chạy RPA gần nhất: —")
+        self.rpa_expense_status_label.setObjectName("rpaExpenseStatusLabel")
+        self.rpa_expense_status_label.setWordWrap(True)
+        self.rpa_expense_status_label.setProperty("muted", True)
+        step4_controls.addWidget(self.rpa_expense_status_label)
+        step4.addLayout(step4_controls)
+        workflow_grid.addWidget(self.step4_card, 3, 0)
 
         # Aliases có chủ ý để lớp điều phối có thể dùng cách đặt tên theo nghiệp vụ
         # mà không tạo thêm widget/nút chính.
@@ -224,12 +414,13 @@ class WorkflowPage(QWidget):
         self.daily_sync_status_label = self.sync_status_label
         self.expense_posting_status_label = self.posting_status_label
         self._excel_running_operation: str | None = None
+        self._rpa_running = False
+        self._rpa_button_text = self.run_rpa_expense_button.text()
         self._excel_button_texts = {
             self.SYNC_OPERATION: self.sync_daily_button.text(),
             self.POSTING_OPERATION: self.post_expenses_button.text(),
             self.PAYMENT_SYNC_OPERATION: self.sync_payment_button.text(),
         }
-        layout.addStretch(1)
 
     def set_configuration(self, settings: Any | None) -> None:
         self._settings = settings
@@ -243,6 +434,21 @@ class WorkflowPage(QWidget):
         else:
             self.assistant_status.setText("Chưa cấu hình BAT")
             self.assistant_status.setStyleSheet(
+                "color: #A16207; background: #FFF8DB; border-radius: 5px; "
+                "padding: 4px 8px;"
+            )
+        rpa_bat = str(
+            _get(settings, "rpa_expense_bat_path", default="") or ""
+        ).strip()
+        if rpa_bat:
+            self.rpa_configuration_status.setText("Đã cấu hình BAT RPA")
+            self.rpa_configuration_status.setStyleSheet(
+                "color: #15803D; background: #ECFDF3; border-radius: 5px; "
+                "padding: 4px 8px;"
+            )
+        else:
+            self.rpa_configuration_status.setText("Chưa cấu hình BAT RPA")
+            self.rpa_configuration_status.setStyleSheet(
                 "color: #A16207; background: #FFF8DB; border-radius: 5px; "
                 "padding: 4px 8px;"
             )
@@ -329,20 +535,31 @@ class WorkflowPage(QWidget):
 
         normalized = self._excel_operation(operation)
         self._excel_running_operation = normalized
+        self.excel_loading_bar.set_running(True)
+        for button in (
+            self.sync_daily_button,
+            self.post_expenses_button,
+            self.sync_payment_button,
+        ):
+            set_button_loading(button, False)
         self.sync_daily_button.setEnabled(False)
         self.post_expenses_button.setEnabled(False)
         self.sync_payment_button.setEnabled(False)
+        self.run_rpa_expense_button.setEnabled(False)
         if normalized == self.SYNC_OPERATION:
+            set_button_loading(self.sync_daily_button, True)
             self.sync_daily_button.setText("Đang đồng bộ…")
             self.sync_status_label.setText(
                 f"Đồng bộ: {message or 'Đang phân tích dữ liệu…'}"
             )
         elif normalized == self.POSTING_OPERATION:
+            set_button_loading(self.post_expenses_button, True)
             self.post_expenses_button.setText("Đang nhập…")
             self.posting_status_label.setText(
                 f"Nhập khoản chi: {message or 'Đang phân tích dữ liệu…'}"
             )
         else:
+            set_button_loading(self.sync_payment_button, True)
             self.sync_payment_button.setText("Đang đồng bộ…")
             self.payment_sync_status_label.setText(
                 "Đồng bộ BK → Thanh toán: "
@@ -387,6 +604,13 @@ class WorkflowPage(QWidget):
         if operation is not None:
             self._excel_operation(operation)
         self._excel_running_operation = None
+        self.excel_loading_bar.set_running(False)
+        for button in (
+            self.sync_daily_button,
+            self.post_expenses_button,
+            self.sync_payment_button,
+        ):
+            set_button_loading(button, False)
         self.sync_daily_button.setText(
             self._excel_button_texts[self.SYNC_OPERATION]
         )
@@ -396,9 +620,11 @@ class WorkflowPage(QWidget):
         self.sync_payment_button.setText(
             self._excel_button_texts[self.PAYMENT_SYNC_OPERATION]
         )
-        self.sync_daily_button.setEnabled(True)
-        self.post_expenses_button.setEnabled(True)
-        self.sync_payment_button.setEnabled(True)
+        enabled = not self._rpa_running
+        self.sync_daily_button.setEnabled(enabled)
+        self.post_expenses_button.setEnabled(enabled)
+        self.sync_payment_button.setEnabled(enabled)
+        self.run_rpa_expense_button.setEnabled(enabled)
 
     def set_excel_actions_enabled(self, enabled: bool) -> None:
         if self._excel_running_operation is not None and enabled:
@@ -406,6 +632,48 @@ class WorkflowPage(QWidget):
         self.sync_daily_button.setEnabled(enabled)
         self.post_expenses_button.setEnabled(enabled)
         self.sync_payment_button.setEnabled(enabled)
+        self.run_rpa_expense_button.setEnabled(enabled and not self._rpa_running)
+
+    def set_rpa_running(self, message: str = "") -> None:
+        self._rpa_running = True
+        self.rpa_loading_bar.set_running(True)
+        set_button_loading(self.run_rpa_expense_button, True)
+        self.sync_daily_button.setEnabled(False)
+        self.post_expenses_button.setEnabled(False)
+        self.sync_payment_button.setEnabled(False)
+        self.run_rpa_expense_button.setEnabled(False)
+        self.run_rpa_expense_button.setText("Đang chuẩn bị RPA…")
+        self.rpa_expense_status_label.setText(
+            f"RPA: {message or 'Đang chuẩn bị dữ liệu…'}"
+        )
+
+    def set_rpa_progress(self, message: str) -> None:
+        self.rpa_expense_status_label.setText(f"RPA: {message}")
+
+    def set_rpa_result(self, result: Any = None) -> None:
+        message = (
+            result
+            if isinstance(result, str)
+            else _get(result, "message", default="Đã khởi chạy PAD.")
+        )
+        self.rpa_expense_status_label.setText(
+            f"Chạy RPA gần nhất: {message or 'Đã khởi chạy PAD.'}"
+        )
+
+    def set_rpa_idle(self) -> None:
+        self._rpa_running = False
+        self.rpa_loading_bar.set_running(False)
+        set_button_loading(self.run_rpa_expense_button, False)
+        self.run_rpa_expense_button.setText(self._rpa_button_text)
+        if self._excel_running_operation is None:
+            self.sync_daily_button.setEnabled(True)
+            self.post_expenses_button.setEnabled(True)
+            self.sync_payment_button.setEnabled(True)
+            self.run_rpa_expense_button.setEnabled(True)
+
+    @property
+    def rpa_running(self) -> bool:
+        return self._rpa_running
 
     @property
     def excel_running_operation(self) -> str | None:

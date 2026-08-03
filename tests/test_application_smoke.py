@@ -39,10 +39,12 @@ def test_runtime_and_main_window_start_with_isolated_data_root(
         assert runtime.paths.excel_temp_dir.is_dir()
         assert runtime.paths.excel_backup_dir.is_dir()
         assert runtime.paths.excel_reports_dir.is_dir()
+        assert runtime.paths.rpa_dir.is_dir()
         assert runtime.daily_sync_service is not None
         assert runtime.expense_posting_service is not None
         assert runtime.payment_sync_service is not None
         assert runtime.excel_task_controller is not None
+        assert runtime.rpa_expense_controller is not None
         assert window.pages.count() == 4
         assert window.workflow_page.open_assistant_button.text() == "Mở Trợ lý ảo"
         assert not hasattr(window.workflow_page, "open_inbox_button")
@@ -64,6 +66,7 @@ def test_runtime_and_main_window_start_with_isolated_data_root(
             "assistantBatEdit",
             "outputDirEdit",
             "containerGptBatEdit",
+            "rpaExpenseBatEdit",
         }.issubset({edit.objectName() for edit in settings_edits})
         assert {
             edit.objectName()
@@ -76,6 +79,7 @@ def test_runtime_and_main_window_start_with_isolated_data_root(
             "bkWorkbookEdit",
             "paymentWorkbookEdit",
             "containerGptBatEdit",
+            "rpaExpenseBatEdit",
         }
         visible_text = " ".join(
             widget.text()

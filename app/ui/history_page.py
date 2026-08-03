@@ -271,7 +271,7 @@ class HistoryPage(QWidget):
         self.open_batch_button = QPushButton("Mở batch")
         self.open_batch_button.setObjectName("openHistoryBatchButton")
         self.open_batch_button.setProperty("primary", True)
-        actions.addWidget(self.open_batch_button)
+        self.open_batch_button.setMinimumWidth(130)
 
         self.path_button = QToolButton()
         self.path_button.setObjectName("openHistoryPathButton")
@@ -282,6 +282,7 @@ class HistoryPage(QWidget):
         menu.addAction(self.current_file_action)
         self.path_button.setMenu(menu)
         actions.addWidget(self.path_button)
+        actions.addWidget(self.open_batch_button)
         layout.addLayout(actions)
 
     def _connect_signals(self) -> None:

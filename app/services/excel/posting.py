@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
@@ -670,18 +670,14 @@ class ExpensePostingService:
         repost_source_indices: set[int] | None = None,
     ) -> list[list[dict[str, Any]]]:
         repost = repost_source_indices or set()
-        groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
-        for row in rows:
-            source_index = row["source_item_index"]
-            if source_index in already_posted and source_index not in repost:
-                continue
-            key = (
-                (row["container"], row["fee"])
-                if row["container"]
-                else ("NO_CONTAINER", row["source_item_index"])
-            )
-            groups.setdefault(key, []).append(row)
-        return list(groups.values())
+        # Mỗi dòng hóa đơn phải còn độc lập cho tới khi xác định được dòng BK.
+        # Cùng container/mã phí chưa đủ để kết luận các khoản thuộc cùng một SQT.
+        return [
+            [row]
+            for row in rows
+            if row["source_item_index"] not in already_posted
+            or row["source_item_index"] in repost
+        ]
 
     @staticmethod
     def _items_from_groups(
@@ -907,12 +903,27 @@ class ExpensePostingService:
             ),
             key=lambda candidate: candidate.row,
         )
+        analyzed_items: list[PostingItem] = []
         conflicts: list[PostingConflict] = []
-        for item_index, item in enumerate(items):
+        target_items: dict[tuple[str, int, int], int] = {}
+        source_container_counts = Counter(
+            item.container
+            for item in items
+            if item.status is PostingItemStatus.PLANNED and item.container
+        )
+        repeated_source_containers = {
+            container
+            for container, count in source_container_counts.items()
+            if count > 1
+        }
+        for item in items:
             if item.status is not PostingItemStatus.PLANNED:
+                analyzed_items.append(item)
                 continue
             item.sheet_name = worksheet.title
             if item.selected_fee not in FEE_HEADER_ALIASES:
+                item_index = len(analyzed_items)
+                analyzed_items.append(item)
                 conflicts.append(
                     self._item_conflict(
                         batch_hash,
@@ -940,6 +951,8 @@ class ExpensePostingService:
                         f"Dòng BK {item.target_row} không còn hợp lệ."
                     )
             if item.container is None and manually_selected is None:
+                item_index = len(analyzed_items)
+                analyzed_items.append(item)
                 conflict_type = (
                     ConflictType.BL_ONLY_NO_CONTAINER
                     if item.bl and item.selected_fee == "CB"
@@ -968,8 +981,18 @@ class ExpensePostingService:
                 else list(index.get(item.container, ()))
             )
             item.row_candidates = candidates
-            selected = manually_selected or self._automatic_row(candidates)
+            requires_source_confirmation = (
+                manually_selected is None
+                and item.container in repeated_source_containers
+            )
+            selected = manually_selected or (
+                None
+                if requires_source_confirmation
+                else self._automatic_row(candidates)
+            )
             if not candidates:
+                item_index = len(analyzed_items)
+                analyzed_items.append(item)
                 conflicts.append(
                     self._item_conflict(
                         batch_hash,
@@ -983,13 +1006,26 @@ class ExpensePostingService:
                 )
                 continue
             if selected is None:
+                item_index = len(analyzed_items)
+                analyzed_items.append(item)
+                conflict_type = (
+                    ConflictType.REPEATED_SOURCE_CONTAINER
+                    if requires_source_confirmation
+                    else ConflictType.MULTIPLE_CONTAINER_MATCH
+                )
+                message = (
+                    f"Container {item.container} xuất hiện ở nhiều khoản hóa đơn; "
+                    "hãy xác nhận dòng SQT cho khoản này."
+                    if requires_source_confirmation
+                    else f"Container {item.container} có nhiều dòng không thể tự chọn."
+                )
                 conflicts.append(
                     self._item_conflict(
                         batch_hash,
                         item_index,
                         item,
-                        ConflictType.MULTIPLE_CONTAINER_MATCH,
-                        f"Container {item.container} có nhiều dòng không thể tự chọn.",
+                        conflict_type,
+                        message,
                         (ResolutionAction.SELECT_ROW, ResolutionAction.SKIP),
                         row_candidates=candidates,
                     )
@@ -998,6 +1034,8 @@ class ExpensePostingService:
             item.target_row = selected.row
             item.target_column = fee_columns.get(item.selected_fee)
             if item.target_column is None:
+                item_index = len(analyzed_items)
+                analyzed_items.append(item)
                 conflicts.append(
                     self._item_conflict(
                         batch_hash,
@@ -1010,11 +1048,37 @@ class ExpensePostingService:
                     )
                 )
                 continue
+
+            target_key = (
+                worksheet.title,
+                item.target_row,
+                item.target_column,
+            )
+            existing_index = target_items.get(target_key)
+            if existing_index is None:
+                target_items[target_key] = len(analyzed_items)
+                analyzed_items.append(item)
+            else:
+                self._merge_target_items(analyzed_items[existing_index], item)
+
+        for item_index in target_items.values():
+            item = analyzed_items[item_index]
             self._set_cell_state(worksheet, item)
             cell_conflict = self._cell_conflict(batch_hash, item_index, item)
             if cell_conflict is not None:
                 conflicts.append(cell_conflict)
-        return items, conflicts
+        return analyzed_items, conflicts
+
+    @staticmethod
+    def _merge_target_items(target: PostingItem, incoming: PostingItem) -> None:
+        """Gom các khoản chỉ sau khi chúng cùng trỏ tới một ô BK cụ thể."""
+
+        target.source_indices.extend(incoming.source_indices)
+        target.amount += incoming.amount
+        target.source_items.extend(incoming.source_items)
+        target.force_repost = target.force_repost or incoming.force_repost
+        if target.action != incoming.action and incoming.action is not None:
+            target.action = None
 
     @staticmethod
     def _automatic_row(candidates: Sequence[RowCandidate]) -> RowCandidate | None:

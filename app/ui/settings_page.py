@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
@@ -19,6 +19,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from .feedback import LinearLoadingBar, set_button_loading
 
 
 def _setting(source: Any, name: str, default: Any = "") -> Any:
@@ -46,6 +48,9 @@ class SettingsPage(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         outer.addWidget(scroll)
         body = QWidget()
         layout = QVBoxLayout(body)
@@ -59,12 +64,14 @@ class SettingsPage(QWidget):
             "Chọn file BAT, thư mục Output và các workbook dùng để xử lý khoản chi."
         )
         subtitle.setProperty("muted", True)
+        subtitle.setWordWrap(True)
         layout.addWidget(title)
         layout.addWidget(subtitle)
 
         card = QFrame()
         card.setProperty("card", True)
         card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(18, 18, 18, 18)
         form = QFormLayout()
         form.setHorizontalSpacing(15)
         form.setVerticalSpacing(12)
@@ -105,6 +112,23 @@ class SettingsPage(QWidget):
         container_gpt_bat_widget = QWidget()
         container_gpt_bat_widget.setLayout(container_gpt_bat_row)
         form.addRow("BAT Load số container:", container_gpt_bat_widget)
+
+        rpa_expense_bat_row = QHBoxLayout()
+        self.rpa_expense_bat_edit = QLineEdit()
+        self.rpa_expense_bat_edit.setObjectName("rpaExpenseBatEdit")
+        self.rpa_expense_bat_edit.setPlaceholderText(
+            "Chọn BAT chạy PAD nhập khoản chi theo quyết toán"
+        )
+        self.rpa_expense_bat_edit.setClearButtonEnabled(True)
+        self.browse_rpa_expense_bat_button = QPushButton("Chọn…")
+        self.browse_rpa_expense_bat_button.setObjectName(
+            "browseRpaExpenseBatButton"
+        )
+        rpa_expense_bat_row.addWidget(self.rpa_expense_bat_edit, 1)
+        rpa_expense_bat_row.addWidget(self.browse_rpa_expense_bat_button)
+        rpa_expense_bat_widget = QWidget()
+        rpa_expense_bat_widget.setLayout(rpa_expense_bat_row)
+        form.addRow("BAT RPA nhập quyết toán:", rpa_expense_bat_widget)
 
         daily_row = QHBoxLayout()
         self.daily_workbook_edit = QLineEdit()
@@ -160,6 +184,16 @@ class SettingsPage(QWidget):
         self.browse_bk_button = self.browse_bk_workbook_button
         self.payment_edit = self.payment_workbook_edit
         self.browse_payment_button = self.browse_payment_workbook_button
+        for browse_button in (
+            self.browse_bat_button,
+            self.browse_output_button,
+            self.browse_container_gpt_bat_button,
+            self.browse_rpa_expense_bat_button,
+            self.browse_daily_workbook_button,
+            self.browse_bk_workbook_button,
+            self.browse_payment_workbook_button,
+        ):
+            browse_button.setMinimumWidth(82)
         card_layout.addLayout(form)
         layout.addWidget(card)
 
@@ -169,16 +203,23 @@ class SettingsPage(QWidget):
         layout.addWidget(self.validation_label)
 
         buttons = QHBoxLayout()
+        buttons.setSpacing(8)
         self.check_button = QPushButton("Kiểm tra cấu hình")
         self.open_output_button = QPushButton("Mở thư mục Output")
         self.save_button = QPushButton("Lưu cấu hình")
         self.save_button.setObjectName("saveSettingsButton")
         self.save_button.setProperty("primary", True)
+        self.check_button.setMinimumWidth(150)
+        self.open_output_button.setMinimumWidth(150)
+        self.save_button.setMinimumWidth(130)
+        buttons.addStretch()
         buttons.addWidget(self.check_button)
         buttons.addWidget(self.open_output_button)
-        buttons.addStretch()
         buttons.addWidget(self.save_button)
         layout.addLayout(buttons)
+        self.check_loading_bar = LinearLoadingBar()
+        self.check_loading_bar.setAccessibleName("Tiến trình kiểm tra cấu hình")
+        layout.addWidget(self.check_loading_bar)
         layout.addStretch()
 
     def _connect_signals(self) -> None:
@@ -186,6 +227,9 @@ class SettingsPage(QWidget):
         self.browse_output_button.clicked.connect(self._browse_output)
         self.browse_container_gpt_bat_button.clicked.connect(
             self._browse_container_gpt_bat
+        )
+        self.browse_rpa_expense_bat_button.clicked.connect(
+            self._browse_rpa_expense_bat
         )
         self.browse_daily_workbook_button.clicked.connect(
             self._browse_daily_workbook
@@ -206,6 +250,7 @@ class SettingsPage(QWidget):
         self.bat_edit.textChanged.connect(self._validate_form)
         self.output_edit.textChanged.connect(self._validate_form)
         self.container_gpt_bat_edit.textChanged.connect(self._validate_form)
+        self.rpa_expense_bat_edit.textChanged.connect(self._validate_form)
         self.daily_workbook_edit.textChanged.connect(self._validate_form)
         self.bk_workbook_edit.textChanged.connect(self._validate_form)
         self.payment_workbook_edit.textChanged.connect(self._validate_form)
@@ -225,6 +270,9 @@ class SettingsPage(QWidget):
         self.container_gpt_bat_edit.setText(
             str(_setting(settings, "container_gpt_bat_path") or "")
         )
+        self.rpa_expense_bat_edit.setText(
+            str(_setting(settings, "rpa_expense_bat_path") or "")
+        )
         self._validate_form()
 
     def settings_data(self) -> dict[str, Any]:
@@ -235,6 +283,7 @@ class SettingsPage(QWidget):
             "bk_workbook_path": self.bk_workbook_edit.text().strip(),
             "payment_workbook_path": self.payment_workbook_edit.text().strip(),
             "container_gpt_bat_path": self.container_gpt_bat_edit.text().strip(),
+            "rpa_expense_bat_path": self.rpa_expense_bat_edit.text().strip(),
         }
 
     values = settings_data
@@ -259,6 +308,14 @@ class SettingsPage(QWidget):
             problems.append("BAT Load số container phải có đuôi .bat.")
         elif container_gpt_bat and not Path(container_gpt_bat).is_file():
             problems.append("Không tìm thấy BAT Load số container.")
+        rpa_expense_bat = self.rpa_expense_bat_edit.text().strip()
+        if (
+            rpa_expense_bat
+            and Path(rpa_expense_bat).suffix.casefold() != ".bat"
+        ):
+            problems.append("BAT RPA nhập quyết toán phải có đuôi .bat.")
+        elif rpa_expense_bat and not Path(rpa_expense_bat).is_file():
+            problems.append("Không tìm thấy BAT RPA nhập quyết toán.")
         for label, path_text in (
             ("File Hàng ngày", self.daily_workbook_edit.text().strip()),
             ("File BK Tổng hợp", self.bk_workbook_edit.text().strip()),
@@ -300,6 +357,18 @@ class SettingsPage(QWidget):
         self.validation_label.style().unpolish(self.validation_label)
         self.validation_label.style().polish(self.validation_label)
 
+    def set_checking(self, checking: bool) -> None:
+        """Hiển thị phản hồi trong lúc đọc và kiểm tra các workbook."""
+
+        self.check_loading_bar.set_running(checking)
+        set_button_loading(self.check_button, checking)
+        self.check_button.setText(
+            "Đang kiểm tra…" if checking else "Kiểm tra cấu hình"
+        )
+        self.check_button.setEnabled(
+            False if checking else self.save_button.isEnabled()
+        )
+
     def _browse_bat(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
             self,
@@ -328,6 +397,16 @@ class SettingsPage(QWidget):
         )
         if filename:
             self.container_gpt_bat_edit.setText(filename)
+
+    def _browse_rpa_expense_bat(self) -> None:
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "Chọn BAT chạy PAD nhập khoản chi theo quyết toán",
+            self.rpa_expense_bat_edit.text().strip(),
+            "Batch Windows (*.bat)",
+        )
+        if filename:
+            self.rpa_expense_bat_edit.setText(filename)
 
     def _browse_daily_workbook(self) -> None:
         self._browse_workbook(

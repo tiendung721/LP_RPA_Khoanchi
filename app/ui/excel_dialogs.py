@@ -9,6 +9,7 @@ from typing import Any
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -401,6 +402,7 @@ DEFAULT_ACTIONS: dict[str, tuple[str, ...]] = {
     "TARGET_SHEET_AMBIGUOUS": ("SELECT_SHEET", "CANCEL"),
     "CONTAINER_NOT_FOUND": ("SKIP", "SELECT_ROW"),
     "MULTIPLE_CONTAINER_MATCH": ("SKIP", "SELECT_ROW"),
+    "REPEATED_SOURCE_CONTAINER": ("SKIP", "SELECT_ROW"),
     "TARGET_CELL_OCCUPIED": ("KEEP_EXISTING", "OVERWRITE", "ADD", "SKIP"),
     "TARGET_CELL_FORMULA": ("KEEP_FORMULA", "OVERWRITE", "SKIP"),
     "TARGET_CELL_TEXT": ("KEEP_EXISTING", "OVERWRITE", "SKIP"),
@@ -424,6 +426,7 @@ DEFAULT_RESOLUTION: dict[str, str] = {
     "TARGET_SHEET_AMBIGUOUS": "SELECT_SHEET",
     "CONTAINER_NOT_FOUND": "SKIP",
     "MULTIPLE_CONTAINER_MATCH": "SKIP",
+    "REPEATED_SOURCE_CONTAINER": "SKIP",
     "TARGET_CELL_OCCUPIED": "KEEP_EXISTING",
     "TARGET_CELL_FORMULA": "KEEP_FORMULA",
     "TARGET_CELL_TEXT": "KEEP_EXISTING",
@@ -496,9 +499,11 @@ class RepostSelectionDialog(QDialog):
 
         self.unposted_only = QRadioButton("Chỉ nhập khoản chưa nhập")
         self.choose_reposts = QRadioButton("Chọn khoản nhập lại")
+        self.select_all = QCheckBox("Chọn tất cả")
         self.unposted_only.setChecked(True)
         layout.addWidget(self.unposted_only)
         layout.addWidget(self.choose_reposts)
+        layout.addWidget(self.select_all)
 
         self.table = QTableWidget(0, len(self.COLUMNS))
         self.table.setObjectName("repostItemTable")
@@ -562,10 +567,48 @@ class RepostSelectionDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
         self.choose_reposts.toggled.connect(self._update_enabled)
+        self.select_all.stateChanged.connect(self._set_all_checked)
+        self.table.itemChanged.connect(self._sync_select_all_state)
         self._update_enabled(False)
 
     def _update_enabled(self, enabled: bool) -> None:
         self.table.setEnabled(enabled)
+        self.select_all.setEnabled(enabled)
+
+    def _set_all_checked(self, state: int) -> None:
+        check_state = Qt.CheckState(state)
+        if check_state is Qt.CheckState.PartiallyChecked:
+            return
+        target_state = (
+            Qt.CheckState.Checked
+            if check_state is Qt.CheckState.Checked
+            else Qt.CheckState.Unchecked
+        )
+        was_blocked = self.table.blockSignals(True)
+        try:
+            for item in self._checkbox_items:
+                item.setCheckState(target_state)
+        finally:
+            self.table.blockSignals(was_blocked)
+
+    def _sync_select_all_state(self, changed_item: QTableWidgetItem) -> None:
+        if changed_item.column() != 0:
+            return
+        checked_count = sum(
+            item.checkState() is Qt.CheckState.Checked
+            for item in self._checkbox_items
+        )
+        if checked_count == len(self._checkbox_items) and self._checkbox_items:
+            state = Qt.CheckState.Checked
+        elif checked_count:
+            state = Qt.CheckState.PartiallyChecked
+        else:
+            state = Qt.CheckState.Unchecked
+        was_blocked = self.select_all.blockSignals(True)
+        try:
+            self.select_all.setCheckState(state)
+        finally:
+            self.select_all.blockSignals(was_blocked)
 
     @property
     def selected_source_indices(self) -> list[int]:
@@ -765,6 +808,7 @@ class ConflictResolutionDialog(QDialog):
         if row_candidates and conflict_type in {
             "CONTAINER_NOT_FOUND",
             "MULTIPLE_CONTAINER_MATCH",
+            "REPEATED_SOURCE_CONTAINER",
             "BL_ONLY_NO_CONTAINER",
             "PARTIAL_KEY_MATCH",
         }:

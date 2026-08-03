@@ -45,6 +45,7 @@ from .review_table_model import (
 )
 from app.container_load.validation import allocate_amount, row_fingerprint
 from app.ui.container_load_controller import ContainerLoadBusyError
+from app.ui.feedback import LinearLoadingBar, set_button_loading
 
 LOGGER = logging.getLogger(__name__)
 
@@ -345,7 +346,12 @@ class ReviewWindow(QMainWindow):
         self.table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         root.addWidget(self.table, 1)
 
+        self.save_loading_bar = LinearLoadingBar()
+        self.save_loading_bar.setAccessibleName("Tiến trình lưu dữ liệu")
+        root.addWidget(self.save_loading_bar)
+
         bottom = QHBoxLayout()
+        bottom.setSpacing(8)
         self.visible_label = QLabel()
         self.visible_label.setProperty("muted", True)
         bottom.addWidget(self.visible_label)
@@ -355,8 +361,10 @@ class ReviewWindow(QMainWindow):
         self.confirm_button.setProperty("primary", True)
         self.close_button = QPushButton("Đóng")
         self.close_button.setObjectName("closeReviewButton")
-        bottom.addWidget(self.confirm_button)
+        self.confirm_button.setMinimumWidth(110)
+        self.close_button.setMinimumWidth(110)
         bottom.addWidget(self.close_button)
+        bottom.addWidget(self.confirm_button)
         root.addLayout(bottom)
 
     def _connect_signals(self) -> None:
@@ -699,6 +707,9 @@ class ReviewWindow(QMainWindow):
 
     def _set_saving(self, saving: bool) -> None:
         self._saving = saving
+        self.save_loading_bar.set_running(saving)
+        set_button_loading(self.confirm_button, saving)
+        self.confirm_button.setText("Đang lưu…" if saving else "Lưu")
         self.confirm_button.setEnabled(not saving and self.model.stats.error == 0)
         self.add_button.setEnabled(not saving)
         self.edit_button.setEnabled(not saving and self._selected_source_row() is not None)

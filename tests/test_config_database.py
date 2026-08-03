@@ -49,6 +49,7 @@ def test_runtime_files_are_grouped_below_output_system(tmp_path: Path) -> None:
     assert paths.excel_reports_dir == (
         tmp_path / "Output" / "_system" / "Excel" / "Reports"
     )
+    assert paths.rpa_dir == tmp_path / "Output" / "_system" / "RPA"
 
 
 def test_legacy_runtime_layout_is_moved_without_changing_files(
@@ -90,6 +91,7 @@ def test_settings_round_trip_utf8(tmp_path: Path) -> None:
         daily_workbook_path=root / "Hàng ngày 2026.xlsx",
         bk_workbook_path=root / "BK Tổng hợp 2026.xlsm",
         container_gpt_bat_path=str(root / "Mở GPT số container.bat"),
+        rpa_expense_bat_path=str(root / "Chạy PAD quyết toán.bat"),
     )
 
     manager.save(settings)
@@ -100,6 +102,7 @@ def test_settings_round_trip_utf8(tmp_path: Path) -> None:
     assert loaded.daily_workbook_path == settings.daily_workbook_path
     assert loaded.bk_workbook_path == settings.bk_workbook_path
     assert loaded.container_gpt_bat_path == settings.container_gpt_bat_path
+    assert loaded.rpa_expense_bat_path == settings.rpa_expense_bat_path
     assert manager.settings_path.read_bytes().startswith(b"{")
 
 
@@ -164,6 +167,7 @@ def test_legacy_settings_are_rewritten_without_browser_or_inbox_keys(
         "bk_workbook_path",
         "payment_workbook_path",
         "container_gpt_bat_path",
+        "rpa_expense_bat_path",
     }
 
 

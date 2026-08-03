@@ -31,6 +31,7 @@ from app.services.batch_service import BatchService
 from app.services.assistant_bat_launcher import AssistantBatLauncher
 from app.container_load.service import ContainerLoadService
 from app.container_load.validation import is_container_result_document
+from app.rpa_expense import RpaExpenseBatLauncher, RpaExpenseService
 from app.services.excel import (
     DailySyncService,
     ExcelConfigurationService,
@@ -43,6 +44,7 @@ from app.services.reviewed_batch_provider import ReviewedBatchProvider
 from app.services.validation_service import ValidationService
 from app.ui.excel_task_controller import ExcelTaskController
 from app.ui.container_load_controller import ContainerLoadController
+from app.ui.rpa_expense_controller import RpaExpenseController
 
 LOGGER = logging.getLogger(__name__)
 
@@ -117,6 +119,12 @@ class ApplicationRuntime:
             daily_sync_service=self.daily_sync_service,
             expense_posting_service=self.expense_posting_service,
             payment_sync_service=self.payment_sync_service,
+        )
+        self.rpa_expense_service = RpaExpenseService(self.settings)
+        self.rpa_expense_launcher = RpaExpenseBatLauncher(self.settings)
+        self.rpa_expense_controller = RpaExpenseController(
+            self.rpa_expense_service,
+            self.rpa_expense_launcher,
         )
         self.assistant_launcher = AssistantBatLauncher(self.settings)
         self.launcher = self.assistant_launcher
@@ -196,6 +204,11 @@ class ApplicationRuntime:
             raise ValueError(
                 "Không thể đổi cấu hình khi đang chờ kết quả số container."
             )
+        rpa_controller = getattr(self, "rpa_expense_controller", None)
+        if rpa_controller is not None and rpa_controller.is_busy:
+            raise ValueError(
+                "Không thể đổi cấu hình khi luồng RPA đang chuẩn bị dữ liệu."
+            )
         new_paths.ensure_directories()
         self.config_manager.save(settings)
         self.settings = settings
@@ -210,6 +223,13 @@ class ApplicationRuntime:
                 daily_sync_service=self.daily_sync_service,
                 expense_posting_service=self.expense_posting_service,
                 payment_sync_service=self.payment_sync_service,
+            )
+        self.rpa_expense_service = RpaExpenseService(settings)
+        self.rpa_expense_launcher = RpaExpenseBatLauncher(settings)
+        if rpa_controller is not None:
+            rpa_controller.update_services(
+                service=self.rpa_expense_service,
+                launcher=self.rpa_expense_launcher,
             )
         LOGGER.info(
             "Đã áp dụng cấu hình; bat=%s, output=%s",
@@ -271,6 +291,10 @@ class ApplicationRuntime:
             self.container_load_controller.shutdown()
         except Exception:
             LOGGER.exception("Không thể dừng watcher Load số container sạch")
+        try:
+            self.rpa_expense_controller.shutdown(wait=True)
+        except Exception:
+            LOGGER.exception("Không thể dừng worker RPA sạch")
         try:
             self.database.close()
         except Exception:

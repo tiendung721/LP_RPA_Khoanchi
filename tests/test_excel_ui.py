@@ -252,9 +252,43 @@ def test_payment_sync_confirmation_discloses_new_sheet_template(
     assert "Sheet Thanh toán mới: Có, tạo từ T05 26" in captured["text"]
 
 
-def test_sync_completion_can_open_the_written_bk_file(
+@pytest.mark.parametrize(
+    ("operation", "result_fields", "expected_title", "expected_detail"),
+    (
+        (
+            "sync",
+            {
+                "message": "Đồng bộ xong.",
+                "sheet_name": "T07 26",
+                "updated_rows": 2,
+                "inserted_rows": 1,
+                "target_only_rows": 3,
+                "invalid_rows": 0,
+            },
+            "Đồng bộ thành công",
+            "Sheet: T07 26",
+        ),
+        (
+            "posting",
+            {
+                "message": "Nhập khoản chi xong.",
+                "sheet_name": "T07 26",
+                "posted_source_items": 10,
+                "already_existing_items": 2,
+                "skipped_source_items": 1,
+            },
+            "Nhập khoản chi hoàn tất",
+            "Đã nhập: 10 khoản",
+        ),
+    ),
+)
+def test_bk_completion_can_open_the_written_bk_file(
     monkeypatch,
     tmp_path: Path,
+    operation: str,
+    result_fields: dict[str, Any],
+    expected_title: str,
+    expected_detail: str,
 ) -> None:
     bk_path = tmp_path / "BK 2026.xlsx"
     bk_path.touch()
@@ -303,12 +337,12 @@ def test_sync_completion_can_open_the_written_bk_file(
     class Tasks:
         @staticmethod
         def normalize_operation(_operation: Any) -> str:
-            return "sync"
+            return operation
 
     monkeypatch.setattr(main_window_module, "QMessageBox", CompletionMessage)
     owner = SimpleNamespace(
         _excel_context="workflow",
-        _excel_operation="sync",
+        _excel_operation=operation,
         _excel_tasks=Tasks(),
         workflow_page=SimpleNamespace(
             set_excel_result=lambda *_args: None
@@ -317,22 +351,17 @@ def test_sync_completion_can_open_the_written_bk_file(
         _open_bk_workbook=lambda path: opened.append(Path(path)),
     )
     result = SimpleNamespace(
-        operation="sync",
+        operation=operation,
         target_path=bk_path,
-        message="Đồng bộ xong.",
-        sheet_name="T07 26",
-        updated_rows=2,
-        inserted_rows=1,
-        target_only_rows=3,
-        invalid_rows=0,
+        **result_fields,
     )
 
     MainWindow._excel_completed(owner, result)
 
     message = CompletionMessage.instance
-    assert message.title == "Đồng bộ thành công"
+    assert message.title == expected_title
     assert message.open_button is not None
-    assert "Sheet: T07 26" in message.text
+    assert expected_detail in message.text
     assert opened == [bk_path]
 
 
@@ -652,13 +681,48 @@ def test_repost_dialog_defaults_to_unposted_and_selects_individual_rows(
 
     assert dialog.unposted_only.isChecked()
     assert not dialog.table.isEnabled()
+    assert not dialog.select_all.isEnabled()
     assert dialog.selected_source_indices == []
 
     dialog.choose_reposts.setChecked(True)
     dialog.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
 
     assert dialog.table.isEnabled()
+    assert dialog.select_all.isEnabled()
     assert dialog.selected_source_indices == [3]
+
+
+def test_repost_dialog_select_all_tracks_all_row_checkboxes(qtbot) -> None:
+    dialog = RepostSelectionDialog(
+        [
+            {"source_item_index": 1},
+            {"source_item_index": 3},
+            {"source_item_index": 5},
+        ]
+    )
+    qtbot.addWidget(dialog)
+    dialog.choose_reposts.setChecked(True)
+
+    dialog.select_all.setChecked(True)
+
+    assert dialog.selected_source_indices == [1, 3, 5]
+    assert all(
+        dialog.table.item(row, 0).checkState() is Qt.CheckState.Checked
+        for row in range(dialog.table.rowCount())
+    )
+
+    dialog.table.item(1, 0).setCheckState(Qt.CheckState.Unchecked)
+
+    assert dialog.select_all.checkState() is Qt.CheckState.PartiallyChecked
+    assert dialog.selected_source_indices == [1, 5]
+
+    dialog.select_all.setChecked(False)
+
+    assert dialog.selected_source_indices == []
+    assert all(
+        dialog.table.item(row, 0).checkState() is Qt.CheckState.Unchecked
+        for row in range(dialog.table.rowCount())
+    )
 
 
 def test_conflict_actions_are_short_vietnamese_labels(qtbot) -> None:
@@ -680,6 +744,12 @@ def test_conflict_actions_are_short_vietnamese_labels(qtbot) -> None:
                     "SKIP",
                 ],
             },
+            {
+                "conflict_id": "repeated",
+                "type": "REPEATED_SOURCE_CONTAINER",
+                "allowed_actions": ["SKIP", "SELECT_ROW"],
+                "row_candidates": [{"row_number": 12, "sqt": 700}],
+            },
         ]
     )
     qtbot.addWidget(dialog)
@@ -695,6 +765,7 @@ def test_conflict_actions_are_short_vietnamese_labels(qtbot) -> None:
 
     assert duplicate_labels == ["Bỏ qua", "Chọn dòng"]
     assert occupied_labels == ["Giữ nguyên", "Ghi đè", "Cộng thêm", "Bỏ qua"]
+    assert "repeated" in dialog._selector_buttons
     assert not any(
         "_" in label
         for label in duplicate_labels + occupied_labels

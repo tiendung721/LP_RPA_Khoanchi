@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from PySide6.QtWidgets import QScrollArea
+
+from app.ui.main_window import MainWindow
 from app.ui.workflow_page import WorkflowPage
 
 
@@ -53,3 +56,43 @@ def test_invalid_batch_never_claims_successful_save(qtbot) -> None:
     assert page.saved_label.text().endswith("—")
     assert not page.review_button.isEnabled()
 
+
+def test_four_workflow_groups_fit_minimum_window_without_scroll(qtbot) -> None:
+    window = MainWindow(settings={}, start_watcher=False)
+    qtbot.addWidget(window)
+    window.resize(980, 650)
+    window.show()
+    qtbot.wait(20)
+
+    page = window.workflow_page
+    cards = (
+        page.step1_card,
+        page.step2_card,
+        page.step3_card,
+        page.step4_card,
+    )
+
+    assert page.findChildren(QScrollArea) == []
+    assert all(card.isVisible() for card in cards)
+    assert all(page.rect().contains(card.geometry()) for card in cards)
+    assert len({card.geometry().left() for card in cards}) == 1
+    assert [card.geometry().top() for card in cards] == sorted(
+        card.geometry().top() for card in cards
+    )
+    assert all(
+        row.rect().contains(button.geometry())
+        for row, button in (
+            (page.daily_sync_action, page.sync_daily_button),
+            (page.expense_posting_action, page.post_expenses_button),
+            (page.payment_sync_action, page.sync_payment_button),
+        )
+    )
+    status_right_edges = {
+        badge.mapTo(page, badge.rect().topRight()).x()
+        for badge in (
+            page.assistant_status,
+            page.file_status_badge,
+            page.rpa_configuration_status,
+        )
+    }
+    assert len(status_right_edges) == 1

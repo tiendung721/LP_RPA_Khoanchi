@@ -699,20 +699,50 @@ def test_posting_groups_normalized_container_and_keeps_bl_only_rows_separate(
     plan = service.analyze(sheet_name="T07 26")
 
     assert plan.selected_sheet == "T07 26"
-    assert len(plan.items) == 3
+    assert len(plan.items) == 4
     assert plan.items[0].container == "DRYU3026167"
-    assert plan.items[0].source_indices == [0, 1]
-    assert plan.items[0].amount == 350
-    assert plan.items[1].source_indices == [2]
-    assert plan.items[2].source_indices == [3]
+    assert plan.items[0].source_indices == [0]
+    assert plan.items[0].amount == 100
+    assert plan.items[1].source_indices == [1]
+    assert plan.items[1].amount == 250
+    assert plan.items[2].source_indices == [2]
+    assert plan.items[3].source_indices == [3]
     assert [
         conflict.conflict_type for conflict in plan.conflicts
+    ] == [
+        ConflictType.REPEATED_SOURCE_CONTAINER,
+        ConflictType.REPEATED_SOURCE_CONTAINER,
+        ConflictType.BL_ONLY_NO_CONTAINER,
+        ConflictType.BL_ONLY_NO_CONTAINER,
+    ]
+
+    repeated = [
+        conflict
+        for conflict in plan.conflicts
+        if conflict.conflict_type is ConflictType.REPEATED_SOURCE_CONTAINER
+    ]
+    refined = service.refine(
+        plan,
+        {
+            conflict.conflict_id: {
+                "action": "SELECT_ROW",
+                "selected_row": 2,
+            }
+            for conflict in repeated
+        },
+    )
+
+    assert len(refined.items) == 3
+    assert refined.items[0].source_indices == [0, 1]
+    assert refined.items[0].amount == 350
+    assert [
+        conflict.conflict_type for conflict in refined.conflicts
     ] == [
         ConflictType.BL_ONLY_NO_CONTAINER,
         ConflictType.BL_ONLY_NO_CONTAINER,
     ]
 
-    result = service.apply(plan, {})
+    result = service.apply(refined, {})
 
     assert result.status is ExcelRunStatus.SUCCEEDED
     assert result.posted_source_items == 2
@@ -725,6 +755,192 @@ def test_posting_groups_normalized_container_and_keeps_bl_only_rows_separate(
         assert workbook["T07 26"].cell(
             2, POSTING_FEE_COLUMNS["VTN"]
         ).value == 350
+    finally:
+        workbook.close()
+
+
+def test_posting_keeps_repeated_container_separate_for_different_sqt_choices(
+    tmp_path: Path,
+) -> None:
+    ready = tmp_path / "ready.json"
+    target = tmp_path / "BK 2026.xlsx"
+    runtime_dir = tmp_path / "Excel"
+    container = "DRYU3026167"
+    _save_ready(
+        ready,
+        [
+            [container, "BL-01", "VTN", "ST", 100],
+            [container, "BL-02", "VTN", "ST", 250],
+        ],
+    )
+    workbook = Workbook()
+    sheet = _new_posting_sheet(workbook, "T07 26")
+    _add_posting_row(sheet, 2, container, sqt=701)
+    _add_posting_row(sheet, 3, container, sqt=702)
+    workbook.save(target)
+    workbook.close()
+
+    service = _posting_service(ready, target, runtime_dir)
+    plan = service.analyze(sheet_name="T07 26")
+    conflicts = [
+        conflict
+        for conflict in plan.conflicts
+        if conflict.conflict_type is ConflictType.REPEATED_SOURCE_CONTAINER
+    ]
+
+    assert len(plan.items) == 2
+    assert [item.source_indices for item in plan.items] == [[0], [1]]
+    assert [conflict.amount for conflict in conflicts] == [100, 250]
+    assert len(conflicts) == 2
+
+    refined = service.refine(
+        plan,
+        {
+            conflicts[0].conflict_id: {
+                "action": "SELECT_ROW",
+                "selected_row": 2,
+            },
+            conflicts[1].conflict_id: {
+                "action": "SELECT_ROW",
+                "selected_row": 3,
+            },
+        },
+    )
+
+    assert not refined.conflicts
+    assert [(item.target_row, item.amount) for item in refined.items] == [
+        (2, 100),
+        (3, 250),
+    ]
+
+    result = service.apply(refined, {})
+
+    assert result.posted_source_items == 2
+    assert result.written_cells == 2
+    workbook = load_workbook(target, data_only=False)
+    try:
+        sheet = workbook["T07 26"]
+        column = POSTING_FEE_COLUMNS["VTN"]
+        assert sheet.cell(2, column).value == 100
+        assert sheet.cell(3, column).value == 250
+    finally:
+        workbook.close()
+
+
+def test_posting_sums_repeated_container_only_after_same_sqt_is_selected(
+    tmp_path: Path,
+) -> None:
+    ready = tmp_path / "ready.json"
+    target = tmp_path / "BK 2026.xlsx"
+    runtime_dir = tmp_path / "Excel"
+    container = "DRYU3026167"
+    _save_ready(
+        ready,
+        [
+            [container, "BL-01", "VTN", "ST", 100],
+            [container, "BL-02", "VTN", "ST", 250],
+        ],
+    )
+    workbook = Workbook()
+    sheet = _new_posting_sheet(workbook, "T07 26")
+    _add_posting_row(sheet, 2, container, sqt=701)
+    _add_posting_row(sheet, 3, container, sqt=702)
+    workbook.save(target)
+    workbook.close()
+
+    service = _posting_service(ready, target, runtime_dir)
+    plan = service.analyze(sheet_name="T07 26")
+    conflicts = [
+        conflict
+        for conflict in plan.conflicts
+        if conflict.conflict_type is ConflictType.REPEATED_SOURCE_CONTAINER
+    ]
+    refined = service.refine(
+        plan,
+        {
+            conflict.conflict_id: {
+                "action": "SELECT_ROW",
+                "selected_row": 2,
+            }
+            for conflict in conflicts
+        },
+    )
+
+    assert not refined.conflicts
+    assert len(refined.items) == 1
+    assert refined.items[0].source_indices == [0, 1]
+    assert refined.items[0].amount == 350
+    assert refined.items[0].target_row == 2
+
+    result = service.apply(refined, {})
+
+    assert result.posted_source_items == 2
+    assert result.written_cells == 1
+    workbook = load_workbook(target, data_only=False)
+    try:
+        sheet = workbook["T07 26"]
+        column = POSTING_FEE_COLUMNS["VTN"]
+        assert sheet.cell(2, column).value == 350
+        assert sheet.cell(3, column).value is None
+    finally:
+        workbook.close()
+
+
+def test_posting_requires_confirmation_for_repeated_container_with_one_bk_row(
+    tmp_path: Path,
+) -> None:
+    ready = tmp_path / "ready.json"
+    target = tmp_path / "BK 2026.xlsx"
+    runtime_dir = tmp_path / "Excel"
+    container = "DRYU3026167"
+    _save_ready(
+        ready,
+        [
+            [container, "BL-01", "VTN", "ST", 100],
+            [container, "BL-02", "VTN", "ST", 250],
+        ],
+    )
+    workbook = Workbook()
+    sheet = _new_posting_sheet(workbook, "T07 26")
+    _add_posting_row(sheet, 2, container, sqt=701)
+    workbook.save(target)
+    workbook.close()
+
+    service = _posting_service(ready, target, runtime_dir)
+    plan = service.analyze(sheet_name="T07 26")
+    conflicts = [
+        conflict
+        for conflict in plan.conflicts
+        if conflict.conflict_type is ConflictType.REPEATED_SOURCE_CONTAINER
+    ]
+
+    assert len(conflicts) == 2
+    assert [conflict.amount for conflict in conflicts] == [100, 250]
+    assert [candidate.sqt for candidate in conflicts[0].row_candidates] == [701]
+    assert all(item.target_row is None for item in plan.items)
+
+    refined = service.refine(
+        plan,
+        {
+            conflicts[0].conflict_id: {
+                "action": "SELECT_ROW",
+                "selected_row": 2,
+            },
+            conflicts[1].conflict_id: {"action": "SKIP"},
+        },
+    )
+
+    assert not refined.conflicts
+    result = service.apply(refined, {})
+
+    assert result.posted_source_items == 1
+    assert result.skipped_source_items == 1
+    assert result.written_cells == 1
+    workbook = load_workbook(target, data_only=False)
+    try:
+        assert workbook["T07 26"].cell(
+            2, POSTING_FEE_COLUMNS["VTN"]
+        ).value == 100
     finally:
         workbook.close()
 

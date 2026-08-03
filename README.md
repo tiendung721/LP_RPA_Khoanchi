@@ -23,6 +23,9 @@ Bước 1 hoặc chọn JSON thủ công.
   `HH:mm ngày dd/MM/yyyy`.
 - Bước 3 đồng bộ các SQT mới từ workbook Hàng ngày và nhập khoản chi của
   file JSON hiện hành đã xác nhận vào workbook BK.
+- Bước 4 cho chọn sheet BK, tổng hợp các dòng theo SQT, chọn nhiều SQT và gọi
+  BAT riêng để chạy PAD nhập khoản chi lên phần mềm quyết toán. Dòng `Đã nhập`
+  vẫn được phép chạy lại.
 - Mọi lần ghi BK đều dùng backup, working copy, kiểm tra lại và thay file
   nguyên tử; tác vụ chạy nền để không khóa giao diện.
 - Dòng thiếu container nhưng có B/L luôn có nút **Load số cont** để mở Custom
@@ -86,6 +89,11 @@ Database, Logs và cây dữ liệu nội bộ bên dưới `Output\_system`.
 
 - **File Hàng ngày trên LAN** (`.xlsx` hoặc `.xlsm`).
 - **File BK Tổng hợp cá nhân** (`.xlsx` hoặc `.xlsm`).
+
+Để dùng Bước 4, chọn thêm **BAT RPA nhập quyết toán**. Phần mềm luôn ghi dữ liệu
+PAD vào `Output\_system\RPA\rpa_input_selection.json`. Hợp đồng dữ liệu và lệnh
+PAD gọi sau khi web lưu thành công được mô tả tại
+[`docs/RPA_FLOW4_CONTRACT.md`](docs/RPA_FLOW4_CONTRACT.md).
 
 Nút **Kiểm tra cấu hình** chỉ đọc workbook/bản sao tạm, không lưu thử vào file
 gốc. Định dạng Excel cũ `.xls` không được hỗ trợ.
@@ -204,6 +212,7 @@ khoanchi_pm_project\                 (hoặc thư mục chứa file .exe)
         │   ├── Temp\
         │   ├── Backup\
         │   └── Reports\
+        └── RPA\
 ```
 
 Khi cả bundle được chuyển vị trí, ứng dụng tự cập nhật `data_root`, `Output`
@@ -214,6 +223,7 @@ bundle do người dùng tự chọn vẫn được giữ nguyên.
 - `Output\_system\Excel\Temp`: snapshot nguồn và working copy ngắn hạn.
 - `Output\_system\Excel\Backup`: backup BK tạo ngay trước mỗi lần ghi.
 - `Output\_system\Excel\Reports`: vùng dành cho báo cáo xử lý Excel.
+- `Output\_system\RPA`: JSON đầu vào riêng cho từng lượt chạy PAD.
 - `Output\<tên bất kỳ>.json`: có thể là kết quả container nếu nội dung đúng
   contract `{"containers": [...]}`; tên file không được dùng để phân loại.
 - `Database`: metadata batch và trạng thái ứng dụng.

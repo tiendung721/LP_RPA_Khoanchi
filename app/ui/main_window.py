@@ -30,6 +30,7 @@ from .log_page import LogPage
 from .review_window import ReviewWindow
 from .settings_page import SettingsPage
 from .workflow_page import WorkflowPage
+from .rpa_expense_dialog import RpaSqtSelectionDialog
 from .excel_dialogs import (
     ConflictResolutionDialog,
     MonthSelectionDialog,
@@ -99,6 +100,7 @@ class MainWindow(QMainWindow):
         excel_configuration_service: Any | None = None,
         excel_run_repository: Any | None = None,
         container_load_controller: Any | None = None,
+        rpa_expense_controller: Any | None = None,
     ) -> None:
         if isinstance(controller, QWidget) and parent is None:
             parent = controller
@@ -135,6 +137,10 @@ class MainWindow(QMainWindow):
         self._container_load_controller = (
             container_load_controller
             or _attribute(controller, "container_load_controller")
+        )
+        self._rpa_expense = (
+            rpa_expense_controller
+            or _attribute(controller, "rpa_expense_controller")
         )
         self._excel_operation: str | None = None
         self._excel_context: str | None = None
@@ -198,19 +204,25 @@ class MainWindow(QMainWindow):
 
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(220)
-        sidebar.setStyleSheet("QFrame#sidebar { background: #12233F; }")
+        sidebar.setFixedWidth(232)
+        sidebar.setStyleSheet(
+            "QFrame#sidebar {"
+            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, "
+            "stop:0 #142B4A, stop:1 #0E1F37);"
+            "}"
+        )
         sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(12, 18, 12, 14)
+        sidebar_layout.setContentsMargins(13, 20, 13, 15)
         brand = QLabel("TRỢ LÝ DỮ LIỆU\nQUYẾT TOÁN")
         brand.setStyleSheet(
-            "color: white; font-size: 13pt; font-weight: 700; padding: 4px 8px 14px 8px;"
+            "color: white; font-size: 13pt; font-weight: 700; "
+            "letter-spacing: 0.5px; padding: 4px 9px 16px 9px;"
         )
         sidebar_layout.addWidget(brand)
         self.navigation = QListWidget()
         self.navigation.setObjectName("navigation")
         self.navigation.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        for text in ("Quy trình", "Lịch sử", "Cài đặt", "Nhật ký"):
+        for text in ("Thao tác", "Lịch sử", "Cài đặt", "Nhật ký"):
             item = QListWidgetItem(text)
             item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
             self.navigation.addItem(item)
@@ -219,7 +231,9 @@ class MainWindow(QMainWindow):
         self.watcher_status.setObjectName("watcherStatus")
         self.watcher_status.setWordWrap(True)
         self.watcher_status.setStyleSheet(
-            "color: #B9C8DC; background: #1B3152; border-radius: 6px; padding: 8px;"
+            "color: #C7D5E8; background: rgba(255, 255, 255, 0.07); "
+            "border: 1px solid rgba(255, 255, 255, 0.08); "
+            "border-radius: 8px; padding: 9px;"
         )
         sidebar_layout.addWidget(self.watcher_status)
         shell.addWidget(sidebar)
@@ -251,6 +265,9 @@ class MainWindow(QMainWindow):
         )
         self.workflow_page.sync_payment_requested.connect(
             self.start_payment_sync
+        )
+        self.workflow_page.run_rpa_expense_requested.connect(
+            self.start_rpa_expense
         )
 
         self.history_page.refresh_requested.connect(self.refresh_history)
@@ -295,6 +312,16 @@ class MainWindow(QMainWindow):
             self._safe_connect(excel_tasks, "completed", self._excel_completed)
             self._safe_connect(excel_tasks, "failed", self._excel_failed)
             self._safe_connect(excel_tasks, "finished", self._excel_finished)
+
+        rpa = self._rpa_expense
+        if rpa is not None:
+            self._safe_connect(rpa, "started", self._rpa_started)
+            self._safe_connect(rpa, "progress", self._rpa_progress)
+            self._safe_connect(rpa, "sheets_ready", self._rpa_sheets_ready)
+            self._safe_connect(rpa, "plan_ready", self._rpa_plan_ready)
+            self._safe_connect(rpa, "launched", self._rpa_launched)
+            self._safe_connect(rpa, "failed", self._rpa_failed)
+            self._safe_connect(rpa, "finished", self._rpa_finished)
 
     @staticmethod
     def _safe_connect(owner: Any, signal_name: str, slot: Callable[..., Any]) -> bool:
@@ -529,6 +556,135 @@ class MainWindow(QMainWindow):
             )
         except Exception as exc:
             self._show_excel_error(exc, operation="payment_sync")
+
+    def _missing_rpa_configuration(self) -> bool:
+        bk = str(
+            _attribute(self._settings, "bk_workbook_path", default="") or ""
+        ).strip()
+        bat = str(
+            _attribute(
+                self._settings,
+                "rpa_expense_bat_path",
+                default="",
+            )
+            or ""
+        ).strip()
+        if bk and bat:
+            return False
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Icon.Warning)
+        message.setWindowTitle("Chưa cấu hình luồng RPA")
+        message.setText(
+            "Hãy cấu hình file BK và BAT RPA nhập quyết toán trong trang Cài đặt."
+        )
+        open_settings = message.addButton(
+            "Mở Cài đặt", QMessageBox.ButtonRole.AcceptRole
+        )
+        message.addButton("Đóng", QMessageBox.ButtonRole.RejectRole)
+        message.exec()
+        if message.clickedButton() is open_settings:
+            self.navigation.setCurrentRow(2)
+        return True
+
+    @Slot()
+    def start_rpa_expense(self) -> None:
+        if self._missing_rpa_configuration():
+            return
+        if self._rpa_expense is None:
+            QMessageBox.warning(
+                self,
+                "Chưa thể chạy RPA",
+                "Dịch vụ chuẩn bị dữ liệu RPA chưa được khởi tạo.",
+            )
+            return
+        if self._excel_tasks is not None and self._excel_tasks.is_busy:
+            QMessageBox.information(
+                self,
+                "Excel đang được sử dụng",
+                "Hãy chờ tác vụ Excel hiện tại hoàn tất rồi chạy RPA.",
+            )
+            return
+        try:
+            self._rpa_expense.load_sheets()
+        except Exception as exc:
+            self._rpa_failed(exc)
+
+    @Slot(str)
+    def _rpa_started(self, phase: str) -> None:
+        labels = {
+            "sheets": "Đang đọc danh sách sheet BK…",
+            "analysis": "Đang tổng hợp dữ liệu theo SQT…",
+            "launch": "Đang tạo dữ liệu và khởi chạy PAD…",
+        }
+        message = labels.get(phase, "Đang chuẩn bị dữ liệu RPA…")
+        self.workflow_page.set_rpa_running(message)
+        self.statusBar().showMessage(message)
+
+    @Slot(str)
+    def _rpa_progress(self, message: str) -> None:
+        self.workflow_page.set_rpa_progress(message)
+        self.statusBar().showMessage(message)
+
+    @Slot(object)
+    def _rpa_sheets_ready(self, candidates: Any) -> None:
+        dialog = MonthSelectionDialog(
+            list(candidates),
+            self,
+            title="Chọn sheet BK chạy RPA nhập quyết toán",
+            preselect_first=False,
+            show_recommendations=False,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self.workflow_page.set_rpa_result("Đã hủy trước khi chọn sheet.")
+            return
+        sheet_name = dialog.selected_sheet_name
+        if not sheet_name:
+            return
+        try:
+            self._rpa_expense.analyze_sheet(sheet_name)
+        except Exception as exc:
+            self._rpa_failed(exc)
+
+    @Slot(object)
+    def _rpa_plan_ready(self, plan: Any) -> None:
+        dialog = RpaSqtSelectionDialog(plan, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self.workflow_page.set_rpa_result("Đã hủy trước khi chạy PAD.")
+            return
+        try:
+            self._rpa_expense.launch(plan, dialog.selected_sqt)
+        except Exception as exc:
+            self._rpa_failed(exc)
+
+    @Slot(object)
+    def _rpa_launched(self, result: Any) -> None:
+        self.workflow_page.set_rpa_result(result)
+        self.statusBar().showMessage(
+            str(_attribute(result, "message", default="Đã khởi chạy PAD.")),
+            10000,
+        )
+        QMessageBox.information(
+            self,
+            "Đã khởi chạy RPA",
+            f"{_attribute(result, 'message', default='Đã khởi chạy PAD.')}\n\n"
+            f"File dữ liệu: {_attribute(result, 'selection_path', default='')}\n"
+            "PAD chỉ đánh dấu “Đã nhập” sau khi thao tác Lưu trên web thành công.",
+        )
+
+    @Slot(object)
+    def _rpa_failed(self, error: Any) -> None:
+        LOGGER.error("Luồng RPA thất bại: %s", error)
+        self.workflow_page.set_rpa_result(f"Lỗi: {error}")
+        QMessageBox.critical(
+            self,
+            "Không thể chạy RPA",
+            f"{error}\n\nHãy kiểm tra file BK đã đóng và cấu hình BAT RPA.",
+        )
+
+    @Slot(str)
+    def _rpa_finished(self, _phase: str) -> None:
+        self.workflow_page.set_rpa_idle()
+        self.statusBar().showMessage("Sẵn sàng", 3000)
 
     @Slot(str)
     def _excel_started(self, operation: str) -> None:
@@ -976,10 +1132,6 @@ class MainWindow(QMainWindow):
                 f"Sheet: {_attribute(result, 'sheet_name', default='—')}"
             )
             title = "Nhập khoản chi hoàn tất"
-        if operation != "sync":
-            QMessageBox.information(self, title, detail)
-            return
-
         completion_message = QMessageBox(self)
         completion_message.setIcon(QMessageBox.Icon.Information)
         completion_message.setWindowTitle(title)
@@ -1004,7 +1156,7 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _excel_finished(self, operation: str) -> None:
         if self._excel_context == "configuration":
-            self.settings_page._validate_form()
+            self.settings_page.set_checking(False)
         else:
             self.workflow_page.set_excel_idle(operation)
         self.statusBar().showMessage("Sẵn sàng", 3000)
@@ -1148,6 +1300,16 @@ class MainWindow(QMainWindow):
                     container_gpt_bat,
                     settings_data.get("output_dir"),
                 )
+            rpa_expense_bat = str(
+                settings_data.get("rpa_expense_bat_path") or ""
+            ).strip()
+            if rpa_expense_bat:
+                from app.rpa_expense import RpaExpenseBatLauncher
+
+                candidate_settings = self._build_settings(settings_data)
+                RpaExpenseBatLauncher(
+                    candidate_settings
+                ).validate_configuration()
         except Exception as exc:
             self.settings_page.show_check_result(False, str(exc))
             return
@@ -1174,7 +1336,7 @@ class MainWindow(QMainWindow):
             candidate_settings = self._build_settings(settings_data)
             service = ExcelConfigurationService(candidate_settings)
             self._excel_context = "configuration"
-            self.settings_page.check_button.setEnabled(False)
+            self.settings_page.set_checking(True)
             self._excel_tasks.submit(
                 "sync",
                 service.validate,
@@ -1182,6 +1344,7 @@ class MainWindow(QMainWindow):
             )
         except Exception as exc:
             self._excel_context = None
+            self.settings_page.set_checking(False)
             self.settings_page.show_check_result(False, str(exc))
 
     def _launch_assistant(self, settings: Any) -> None:
