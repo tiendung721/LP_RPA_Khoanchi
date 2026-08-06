@@ -23,6 +23,12 @@ Bước 1 hoặc chọn JSON thủ công.
   `HH:mm ngày dd/MM/yyyy`.
 - Bước 3 đồng bộ các SQT mới từ workbook Hàng ngày và nhập khoản chi của
   file JSON hiện hành đã xác nhận vào workbook BK.
+- Khi nhập khoản chi vào một sheet tháng, ứng dụng đối chiếu sheet đó và hai
+  tháng liền trước. Dòng kế hoạch tháng cũ được mang sang đúng một lần, chỉ giữ
+  12 trường thông tin lô hàng; phí và hóa đơn mới tiếp tục ghi trên cùng dòng.
+- Container xuất hiện ở nhiều tháng/SQT phải được chọn đúng sheet và dòng nguồn.
+  Nhiều dòng JSON cùng nhắm một ô phí không được cộng; người dùng chọn đúng một
+  dòng để ghi, còn ô đã có giá trị chỉ cho giữ nguyên, ghi đè hoặc bỏ qua.
 - Bước 4 cho chọn sheet BK, tổng hợp các dòng theo SQT, chọn nhiều SQT và gọi
   BAT riêng để chạy PAD nhập khoản chi lên phần mềm quyết toán. Dòng `Đã nhập`
   vẫn được phép chạy lại.
@@ -129,22 +135,25 @@ Các khóa khác trong `Preferences` được giữ nguyên.
 
 ## Hợp đồng JSON
 
-Ứng dụng chỉ hỗ trợ schema:
+Ứng dụng chỉ hỗ trợ một schema v1 duy nhất:
 
 ```json
 {
   "v": 1,
   "d": [
-    ["DRYU3026167", null, "VTN", "CV", 13554000]
+    ["DRYU3026167", null, "VTN", "CV", "HD-130", "Vận tải ABC", 13554000]
   ]
 }
 ```
 
-Root chỉ có `v` và `d`. Mỗi dòng trong `d` có đúng năm vị trí:
+Root chỉ có `v` và `d`. Mỗi dòng trong `d` có đúng bảy vị trí:
 
 ```text
-[container, bl, fee, rule, amount]
+[container, bl, fee, rule, invoice_no, carrier, amount]
 ```
+
+Định dạng v1 cũ gồm năm vị trí và mọi định dạng sáu vị trí đều không được hỗ
+trợ.
 
 Không dùng các root `metadata`, `du_lieu_boc_tach`, `canh_bao` hoặc
 `raw_data`.
@@ -162,8 +171,8 @@ tra ISO 6346. Khi file ổn định, popup tự mở để xem số container v�
 được phân bổ:
 
 - Một container thay trực tiếp dòng gốc.
-- Nhiều container thay dòng gốc bằng nhiều dòng, giữ nguyên B/L, loại phí và
-  quy tắc.
+- Nhiều container thay dòng gốc bằng nhiều dòng, giữ nguyên B/L, loại phí,
+  quy tắc, số HĐ và bên vận tải.
 - Khoản tiền nguyên không âm được chia bằng `divmod`; phần dư cộng lần lượt từ
   dòng đầu nên tổng sau chia luôn bằng tổng ban đầu.
 - Nếu khoản tiền không hợp lệ, popup vẫn hiển thị nhưng nút **Xác nhận** bị

@@ -44,6 +44,9 @@ def test_v2_database_is_migrated_transactionally_to_excel_schema(
     assert database.query_one(
         "SELECT name FROM sqlite_master WHERE name = 'expense_posting_items'"
     )
+    assert database.query_one(
+        "SELECT name FROM sqlite_master WHERE name = 'expense_carry_forwards'"
+    )
     history_index = database.query_one(
         """
         SELECT sql FROM sqlite_master
@@ -58,6 +61,19 @@ def test_v2_database_is_migrated_transactionally_to_excel_schema(
         WHERE type = 'index' AND name = 'ux_expense_posting_success_source'
         """
     ) is None
+    columns = {
+        row["name"]
+        for row in database.query_all("PRAGMA table_info(expense_posting_items)")
+    }
+    assert {
+        "invoice_no",
+        "invoice_selected",
+        "invoice_target_column",
+        "invoice_target_cell",
+        "invoice_value_before",
+        "invoice_value_after",
+        "invoice_action",
+    }.issubset(columns)
     database.close()
 
 
@@ -124,6 +140,13 @@ def test_posting_repository_round_trips_items_and_filters_successful_sources(
                 "value_before": {"kind": "empty", "value": None},
                 "value_after": 1_250_000,
                 "action": "WRITE",
+                "invoice_no": "INV-001",
+                "invoice_selected": "INV-001",
+                "invoice_target_column": 18,
+                "invoice_target_cell": "R42",
+                "invoice_value_before": None,
+                "invoice_value_after": "INV-001",
+                "invoice_action": "OVERWRITE",
                 "status": "POSTED",
             },
             {
@@ -144,6 +167,11 @@ def test_posting_repository_round_trips_items_and_filters_successful_sources(
     assert len(records) == 2
     assert records[0].target_cell == "Q42"
     assert records[0].value_before == {"kind": "empty", "value": None}
+    assert records[0].invoice_no == "INV-001"
+    assert records[0].invoice_selected == "INV-001"
+    assert records[0].invoice_target_cell == "R42"
+    assert records[0].invoice_value_after == "INV-001"
+    assert records[0].invoice_action == "OVERWRITE"
     assert repository.successful_source_indices("e" * 64) == {0, 1}
     assert repository.batch_has_successful_items("e" * 64)
     assert repository.is_source_item_posted("e" * 64, 1)
@@ -177,4 +205,49 @@ def test_posting_history_allows_multiple_successful_reposts(
     assert postings.successful_source_indices("1" * 64) == {4}
     latest = postings.latest_successful_items("1" * 64)
     assert [item.id for item in latest] == [retry.id]
+    database.close()
+
+
+def test_posting_repository_round_trips_carry_forward_mapping(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "app_state.db")
+    repository = ExpensePostingRepository(database)
+    workbook = tmp_path / "BK 2026.xlsx"
+
+    created = repository.save_carry_forward(
+        workbook_path=workbook,
+        source_sheet="T06 26",
+        source_row=28,
+        source_sqt=619,
+        container="DRYU3026167",
+        source_signature="a" * 64,
+        target_sheet="T07 26",
+        target_row=40,
+    )
+    loaded = repository.get_carry_forward(
+        workbook_path=workbook,
+        source_sheet="T06 26",
+        source_row=28,
+        source_sqt=619,
+        container="DRYU3026167",
+        target_sheet="T07 26",
+    )
+
+    assert loaded == created
+    assert loaded is not None
+    assert loaded.target_row == 40
+    updated = repository.save_carry_forward(
+        workbook_path=workbook,
+        source_sheet="T06 26",
+        source_row=28,
+        source_sqt=619,
+        container="DRYU3026167",
+        source_signature="b" * 64,
+        target_sheet="T07 26",
+        target_row=41,
+    )
+    assert updated.id == created.id
+    assert updated.target_row == 41
+    assert updated.source_signature == "b" * 64
     database.close()

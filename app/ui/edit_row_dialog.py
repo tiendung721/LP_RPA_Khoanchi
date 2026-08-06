@@ -34,11 +34,13 @@ try:
     from app.services.validation_service import (
         normalize_bl as _core_normalize_bl,
         normalize_container as _core_normalize_container,
+        normalize_optional_text as _core_normalize_optional_text,
         parse_amount as _core_parse_amount,
     )
 except ImportError:
     _core_normalize_bl = None
     _core_normalize_container = None
+    _core_normalize_optional_text = None
     _core_parse_amount = None
 
 
@@ -57,6 +59,13 @@ def normalize_bl(value: str) -> str | None:
     if _core_normalize_bl is not None:
         return _core_normalize_bl(value)
     normalized = re.sub(r"\s+", " ", value.strip()).upper()
+    return normalized or None
+
+
+def normalize_optional_text(value: str) -> str | None:
+    if _core_normalize_optional_text is not None:
+        return _core_normalize_optional_text(value)
+    normalized = re.sub(r"\s+", " ", value.strip())
     return normalized or None
 
 
@@ -100,7 +109,7 @@ class EditRowDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(title or ("Thêm dòng dữ liệu" if row is None else "Sửa dòng dữ liệu"))
         self.setModal(True)
-        self.resize(610, 480)
+        self.resize(640, 560)
         self._editing = row is not None
         self._original_rule: Any = None
         self._validator = validator
@@ -163,6 +172,20 @@ class EditRowDialog(QDialog):
         form.addRow("Quy tắc tiền:", self.rule_combo)
         form.setRowVisible(self.rule_combo, not self._editing)
 
+        self.invoice_no_edit = QLineEdit()
+        self.invoice_no_edit.setObjectName("invoiceNoEdit")
+        self.invoice_no_edit.setPlaceholderText("Để trống nếu chưa xác định")
+        self.invoice_no_edit.setMaxLength(200)
+        self.invoice_no_edit.setClearButtonEnabled(True)
+        form.addRow("Số HĐ:", self.invoice_no_edit)
+
+        self.carrier_edit = QLineEdit()
+        self.carrier_edit.setObjectName("carrierEdit")
+        self.carrier_edit.setPlaceholderText("Để trống nếu chưa xác định")
+        self.carrier_edit.setMaxLength(300)
+        self.carrier_edit.setClearButtonEnabled(True)
+        form.addRow("Bên vận tải:", self.carrier_edit)
+
         amount_box = QVBoxLayout()
         amount_box.setContentsMargins(0, 0, 0, 0)
         amount_box.setSpacing(5)
@@ -206,6 +229,8 @@ class EditRowDialog(QDialog):
         self.bl_edit.textChanged.connect(self._validate_realtime)
         self.fee_combo.currentIndexChanged.connect(self._validate_realtime)
         self.rule_combo.currentIndexChanged.connect(self._validate_realtime)
+        self.invoice_no_edit.textChanged.connect(self._validate_realtime)
+        self.carrier_edit.textChanged.connect(self._validate_realtime)
         self.amount_edit.textChanged.connect(self._validate_realtime)
         self.amount_edit.editingFinished.connect(self._format_amount_on_finish)
         self.button_box.accepted.connect(self._accept_row)
@@ -218,6 +243,12 @@ class EditRowDialog(QDialog):
         self._select_combo_data(self.fee_combo, value.fee)
         self._original_rule = value.rule
         self._select_combo_data(self.rule_combo, value.rule)
+        self.invoice_no_edit.setText(
+            value.invoice_no if isinstance(value.invoice_no, str) else ""
+        )
+        self.carrier_edit.setText(
+            value.carrier if isinstance(value.carrier, str) else ""
+        )
         valid_amount = (
             value.amount
             if isinstance(value.amount, int) and not isinstance(value.amount, bool) and value.amount >= 0
@@ -254,6 +285,8 @@ class EditRowDialog(QDialog):
             fee=self.fee_combo.currentData(),
             rule=self._original_rule if self._editing else self.rule_combo.currentData(),
             amount=amount,
+            invoice_no=normalize_optional_text(self.invoice_no_edit.text()),
+            carrier=normalize_optional_text(self.carrier_edit.text()),
         )
         return row, amount_error
 
@@ -355,7 +388,7 @@ class EditRowDialog(QDialog):
         """Trả về bản sao dòng đã lưu (hoặc dữ liệu hợp lệ đang nhập)."""
 
         if self._result_row is not None:
-            return ReviewRow(*self._result_row.as_array())
+            return ReviewRow.from_sequence(self._result_row.as_array())
         row, error = self._collect_row()
         if error:
             raise ValueError(error)

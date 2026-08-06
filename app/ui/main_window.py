@@ -960,7 +960,9 @@ class MainWindow(QMainWindow):
             }
             if (
                 operation == "posting"
-                and selector_actions.intersection({"SELECT_ROW", "SELECT_FEE"})
+                and selector_actions.intersection(
+                    {"SELECT_ROW", "SELECT_FEE", "SELECT_INVOICE"}
+                )
             ):
                 self._excel_tasks.refine_plan(
                     plan,
@@ -1002,6 +1004,28 @@ class MainWindow(QMainWindow):
 
         source_sheet = _attribute(plan, "source_sheet", default="—")
         target_sheet = _attribute(plan, "target_sheet", default="—")
+        target_plans = _attribute(plan, "targets", default={}) or {}
+        target_sections: list[str] = []
+        for target_type in ("HP", "NAM"):
+            target = _attribute(target_plans, target_type, default=None)
+            if target is None:
+                continue
+            created = bool(_attribute(target, "sheet_to_create", default=False))
+            template = _attribute(target, "template_sheet", default="—")
+            section = (
+                f"{_attribute(target, 'sheet_name', default=target_type)}\n"
+                f"- Sheet mới: {'Có' if created else 'Không'}\n"
+            )
+            if created:
+                section += f"- Sheet mẫu: {template}\n"
+            section += (
+                f"- Dòng mới: {_attribute(target, 'new_count', default=0)}\n"
+                f"- Cập nhật: {_attribute(target, 'update_count', default=0)}\n"
+                f"- Không đổi: {_attribute(target, 'unchanged_count', default=0)}\n"
+                f"- Xung đột: {_attribute(target, 'conflict_count', default=0)}"
+            )
+            target_sections.append(section)
+        target_detail = "\n\n".join(target_sections)
         updates = int(_attribute(plan, "update_count", default=0) or 0)
         unchanged = int(_attribute(plan, "unchanged_count", default=0) or 0)
         new_count = int(_attribute(plan, "new_count", default=0) or 0)
@@ -1031,6 +1055,7 @@ class MainWindow(QMainWindow):
                 f"Sheet BK: {source_sheet}\n"
                 f"Sheet Thanh toán: {target_sheet}\n\n"
                 f"{creation_detail}"
+                f"{target_detail}\n\n"
                 f"Cập nhật: {updates} dòng\n"
                 f"Không đổi: {unchanged} dòng\n"
                 f"Dòng mới được chọn: {selected_new_count}/{new_count}\n"
@@ -1083,8 +1108,26 @@ class MainWindow(QMainWindow):
             _attribute(result, "message", default="Hoàn tất xử lý Excel.") or ""
         )
         if operation == "payment_sync":
+            result_targets = _attribute(result, "target_results", default={}) or {}
+            result_sections: list[str] = []
+            for target_type in ("HP", "NAM"):
+                target_result = _attribute(result_targets, target_type, default=None)
+                if target_result is None:
+                    continue
+                result_sections.append(
+                    (
+                        f"{_attribute(target_result, 'sheet_name', default=target_type)}\n"
+                        f"- Đã tạo mới: {'Có' if bool(_attribute(target_result, 'sheet_created', default=False)) else 'Không'}\n"
+                        f"- Đã cập nhật: {_attribute(target_result, 'updated_rows', default=0)}\n"
+                        f"- Đã thêm: {_attribute(target_result, 'inserted_rows', default=0)}\n"
+                        f"- Không đổi: {_attribute(target_result, 'unchanged_rows', default=0)}\n"
+                        f"- Bỏ qua: {_attribute(target_result, 'skipped_rows', default=0)}"
+                    )
+                )
+            result_target_detail = "\n\n".join(result_sections)
             detail = (
                 f"{message}\n\n"
+                f"{result_target_detail}\n\n"
                 f"Sheet BK: {_attribute(result, 'source_sheet_name', default='—')}\n"
                 f"Sheet Thanh toán: {_attribute(result, 'sheet_name', default='—')}\n"
                 f"Đã tạo sheet mới: "

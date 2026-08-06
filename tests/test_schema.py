@@ -16,8 +16,8 @@ def test_parse_valid_json_object_keeps_row_order() -> None:
     raw = {
         "v": 1,
         "d": [
-            ["DRYU3026167", None, "VTN", "CV", 13_554_000],
-            [None, "BL123456789", "CB", "HD", 27_500_000],
+            ["DRYU3026167", None, "VTN", "CV", None, None, 13_554_000],
+            [None, "BL123456789", "CB", "HD", None, None, 27_500_000],
         ],
     }
 
@@ -26,6 +26,31 @@ def test_parse_valid_json_object_keeps_row_order() -> None:
     assert document.v == 1
     assert [row.to_list() for row in document.rows] == raw["d"]
     assert list(document_to_dict(document)) == ["v", "d"]
+
+
+def test_parse_v1_keeps_invoice_and_carrier_fields() -> None:
+    raw = {
+        "v": 1,
+        "d": [
+            [
+                "DRYU3026167",
+                None,
+                "VTN",
+                "CV",
+                "000130/HD",
+                "Công ty vận tải ABC",
+                13_554_000,
+            ]
+        ],
+    }
+
+    document = parse_document(raw)
+
+    assert document.v == 1
+    assert document.rows[0].invoice_no == "000130/HD"
+    assert document.rows[0].carrier == "Công ty vận tải ABC"
+    assert document.rows[0].amount == 13_554_000
+    assert document_to_dict(document) == raw
 
 
 def test_parse_real_custom_assistant_fixture() -> None:
@@ -60,7 +85,7 @@ def test_root_must_have_exact_keys(raw: object) -> None:
     assert exc_info.value.code == "root_keys"
 
 
-@pytest.mark.parametrize("version", [0, 2, True, 1.0, "1"])
+@pytest.mark.parametrize("version", [0, 2, 3, True, 1.0, "1"])
 def test_version_must_be_integer_one(version: object) -> None:
     with pytest.raises(SchemaError) as exc_info:
         parse_document({"v": version, "d": []})
@@ -78,12 +103,13 @@ def test_data_must_be_array(data: object) -> None:
     ("row", "code"),
     [
         (None, "row_not_array"),
-        (("A", None, "VTN", "CV", 1), "row_not_array"),
+        (("A", None, "VTN", "CV", None, None, 1), "row_not_array"),
         (["A", None, "VTN", "CV"], "row_length"),
         (["A", None, "VTN", "CV", 1, "extra"], "row_length"),
+        (["A", None, "VTN", "CV", None, None, 1, "extra"], "row_length"),
     ],
 )
-def test_each_row_must_be_five_element_array(row: object, code: str) -> None:
+def test_each_v1_row_must_be_seven_element_array(row: object, code: str) -> None:
     with pytest.raises(SchemaError) as exc_info:
         parse_document({"v": 1, "d": [row]})
     assert exc_info.value.code == code
@@ -99,7 +125,20 @@ def test_document_serializes_back_as_positional_arrays() -> None:
     assert document_to_dict(document) == {
         "v": 1,
         "d": [
-            ["DRYU3026167", None, "VTN", "CV", 13_554_000],
-            [None, "BL123", "CB", "HD", 27_500_000],
+            ["DRYU3026167", None, "VTN", "CV", None, None, 13_554_000],
+            [None, "BL123", "CB", "HD", None, None, 27_500_000],
         ],
     }
+
+
+def test_v1_rejects_six_field_rows() -> None:
+    with pytest.raises(SchemaError) as exc_info:
+        parse_document(
+            {
+                "v": 1,
+                "d": [["DRYU3026167", None, "VTN", "CV", "130", 1]],
+            }
+        )
+
+    assert exc_info.value.code == "row_length"
+    assert "7 phần tử" in str(exc_info.value)

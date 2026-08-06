@@ -22,6 +22,7 @@ try:
     from app.constants import (
         FEE_CATALOG as _CORE_FEE_CATALOG,
         RULE_CATALOG as _CORE_RULE_CATALOG,
+        SCHEMA_VERSION as _SCHEMA_VERSION,
         UNDETERMINED_RULE_LABEL as _UNDETERMINED_RULE_LABEL,
     )
 
@@ -59,6 +60,7 @@ except ImportError:
             ("GV", "Gộp các dòng phù hợp rồi lấy tiền cuối cùng"),
         ]
     )
+    _SCHEMA_VERSION = 1
 
 
 class RowStatus(str, Enum):
@@ -78,17 +80,48 @@ STATUS_LABELS: Final[dict[RowStatus, str]] = {
 
 @dataclass(slots=True)
 class ReviewRow:
-    """Biểu diễn nội bộ của một dòng schema mảng 5 vị trí."""
+    """Biểu diễn nội bộ của một dòng schema v1 gồm 7 vị trí."""
 
     cont: Any = None
     bl: Any = None
     fee: Any = "CXD"
     rule: Any = None
     amount: Any = None
+    invoice_no: Any = None
+    carrier: Any = None
     runtime_id: str = field(default_factory=lambda: uuid4().hex)
 
     def as_array(self) -> list[Any]:
-        return [self.cont, self.bl, self.fee, self.rule, self.amount]
+        return [
+            self.cont,
+            self.bl,
+            self.fee,
+            self.rule,
+            self.invoice_no,
+            self.carrier,
+            self.amount,
+        ]
+
+    @classmethod
+    def from_sequence(
+        cls,
+        value: Sequence[Any],
+        *,
+        runtime_id: str | None = None,
+    ) -> "ReviewRow":
+        values = list(value)
+        if len(values) != 7:
+            raise ValueError("Mỗi dòng dữ liệu phải có đúng 7 giá trị.")
+        return cls(
+            cont=values[0],
+            bl=values[1],
+            fee=values[2],
+            rule=values[3],
+            invoice_no=values[4],
+            carrier=values[5],
+            amount=values[6],
+            runtime_id=runtime_id or uuid4().hex,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,28 +177,34 @@ def coerce_review_row(value: Any) -> ReviewRow:
     """Chuyển dataclass/dict/list/object từ core thành ``ReviewRow``."""
 
     if isinstance(value, ReviewRow):
-        return ReviewRow(*value.as_array(), runtime_id=value.runtime_id)
+        return ReviewRow.from_sequence(value.as_array(), runtime_id=value.runtime_id)
     if isinstance(value, Mapping):
         return ReviewRow(
             _mapping_value(value, "cont", "container"),
             _mapping_value(value, "bl", "bill_of_lading", "bill"),
             _mapping_value(value, "fee", "fee_code", default="CXD"),
             _mapping_value(value, "rule", "rule_code"),
-            _mapping_value(value, "amount"),
+            amount=_mapping_value(value, "amount"),
+            invoice_no=_mapping_value(
+                value, "invoice_no", "invoice_number", "invoice"
+            ),
+            carrier=_mapping_value(
+                value, "carrier", "transport_provider", "transport"
+            ),
         )
     if is_dataclass(value):
         return coerce_review_row(asdict(value))
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         values = list(value)
-        if len(values) != 5:
-            raise ValueError("Mỗi dòng dữ liệu phải có đúng 5 giá trị.")
-        return ReviewRow(*values)
+        return ReviewRow.from_sequence(values)
     attrs = [
         getattr(value, "cont", getattr(value, "container", None)),
         getattr(value, "bl", getattr(value, "bill_of_lading", None)),
         getattr(value, "fee", getattr(value, "fee_code", "CXD")),
         getattr(value, "rule", getattr(value, "rule_code", None)),
         getattr(value, "amount", None),
+        getattr(value, "invoice_no", getattr(value, "invoice_number", None)),
+        getattr(value, "carrier", getattr(value, "transport_provider", None)),
     ]
     if any(hasattr(value, name) for name in ("cont", "container", "fee", "fee_code")):
         return ReviewRow(*attrs)
@@ -186,6 +225,10 @@ def validate_row(row: ReviewRow) -> RowValidation:
         errors.append("Mã loại cước không thuộc danh mục chính thức.")
     if row.rule is not None and (not isinstance(row.rule, str) or row.rule not in RULE_CATALOG):
         errors.append("Mã xử lý tiền không hợp lệ.")
+    if row.invoice_no is not None and not isinstance(row.invoice_no, str):
+        errors.append("Số HĐ phải là chuỗi hoặc null.")
+    if row.carrier is not None and not isinstance(row.carrier, str):
+        errors.append("Bên vận tải phải là chuỗi hoặc null.")
     if row.amount is not None:
         if isinstance(row.amount, bool) or not isinstance(row.amount, int):
             errors.append("Số tiền phải là số nguyên hoặc null.")
@@ -231,11 +274,13 @@ class ReviewTableModel(QAbstractTableModel):
     COLUMN_FEE_NAME = 4
     COLUMN_RULE = 5
     COLUMN_RULE_NAME = 6
-    COLUMN_AMOUNT = 7
-    COLUMN_STATUS = 8
-    COLUMN_MESSAGES = 9
-    COLUMN_LOOKUP_RESULT = 10
-    COLUMN_LOOKUP_ACTION = 11
+    COLUMN_INVOICE_NO = 7
+    COLUMN_CARRIER = 8
+    COLUMN_AMOUNT = 9
+    COLUMN_STATUS = 10
+    COLUMN_MESSAGES = 11
+    COLUMN_LOOKUP_RESULT = 12
+    COLUMN_LOOKUP_ACTION = 13
 
     ACTION_VISIBLE_ROLE = int(Qt.ItemDataRole.UserRole) + 10
     ACTION_ENABLED_ROLE = int(Qt.ItemDataRole.UserRole) + 11
@@ -250,6 +295,8 @@ class ReviewTableModel(QAbstractTableModel):
         "Tên loại cước",
         "Mã xử lý",
         "Diễn giải xử lý tiền",
+        "Số HĐ",
+        "Bên vận tải",
         "Số tiền cuối cùng (VND)",
         "Trạng thái",
         "Cảnh báo / lỗi",
@@ -346,7 +393,12 @@ class ReviewTableModel(QAbstractTableModel):
                 return QColor(WARNING_BG)
             return QColor(SUCCESS_BG)
         if role == Qt.ItemDataRole.ForegroundRole:
-            if column in (self.COLUMN_CONT, self.COLUMN_BL) and self._raw_value(
+            if column in (
+                self.COLUMN_CONT,
+                self.COLUMN_BL,
+                self.COLUMN_INVOICE_NO,
+                self.COLUMN_CARRIER,
+            ) and self._raw_value(
                 row, result, column, index.row()
             ) is None:
                 return QColor(MUTED_TEXT)
@@ -376,6 +428,8 @@ class ReviewTableModel(QAbstractTableModel):
             RULE_CATALOG.get(row.rule, "")
             if row.rule is None or isinstance(row.rule, str)
             else "",
+            row.invoice_no,
+            row.carrier,
             row.amount,
             result.status.value,
             "\n".join(result.messages),
@@ -404,7 +458,13 @@ class ReviewTableModel(QAbstractTableModel):
         if column == self.COLUMN_LOOKUP_ACTION:
             return "Hủy Load" if self._load_is_active(lookup) else "Load số cont"
         value = self._raw_value(row, result, column, source_row)
-        if column in (self.COLUMN_CONT, self.COLUMN_BL, self.COLUMN_RULE) and value is None:
+        if column in (
+            self.COLUMN_CONT,
+            self.COLUMN_BL,
+            self.COLUMN_RULE,
+            self.COLUMN_INVOICE_NO,
+            self.COLUMN_CARRIER,
+        ) and value is None:
             return "—"
         if column == self.COLUMN_AMOUNT:
             if value is None:
@@ -434,11 +494,11 @@ class ReviewTableModel(QAbstractTableModel):
 
     def row_at(self, row: int) -> ReviewRow:
         source = self._rows[row]
-        return ReviewRow(*source.as_array(), runtime_id=source.runtime_id)
+        return ReviewRow.from_sequence(source.as_array(), runtime_id=source.runtime_id)
 
     def rows(self) -> list[ReviewRow]:
         return [
-            ReviewRow(*row.as_array(), runtime_id=row.runtime_id)
+            ReviewRow.from_sequence(row.as_array(), runtime_id=row.runtime_id)
             for row in self._rows
         ]
 
@@ -464,7 +524,7 @@ class ReviewTableModel(QAbstractTableModel):
         return [row.as_array() for row in self._rows]
 
     def to_document(self) -> dict[str, Any]:
-        return {"v": 1, "d": self.rows_as_arrays()}
+        return {"v": _SCHEMA_VERSION, "d": self.rows_as_arrays()}
 
     def set_rows(self, rows: Iterable[Any], *, mark_dirty: bool = False) -> None:
         converted = [coerce_review_row(row) for row in rows]
@@ -614,7 +674,7 @@ class ReviewTableModel(QAbstractTableModel):
                 result = results[index]
                 results[index] = RowValidation(
                     result.errors,
-                    result.warnings + ("Dòng có đủ 5 giá trị trùng hoàn toàn với dòng khác.",),
+                    result.warnings + ("Dòng có đủ 7 giá trị trùng hoàn toàn với dòng khác.",),
                 )
 
         external = self._run_external_validator()
@@ -691,7 +751,7 @@ class ReviewTableModel(QAbstractTableModel):
 
 
 class ReviewFilterProxyModel(QSortFilterProxyModel):
-    """Proxy tìm container/B/L, lọc fee/trạng thái và sort an toàn."""
+    """Proxy tìm thông tin chứng từ, lọc fee/trạng thái và sort an toàn."""
 
     def __init__(self, parent: Any = None) -> None:
         super().__init__(parent)
@@ -758,7 +818,15 @@ class ReviewFilterProxyModel(QSortFilterProxyModel):
             bl = model.index(source_row, ReviewTableModel.COLUMN_BL, source_parent).data(
                 Qt.ItemDataRole.UserRole
             )
-            haystack = f"{cont or ''} {bl or ''}".casefold()
+            invoice_no = model.index(
+                source_row, ReviewTableModel.COLUMN_INVOICE_NO, source_parent
+            ).data(Qt.ItemDataRole.UserRole)
+            carrier = model.index(
+                source_row, ReviewTableModel.COLUMN_CARRIER, source_parent
+            ).data(Qt.ItemDataRole.UserRole)
+            haystack = (
+                f"{cont or ''} {bl or ''} {invoice_no or ''} {carrier or ''}"
+            ).casefold()
             if self._search_text not in haystack:
                 return False
         if self._fee:

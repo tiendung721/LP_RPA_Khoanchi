@@ -10,6 +10,7 @@ from app.services.file_stability import FileStabilityChecker
 
 from .daily_sync import SOURCE_HEADER_ALIASES, SYNC_FIELDS
 from .headers import HeaderResolver
+from .payment_sync import HPSheetProfile, NAMSheetProfile
 from .resolvers import MonthSheetService, YearResolver
 from .workbook import (
     ExcelLockService,
@@ -201,16 +202,20 @@ class ExcelConfigurationService:
                 )
             with self.lock_service.acquire(payment):
                 pass
-            payment_book = self.gateway.load(payment, read_only=True)
-            payment_sheets = [
-                name
+            payment_book = self.gateway.load(payment, read_only=False)
+            payment_sheets = {
+                parsed.sheet_type: name
                 for name in payment_book.sheetnames
-                if self.months.parse_target_sheet(name) is not None
-            ]
-            if not payment_sheets:
+                if (parsed := self.months.parse_payment_sheet(name)) is not None
+            }
+            missing_types = {"HP", "NAM"} - set(payment_sheets)
+            if missing_types:
                 raise ValueError(
-                    "File Thanh toán không có sheet dạng TMM YY."
+                    "File Thanh toán thiếu sheet mẫu: "
+                    + ", ".join(sorted(missing_types))
                 )
+            HPSheetProfile().resolve(payment_book[payment_sheets["HP"]])
+            NAMSheetProfile().resolve(payment_book[payment_sheets["NAM"]])
             result.checks.append(
                 ConfigurationCheck(
                     "payment_workbook",

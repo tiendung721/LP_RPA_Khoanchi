@@ -59,6 +59,12 @@ class ConflictType(str, Enum):
     FILE_LOCKED = "FILE_LOCKED"
     PARTIAL_KEY_MATCH = "PARTIAL_KEY_MATCH"
     PAYMENT_SOURCE_INVALID = "PAYMENT_SOURCE_INVALID"
+    PAYMENT_CLEAR_VALUE = "PAYMENT_CLEAR_VALUE"
+    MULTIPLE_SOURCE_INVOICES = "MULTIPLE_SOURCE_INVOICES"
+    INVOICE_VALUE_CONFLICT = "INVOICE_VALUE_CONFLICT"
+    INVOICE_COLUMN_MISSING = "INVOICE_COLUMN_MISSING"
+    MULTIPLE_EXPENSE_SAME_CELL = "MULTIPLE_EXPENSE_SAME_CELL"
+    CARRY_FORWARD_MAPPING_INVALID = "CARRY_FORWARD_MAPPING_INVALID"
 
 
 class ResolutionAction(str, Enum):
@@ -70,11 +76,14 @@ class ResolutionAction(str, Enum):
     SELECT_SHEET = "SELECT_SHEET"
     SELECT_ROW = "SELECT_ROW"
     SELECT_FEE = "SELECT_FEE"
+    SELECT_INVOICE = "SELECT_INVOICE"
+    SELECT_SOURCE_ITEM = "SELECT_SOURCE_ITEM"
     KEEP_EXISTING = "KEEP_EXISTING"
     KEEP_FORMULA = "KEEP_FORMULA"
     OVERWRITE = "OVERWRITE"
     ADD = "ADD"
     SKIP = "SKIP"
+    SKIP_INVOICE = "SKIP_INVOICE"
     POST_UNPOSTED_ONLY = "POST_UNPOSTED_ONLY"
     REANALYZE = "REANALYZE"
     RETRY = "RETRY"
@@ -344,6 +353,12 @@ class RowCandidate:
     row: int
     sqt: int | None
     container: str | None
+    source_sheet: str = ""
+    source_row: int | None = None
+    plan_values: tuple[Any, ...] = ()
+    source_signature: str = ""
+    carried_target_row: int | None = None
+    mapping_invalid: bool = False
     cargo_type: Any = None
     closing_date: Any = None
     vessel: Any = None
@@ -361,6 +376,12 @@ class PostingItem:
     rule: str | None
     amount: int
     sheet_name: str | None = None
+    selected_source_sheet: str | None = None
+    selected_source_row: int | None = None
+    source_sqt: int | None = None
+    plan_values: tuple[Any, ...] = ()
+    source_signature: str = ""
+    carry_forward_required: bool = False
     target_row: int | None = None
     target_column: int | None = None
     target_cell: str | None = None
@@ -371,6 +392,13 @@ class PostingItem:
     row_candidates: list[RowCandidate] = field(default_factory=list)
     source_items: list[dict[str, Any]] = field(default_factory=list)
     force_repost: bool = False
+    invoice_candidates: list[str] = field(default_factory=list)
+    selected_invoice: str | None = None
+    invoice_column: int | None = None
+    invoice_cell: str | None = None
+    invoice_current_value: Any = None
+    invoice_value_after: Any = None
+    invoice_action: ResolutionAction | None = None
 
     @property
     def fee(self) -> str:
@@ -433,7 +461,10 @@ class PostingResolution:
     action: ResolutionAction | str
     selected_sheet: str | None = None
     selected_row: int | None = None
+    selected_source_sheet: str | None = None
+    selected_source_item_index: int | None = None
     selected_fee: str | None = None
+    selected_invoice: str | None = None
 
 
 @dataclass(slots=True)
@@ -489,6 +520,7 @@ class PostingResult:
     sheet_name: str | None = None
     posted_source_items: int = 0
     written_cells: int = 0
+    invoice_written_cells: int = 0
     skipped_source_items: int = 0
     already_existing_items: int = 0
     conflict_count: int = 0
@@ -511,6 +543,7 @@ class PaymentSyncItem:
     sqt: int
     container: str
     values: dict[str, Any]
+    target_type: str = "NAM"
     target_row: int | None = None
     status: str = "NEW"
     differences: dict[str, tuple[Any, Any]] = field(default_factory=dict)
@@ -556,19 +589,55 @@ class PaymentSyncConflict:
 
 
 @dataclass(slots=True)
+class PaymentTargetPlan:
+    target_type: str
+    sheet_name: str
+    items: list[PaymentSyncItem]
+    conflicts: list[PaymentSyncConflict] = field(default_factory=list)
+    sheet_to_create: bool = False
+    template_sheet: str | None = None
+
+    @property
+    def new_rows(self) -> list[PaymentSyncItem]:
+        return [item for item in self.items if item.is_new]
+
+    @property
+    def update_rows(self) -> list[PaymentSyncItem]:
+        return [item for item in self.items if item.is_update]
+
+    @property
+    def unchanged_rows(self) -> list[PaymentSyncItem]:
+        return [item for item in self.items if item.is_unchanged]
+
+    @property
+    def new_count(self) -> int:
+        return len(self.new_rows)
+
+    @property
+    def update_count(self) -> int:
+        return len(self.update_rows)
+
+    @property
+    def unchanged_count(self) -> int:
+        return len(self.unchanged_rows)
+
+    @property
+    def conflict_count(self) -> int:
+        return len(self.conflicts)
+
+
+@dataclass(slots=True)
 class PaymentSyncPlan:
     source_path: Path
     target_path: Path
     source_fingerprint: WorkbookFingerprint
     target_fingerprint: WorkbookFingerprint
     source_sheet: str
-    target_sheet: str
-    items: list[PaymentSyncItem]
-    conflicts: list[PaymentSyncConflict] = field(default_factory=list)
+    targets: dict[str, PaymentTargetPlan]
     normalization_required: bool = False
     normalization_sheet_count: int = 0
-    target_sheet_created: bool = False
-    template_sheet: str | None = None
+    source_vba_present: bool = False
+    target_vba_present: bool = False
     run_id: int | None = None
 
     @property
@@ -577,7 +646,36 @@ class PaymentSyncPlan:
 
     @property
     def selected_sheet(self) -> str:
-        return self.target_sheet
+        return ", ".join(target.sheet_name for target in self.targets.values())
+
+    @property
+    def target_sheet(self) -> str:
+        return self.selected_sheet
+
+    @property
+    def items(self) -> list[PaymentSyncItem]:
+        return [item for target in self.targets.values() for item in target.items]
+
+    @property
+    def conflicts(self) -> list[PaymentSyncConflict]:
+        return [
+            conflict
+            for target in self.targets.values()
+            for conflict in target.conflicts
+        ]
+
+    @property
+    def target_sheet_created(self) -> bool:
+        return any(target.sheet_to_create for target in self.targets.values())
+
+    @property
+    def template_sheet(self) -> str | None:
+        templates = [
+            target.template_sheet
+            for target in self.targets.values()
+            if target.template_sheet
+        ]
+        return ", ".join(templates) if templates else None
 
     @property
     def new_rows(self) -> list[PaymentSyncItem]:
@@ -627,12 +725,9 @@ class PaymentSyncPlan:
 
 
 @dataclass(slots=True)
-class PaymentSyncResult:
-    status: ExcelRunStatus
-    source_path: Path
-    target_path: Path
+class PaymentTargetResult:
+    target_type: str
     sheet_name: str
-    source_sheet_name: str
     sheet_created: bool = False
     template_sheet_name: str | None = None
     inserted_rows: int = 0
@@ -640,17 +735,64 @@ class PaymentSyncResult:
     unchanged_rows: int = 0
     skipped_rows: int = 0
     conflict_count: int = 0
+
+
+@dataclass(slots=True)
+class PaymentSyncResult:
+    status: ExcelRunStatus
+    source_path: Path
+    target_path: Path
+    target_results: dict[str, PaymentTargetResult]
+    source_sheet_name: str
     backup_path: Path | None = None
     source_backup_path: Path | None = None
     fingerprint_before: WorkbookFingerprint | None = None
     fingerprint_after: WorkbookFingerprint | None = None
     source_fingerprint_after: WorkbookFingerprint | None = None
+    vba_preserved: bool = True
     run_id: int | None = None
     message: str = ""
 
     @property
     def operation(self) -> ExcelOperation:
         return ExcelOperation.PAYMENT_SYNC
+
+    @property
+    def sheet_name(self) -> str:
+        return ", ".join(result.sheet_name for result in self.target_results.values())
+
+    @property
+    def sheet_created(self) -> bool:
+        return any(result.sheet_created for result in self.target_results.values())
+
+    @property
+    def template_sheet_name(self) -> str | None:
+        names = [
+            result.template_sheet_name
+            for result in self.target_results.values()
+            if result.template_sheet_name
+        ]
+        return ", ".join(names) if names else None
+
+    @property
+    def inserted_rows(self) -> int:
+        return sum(result.inserted_rows for result in self.target_results.values())
+
+    @property
+    def updated_rows(self) -> int:
+        return sum(result.updated_rows for result in self.target_results.values())
+
+    @property
+    def unchanged_rows(self) -> int:
+        return sum(result.unchanged_rows for result in self.target_results.values())
+
+    @property
+    def skipped_rows(self) -> int:
+        return sum(result.skipped_rows for result in self.target_results.values())
+
+    @property
+    def conflict_count(self) -> int:
+        return sum(result.conflict_count for result in self.target_results.values())
 
 
 Plan = SyncPlan | PostingPlan | PaymentSyncPlan

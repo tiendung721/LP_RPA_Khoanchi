@@ -34,6 +34,8 @@ from .models import (
     PaymentSyncItem,
     PaymentSyncPlan,
     PaymentSyncResult,
+    PaymentTargetPlan,
+    PaymentTargetResult,
     ResolutionAction,
     RowCandidate,
     SourceSheetCandidate,
@@ -61,11 +63,14 @@ from .payment_sync import (
     SUMMARY_HEADERS,
     PaymentSyncError,
     PaymentSyncService,
+    HPSheetProfile,
+    NAMSheetProfile,
     normalize_bk_workbook,
     refresh_bk_summary_formulas,
 )
 from .resolvers import (
     MonthSheetService,
+    PaymentSheetName,
     YearResolutionError,
     YearResolver,
 )
@@ -78,6 +83,7 @@ from .workbook import (
     WorkbookGateway,
     WorkbookLockedError,
     ensure_supported_workbook,
+    workbook_has_vba,
     workbook_fingerprint,
 )
 
@@ -117,6 +123,11 @@ __all__ = [
     "PaymentSyncPlan",
     "PaymentSyncResult",
     "PaymentSyncService",
+    "PaymentTargetPlan",
+    "PaymentTargetResult",
+    "HPSheetProfile",
+    "NAMSheetProfile",
+    "PaymentSheetName",
     "ResolutionAction",
     "RowCandidate",
     "SourceSheetCandidate",
@@ -142,6 +153,7 @@ __all__ = [
     "parse_sqt",
     "validate_configuration",
     "workbook_fingerprint",
+    "workbook_has_vba",
     "DATE_HEADER",
     "SUMMARY_HEADERS",
     "normalize_bk_workbook",

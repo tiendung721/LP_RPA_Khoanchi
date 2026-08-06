@@ -13,6 +13,7 @@ from app.config import (
     migrate_legacy_runtime_layout,
     software_root,
 )
+from app.constants import SQLITE_SCHEMA_VERSION
 from app.database import Database
 from app.models import BatchStatus
 from app.repositories.batch_repository import BatchRepository
@@ -189,7 +190,7 @@ def test_database_v6_removes_legacy_pad_lookup_jobs(tmp_path: Path) -> None:
     )
 
     assert row is None
-    assert database.query_one("PRAGMA user_version")[0] == 6
+    assert database.query_one("PRAGMA user_version")[0] == SQLITE_SCHEMA_VERSION
     database.close()
 
 

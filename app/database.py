@@ -89,6 +89,14 @@ class Database:
                 self._migration_6(connection)
                 connection.execute("PRAGMA user_version = 6")
                 current_version = 6
+            if current_version < 7:
+                self._migration_7(connection)
+                connection.execute("PRAGMA user_version = 7")
+                current_version = 7
+            if current_version < 8:
+                self._migration_8(connection)
+                connection.execute("PRAGMA user_version = 8")
+                current_version = 8
             if current_version != SQLITE_SCHEMA_VERSION:
                 raise DatabaseError("Không thể nâng cấp database đến phiên bản hiện tại.")
 
@@ -273,6 +281,65 @@ class Database:
 
         connection.execute("DROP TABLE IF EXISTS container_lookup_jobs")
 
+    @staticmethod
+    def _migration_7(connection: sqlite3.Connection) -> None:
+        """Lưu vết cột và giá trị hóa đơn của luồng nhập khoản chi BK."""
+
+        columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(expense_posting_items)"
+            ).fetchall()
+        }
+        if not columns:
+            return
+        additions = {
+            "invoice_no": "TEXT",
+            "invoice_selected": "TEXT",
+            "invoice_target_column": "INTEGER",
+            "invoice_target_cell": "TEXT",
+            "invoice_value_before": "TEXT",
+            "invoice_value_after": "TEXT",
+            "invoice_action": "TEXT",
+        }
+        for name, column_type in additions.items():
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE expense_posting_items ADD COLUMN {name} {column_type}"
+                )
+
+    @staticmethod
+    def _migration_8(connection: sqlite3.Connection) -> None:
+        """Ánh xạ dòng kế hoạch được mang từ sheet tháng cũ sang tháng đích."""
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS expense_carry_forwards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workbook_path TEXT NOT NULL,
+                source_sheet TEXT NOT NULL,
+                source_row INTEGER NOT NULL CHECK (source_row > 0),
+                source_sqt INTEGER NOT NULL CHECK (source_sqt > 0),
+                container TEXT NOT NULL,
+                source_signature TEXT NOT NULL,
+                target_sheet TEXT NOT NULL,
+                target_row INTEGER NOT NULL CHECK (target_row > 0),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (
+                    workbook_path, source_sheet, source_row, source_sqt,
+                    container, target_sheet
+                )
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_expense_carry_forward_target
+            ON expense_carry_forwards(workbook_path, target_sheet, target_row)
+            """
+        )
+
     @contextmanager
     def transaction(
         self,
@@ -350,6 +417,18 @@ class Database:
                     WHERE id = ?
                     """,
                     (*(values[column] for column in path_columns), int(row["id"])),
+                )
+                changed_rows += 1
+            carry_rows = connection.execute(
+                "SELECT id, workbook_path FROM expense_carry_forwards"
+            ).fetchall()
+            for row in carry_rows:
+                rebased = _rebased_path_text(row["workbook_path"], old, new)
+                if rebased == row["workbook_path"]:
+                    continue
+                connection.execute(
+                    "UPDATE expense_carry_forwards SET workbook_path = ? WHERE id = ?",
+                    (rebased, int(row["id"])),
                 )
                 changed_rows += 1
         return changed_rows

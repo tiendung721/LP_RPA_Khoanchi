@@ -77,7 +77,7 @@ def install_exception_hook(
         logger.critical(
             "Lỗi chưa được xử lý",
             exc_info=(exception_type, exception, traceback),
-        )
+        ) 
         if on_user_error is not None:
             try:
                 on_user_error(

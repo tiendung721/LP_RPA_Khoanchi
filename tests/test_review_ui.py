@@ -22,8 +22,16 @@ def _review_payload() -> dict[str, Any]:
         "document": {
             "v": 1,
             "d": [
-                ["DRYU3026167", None, "VTN", "CV", 13_554_000],
-                [None, "BL123456789", "CB", "HD", 27_500_000],
+                [
+                    "DRYU3026167",
+                    None,
+                    "VTN",
+                    "CV",
+                    "HD-130",
+                    "Vận tải ABC",
+                    13_554_000,
+                ],
+                [None, "BL123456789", "CB", "HD", None, None, 27_500_000],
             ],
         },
     }
@@ -149,6 +157,8 @@ def test_review_window_uses_compact_balanced_layout(qtbot) -> None:
         assert window.add_button.geometry().top() > window.search_edit.geometry().bottom()
         assert window.table.columnWidth(ReviewTableModel.COLUMN_CONT) == 140
         assert window.table.columnWidth(ReviewTableModel.COLUMN_BL) == 130
+        assert window.table.columnWidth(ReviewTableModel.COLUMN_INVOICE_NO) == 130
+        assert window.table.columnWidth(ReviewTableModel.COLUMN_CARRIER) == 190
         assert window.table.columnWidth(ReviewTableModel.COLUMN_AMOUNT) == 185
         assert abs(
             window.table.columnWidth(ReviewTableModel.COLUMN_FEE_NAME)
@@ -160,7 +170,15 @@ def test_review_window_uses_compact_balanced_layout(qtbot) -> None:
 
 def test_edit_dialog_hides_rule_but_preserves_its_value(qtbot) -> None:
     dialog = EditRowDialog(
-        ReviewRow("DRYU3026167", None, "VTN", "CV", 13_554_000)
+        ReviewRow(
+            "DRYU3026167",
+            None,
+            "VTN",
+            "CV",
+            13_554_000,
+            invoice_no="HD-130",
+            carrier="Vận tải ABC",
+        )
     )
     qtbot.addWidget(dialog)
     dialog.show()
@@ -174,6 +192,8 @@ def test_edit_dialog_hides_rule_but_preserves_its_value(qtbot) -> None:
 
         assert edited.rule == "CV"
         assert edited.amount == 13_555_000
+        assert edited.invoice_no == "HD-130"
+        assert edited.carrier == "Vận tải ABC"
 
         dialog.amount_edit.clear()
         assert dialog.row_data().amount is None

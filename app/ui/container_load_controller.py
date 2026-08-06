@@ -94,8 +94,8 @@ class ContainerLoadController(QObject):
                     "Đang chờ kết quả Load số cont cho "
                     f"B/L {active.requested_bl}."
                 )
-        if len(row_snapshot) != 5:
-            raise ValueError("Dòng Load số cont phải có đúng 5 giá trị.")
+        if len(row_snapshot) != 7:
+            raise ValueError("Dòng Load số cont phải có đúng 7 giá trị.")
         container, bl = row_snapshot[0], row_snapshot[1]
         if isinstance(container, str) and container.strip():
             raise ValueError("Dòng đã có số container.")

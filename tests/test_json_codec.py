@@ -20,7 +20,9 @@ def test_read_accepts_utf8_bom(tmp_path: Path) -> None:
     path = tmp_path / "ket_qua_boc_tach.json"
     path.write_bytes(
         b"\xef\xbb\xbf"
-        + '{"v":1,"d":[["DRYU3026167",null,"VTN","CV",1]]}'.encode("utf-8")
+        + '{"v":1,"d":[["DRYU3026167",null,"VTN","CV",null,null,1]]}'.encode(
+            "utf-8"
+        )
     )
 
     document = JsonCodec().load(path)

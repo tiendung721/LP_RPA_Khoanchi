@@ -13,9 +13,9 @@ from app.ui.edit_row_dialog import normalize_bl, normalize_container, parse_amou
 
 def _rows() -> list[list[object]]:
     return [
-        ["DRYU3026167", None, "VTN", "CV", 13_554_000],
-        [None, "BL123456789", "CB", "HD", 27_500_000],
-        ["ABCD1234567", "HBL-01", "VSDL", "ST", 850_000],
+        ["DRYU3026167", None, "VTN", "CV", None, None, 13_554_000],
+        [None, "BL123456789", "CB", "HD", None, None, 27_500_000],
+        ["ABCD1234567", "HBL-01", "VSDL", "ST", None, None, 850_000],
     ]
 
 
@@ -32,6 +32,44 @@ def test_sort_filter_does_not_change_source_order(qtbot) -> None:
     assert model.rows_as_arrays() == original
 
 
+def test_v1_fields_are_serialized_and_searchable(qtbot) -> None:
+    model = ReviewTableModel(
+        [
+            [
+                "DRYU3026167",
+                None,
+                "VTN",
+                "CV",
+                "HD-000130",
+                "Vận tải Ánh Dương",
+                13_554_000,
+            ]
+        ]
+    )
+    proxy = ReviewFilterProxyModel()
+    proxy.setSourceModel(model)
+
+    assert model.to_document() == {
+        "v": 1,
+        "d": [
+            [
+                "DRYU3026167",
+                None,
+                "VTN",
+                "CV",
+                "HD-000130",
+                "Vận tải Ánh Dương",
+                13_554_000,
+            ]
+        ],
+    }
+    assert model.data(model.index(0, ReviewTableModel.COLUMN_INVOICE_NO)) == "HD-000130"
+    assert model.data(model.index(0, ReviewTableModel.COLUMN_CARRIER)) == "Vận tải Ánh Dương"
+
+    proxy.set_search_text("ánh dương")
+    assert proxy.rowCount() == 1
+
+
 def test_edit_updates_validation_and_dirty_state(qtbot) -> None:
     model = ReviewTableModel(_rows())
     assert not model.dirty
@@ -44,7 +82,7 @@ def test_edit_updates_validation_and_dirty_state(qtbot) -> None:
 
 
 def test_duplicate_rows_are_only_a_warning(qtbot) -> None:
-    row = ["DRYU3026167", None, "VTN", "CV", 13_554_000]
+    row = ["DRYU3026167", None, "VTN", "CV", None, None, 13_554_000]
     model = ReviewTableModel([row, row])
 
     assert model.stats.error == 0
@@ -64,8 +102,8 @@ def test_friendly_amount_parser_and_text_normalization() -> None:
 def test_invalid_unhashable_values_remain_visible_and_editable(qtbot) -> None:
     model = ReviewTableModel(
         [
-            [["OCR"], None, "VTN", "CV", {"raw": "13.554.000"}],
-            [["OCR"], None, "VTN", "CV", {"raw": "13.554.000"}],
+            [["OCR"], None, "VTN", "CV", None, None, {"raw": "13.554.000"}],
+            [["OCR"], None, "VTN", "CV", None, None, {"raw": "13.554.000"}],
         ]
     )
 

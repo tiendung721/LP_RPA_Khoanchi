@@ -6,6 +6,7 @@ import hashlib
 import os
 import shutil
 import tempfile
+import zipfile
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -50,6 +51,22 @@ def workbook_fingerprint(path: str | Path) -> WorkbookFingerprint:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return WorkbookFingerprint(stat.st_size, stat.st_mtime_ns, digest.hexdigest())
+
+
+def workbook_has_vba(path: str | Path) -> bool:
+    """Inspect the OOXML package instead of trusting the ``.xlsm`` suffix."""
+
+    candidate = ensure_supported_workbook(path)
+    if candidate.suffix.casefold() != ".xlsm":
+        return False
+    try:
+        with zipfile.ZipFile(candidate) as package:
+            return any(
+                name.casefold().endswith("vbaproject.bin")
+                for name in package.namelist()
+            )
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise WorkbookError(f"Không thể kiểm tra VBA trong {candidate.name}: {exc}") from exc
 
 
 class WorkbookGateway:
@@ -127,6 +144,12 @@ class WorkbookGateway:
     def verify_openable(self, path: str | Path) -> None:
         workbook = self.load(path, read_only=True, data_only=False)
         workbook.close()
+
+    def verify_vba(self, path: str | Path, *, expected_present: bool) -> bool:
+        present = workbook_has_vba(path)
+        if expected_present and not present:
+            raise WorkbookError("vbaProject.bin không còn trong package XLSM sau khi lưu.")
+        return present
 
     def atomic_replace(
         self,

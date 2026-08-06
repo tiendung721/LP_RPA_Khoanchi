@@ -44,11 +44,22 @@ _UPDATABLE_COLUMNS = frozenset(
         "value_before",
         "value_after",
         "action",
+        "invoice_no",
+        "invoice_selected",
+        "invoice_target_column",
+        "invoice_target_cell",
+        "invoice_value_before",
+        "invoice_value_after",
+        "invoice_action",
         "status",
     }
 )
-_VALUE_COLUMNS = frozenset({"value_before", "value_after"})
-_POSITIVE_COLUMNS = frozenset({"target_row", "target_column"})
+_VALUE_COLUMNS = frozenset(
+    {"value_before", "value_after", "invoice_value_before", "invoice_value_after"}
+)
+_POSITIVE_COLUMNS = frozenset(
+    {"target_row", "target_column", "invoice_target_column"}
+)
 
 
 def _posting_status(value: object) -> str:
@@ -99,12 +110,34 @@ class ExpensePostingItemRecord:
     value_before: Any
     value_after: Any
     action: str | None
+    invoice_no: str | None
+    invoice_selected: str | None
+    invoice_target_column: int | None
+    invoice_target_cell: str | None
+    invoice_value_before: Any
+    invoice_value_after: Any
+    invoice_action: str | None
     status: str
     created_at: str
 
     @property
     def item_id(self) -> int:
         return self.id
+
+
+@dataclass(frozen=True, slots=True)
+class ExpenseCarryForwardRecord:
+    id: int
+    workbook_path: str
+    source_sheet: str
+    source_row: int
+    source_sqt: int
+    container: str
+    source_signature: str
+    target_sheet: str
+    target_row: int
+    created_at: str
+    updated_at: str
 
 
 class ExpensePostingRepository:
@@ -134,6 +167,13 @@ class ExpensePostingRepository:
         value_before: object | None = None,
         value_after: object | None = None,
         action: object | None = None,
+        invoice_no: str | None = None,
+        invoice_selected: str | None = None,
+        invoice_target_column: int | None = None,
+        invoice_target_cell: str | None = None,
+        invoice_value_before: object | None = None,
+        invoice_value_after: object | None = None,
+        invoice_action: object | None = None,
         created_at: str | None = None,
     ) -> ExpensePostingItemRecord:
         payload = self._normalize_create_payload(
@@ -155,6 +195,13 @@ class ExpensePostingRepository:
                 "value_before": value_before,
                 "value_after": value_after,
                 "action": action,
+                "invoice_no": invoice_no,
+                "invoice_selected": invoice_selected,
+                "invoice_target_column": invoice_target_column,
+                "invoice_target_cell": invoice_target_cell,
+                "invoice_value_before": invoice_value_before,
+                "invoice_value_after": invoice_value_after,
+                "invoice_action": invoice_action,
                 "status": status,
                 "created_at": created_at or local_now_iso(),
             }
@@ -220,6 +267,115 @@ class ExpensePostingRepository:
     save_items = create_items
     record_items = create_items
 
+    def get_carry_forward(
+        self,
+        *,
+        workbook_path: str | Path,
+        source_sheet: str,
+        source_row: int,
+        source_sqt: int,
+        container: str,
+        target_sheet: str,
+    ) -> ExpenseCarryForwardRecord | None:
+        row = self.database.query_one(
+            """
+            SELECT * FROM expense_carry_forwards
+            WHERE workbook_path = ? AND source_sheet = ? AND source_row = ?
+              AND source_sqt = ? AND container = ? AND target_sheet = ?
+            """,
+            (
+                str(Path(workbook_path).resolve(strict=False)),
+                source_sheet,
+                source_row,
+                source_sqt,
+                container,
+                target_sheet,
+            ),
+        )
+        return self._to_carry_forward(row) if row is not None else None
+
+    def save_carry_forward(
+        self,
+        *,
+        workbook_path: str | Path,
+        source_sheet: str,
+        source_row: int,
+        source_sqt: int,
+        container: str,
+        source_signature: str,
+        target_sheet: str,
+        target_row: int,
+    ) -> ExpenseCarryForwardRecord:
+        if source_row <= 0 or source_sqt <= 0 or target_row <= 0:
+            raise ValueError("Dòng nguồn, SQT và dòng đích phải là số nguyên dương.")
+        if not container or not source_signature:
+            raise ValueError("Container và chữ ký dòng nguồn không được để trống.")
+        now = local_now_iso()
+        resolved_path = str(Path(workbook_path).resolve(strict=False))
+        with self.database.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                INSERT INTO expense_carry_forwards (
+                    workbook_path, source_sheet, source_row, source_sqt,
+                    container, source_signature, target_sheet, target_row,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (
+                    workbook_path, source_sheet, source_row, source_sqt,
+                    container, target_sheet
+                ) DO UPDATE SET
+                    source_signature = excluded.source_signature,
+                    target_row = excluded.target_row,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    resolved_path,
+                    source_sheet,
+                    source_row,
+                    source_sqt,
+                    container,
+                    source_signature,
+                    target_sheet,
+                    target_row,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM expense_carry_forwards
+                WHERE workbook_path = ? AND source_sheet = ? AND source_row = ?
+                  AND source_sqt = ? AND container = ? AND target_sheet = ?
+                """,
+                (
+                    resolved_path,
+                    source_sheet,
+                    source_row,
+                    source_sqt,
+                    container,
+                    target_sheet,
+                ),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("Không thể đọc lại ánh xạ dòng kế hoạch vừa lưu.")
+        return self._to_carry_forward(row)
+
+    @staticmethod
+    def _to_carry_forward(row: sqlite3.Row) -> ExpenseCarryForwardRecord:
+        return ExpenseCarryForwardRecord(
+            id=int(row["id"]),
+            workbook_path=str(row["workbook_path"]),
+            source_sheet=str(row["source_sheet"]),
+            source_row=int(row["source_row"]),
+            source_sqt=int(row["source_sqt"]),
+            container=str(row["container"]),
+            source_signature=str(row["source_signature"]),
+            target_sheet=str(row["target_sheet"]),
+            target_row=int(row["target_row"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
     def get_by_id(self, item_id: int) -> ExpensePostingItemRecord | None:
         row = self.database.query_one(
             "SELECT * FROM expense_posting_items WHERE id = ?",
@@ -265,6 +421,10 @@ class ExpensePostingRepository:
                 "sheet_name",
                 "target_cell",
                 "action",
+                "invoice_no",
+                "invoice_selected",
+                "invoice_target_cell",
+                "invoice_action",
             }:
                 value = _optional_text(value)
                 if key == "fee_original" and not value:
@@ -437,9 +597,13 @@ class ExpensePostingRepository:
                 run_id, batch_id, batch_hash, source_item_index, container, bl,
                 fee_original, fee_selected, rule, amount, sheet_name,
                 target_row, target_column, target_cell, value_before,
-                value_after, action, status, created_at
+                value_after, action, invoice_no, invoice_selected,
+                invoice_target_column, invoice_target_cell,
+                invoice_value_before, invoice_value_after, invoice_action,
+                status, created_at
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?
             )
             """,
             tuple(
@@ -462,6 +626,13 @@ class ExpensePostingRepository:
                     "value_before",
                     "value_after",
                     "action",
+                    "invoice_no",
+                    "invoice_selected",
+                    "invoice_target_column",
+                    "invoice_target_cell",
+                    "invoice_value_before",
+                    "invoice_value_after",
+                    "invoice_action",
                     "status",
                     "created_at",
                 )
@@ -508,12 +679,18 @@ class ExpensePostingRepository:
 
         target_row = payload.get("target_row")
         target_column = payload.get("target_column")
+        invoice_target_column = payload.get("invoice_target_column")
         if target_row is not None:
             target_row = _required_positive_int(target_row, field_name="target_row")
         if target_column is not None:
             target_column = _required_positive_int(
                 target_column,
                 field_name="target_column",
+            )
+        if invoice_target_column is not None:
+            invoice_target_column = _required_positive_int(
+                invoice_target_column,
+                field_name="invoice_target_column",
             )
         return {
             "run_id": run_id,
@@ -533,6 +710,13 @@ class ExpensePostingRepository:
             "value_before": _json_text(payload.get("value_before")),
             "value_after": _json_text(payload.get("value_after")),
             "action": _optional_text(payload.get("action")),
+            "invoice_no": _optional_text(payload.get("invoice_no")),
+            "invoice_selected": _optional_text(payload.get("invoice_selected")),
+            "invoice_target_column": invoice_target_column,
+            "invoice_target_cell": _optional_text(payload.get("invoice_target_cell")),
+            "invoice_value_before": _json_text(payload.get("invoice_value_before")),
+            "invoice_value_after": _json_text(payload.get("invoice_value_after")),
+            "invoice_action": _optional_text(payload.get("invoice_action")),
             "status": _posting_status(payload["status"]),
             "created_at": created_at,
         }
@@ -564,6 +748,17 @@ class ExpensePostingRepository:
             value_before=_json_value(row["value_before"]),
             value_after=_json_value(row["value_after"]),
             action=row["action"],
+            invoice_no=row["invoice_no"],
+            invoice_selected=row["invoice_selected"],
+            invoice_target_column=(
+                int(row["invoice_target_column"])
+                if row["invoice_target_column"] is not None
+                else None
+            ),
+            invoice_target_cell=row["invoice_target_cell"],
+            invoice_value_before=_json_value(row["invoice_value_before"]),
+            invoice_value_after=_json_value(row["invoice_value_after"]),
+            invoice_action=row["invoice_action"],
             status=str(row["status"]),
             created_at=str(row["created_at"]),
         )
@@ -572,6 +767,7 @@ class ExpensePostingRepository:
 __all__ = [
     "POSTING_ITEM_STATUSES",
     "SUCCESSFUL_POSTING_STATUSES",
+    "ExpenseCarryForwardRecord",
     "ExpensePostingItemRecord",
     "ExpensePostingRepository",
 ]

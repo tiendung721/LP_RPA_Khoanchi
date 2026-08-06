@@ -44,6 +44,7 @@ from .review_table_model import (
     RowStatus,
 )
 from app.container_load.validation import allocate_amount, row_fingerprint
+from app.constants import SCHEMA_VERSION
 from app.ui.container_load_controller import ContainerLoadBusyError
 from app.ui.feedback import LinearLoadingBar, set_button_loading
 
@@ -266,7 +267,9 @@ class ReviewWindow(QMainWindow):
         filter_toolbar.setSpacing(7)
         self.search_edit = QLineEdit()
         self.search_edit.setObjectName("reviewSearchEdit")
-        self.search_edit.setPlaceholderText("Tìm container hoặc B/L…  (Ctrl+F)")
+        self.search_edit.setPlaceholderText(
+            "Tìm container, B/L, Số HĐ hoặc Bên vận tải…  (Ctrl+F)"
+        )
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.setMinimumWidth(220)
         filter_toolbar.addWidget(self.search_edit, 2)
@@ -335,6 +338,8 @@ class ReviewWindow(QMainWindow):
         header.setSectionResizeMode(ReviewTableModel.COLUMN_MESSAGES, QHeaderView.ResizeMode.Stretch)
         self.table.setColumnWidth(ReviewTableModel.COLUMN_CONT, 140)
         self.table.setColumnWidth(ReviewTableModel.COLUMN_BL, 130)
+        self.table.setColumnWidth(ReviewTableModel.COLUMN_INVOICE_NO, 130)
+        self.table.setColumnWidth(ReviewTableModel.COLUMN_CARRIER, 190)
         self.table.setColumnWidth(ReviewTableModel.COLUMN_AMOUNT, 185)
         self.table.setColumnWidth(ReviewTableModel.COLUMN_LOOKUP_RESULT, 190)
         self.table.setColumnWidth(ReviewTableModel.COLUMN_LOOKUP_ACTION, 120)
@@ -588,11 +593,11 @@ class ReviewWindow(QMainWindow):
                 for row in arrays
             ]
             try:
-                return BatchDocument(v=1, rows=rows)
+                return BatchDocument(v=SCHEMA_VERSION, rows=rows)
             except TypeError:
-                return BatchDocument(version=1, data=rows)
+                return BatchDocument(version=SCHEMA_VERSION, data=rows)
         except (ImportError, AttributeError, TypeError):
-            return {"v": 1, "d": arrays}
+            return {"v": SCHEMA_VERSION, "d": arrays}
 
     def save_working(self) -> bool:
         if self._saving:
@@ -945,11 +950,13 @@ class ReviewWindow(QMainWindow):
                 return
             replacements = [
                 ReviewRow(
-                    allocation.container,
-                    row.bl,
-                    row.fee,
-                    row.rule,
-                    allocation.amount,
+                    cont=allocation.container,
+                    bl=row.bl,
+                    fee=row.fee,
+                    rule=row.rule,
+                    amount=allocation.amount,
+                    invoice_no=row.invoice_no,
+                    carrier=row.carrier,
                 )
                 for allocation in allocations
             ]

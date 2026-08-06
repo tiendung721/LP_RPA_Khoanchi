@@ -79,18 +79,18 @@ def parse_document(raw: object) -> BatchDocument:
                 code="row_not_array",
                 row_index=index,
             )
-        if len(item) != 5:
+        if len(item) != 7:
             raise SchemaError(
-                f"Dòng {index + 1} phải có đúng 5 phần tử.",
+                f"Dòng {index + 1} của schema v1 phải có đúng 7 phần tử.",
                 code="row_length",
                 row_index=index,
             )
         rows.append(DataRow.from_sequence(item))
-    return BatchDocument(v=version, rows=rows)
+    return BatchDocument(v=SCHEMA_VERSION, rows=rows)
 
 
 def document_to_dict(document: BatchDocument) -> dict[str, Any]:
-    """Trả đúng root ``v`` rồi ``d`` và mỗi dòng là mảng 5 phần tử."""
+    """Trả đúng root ``v`` rồi ``d`` và mỗi dòng là mảng 7 phần tử."""
 
     if type(document.v) is not int or document.v != SCHEMA_VERSION:
         raise SchemaError(
@@ -107,9 +107,9 @@ def document_to_dict(document: BatchDocument) -> dict[str, Any]:
                 row_index=index,
             )
         values = row.to_list()
-        if len(values) != 5:
+        if len(values) != 7:
             raise SchemaError(
-                f"Dòng {index + 1} phải có đúng 5 phần tử.",
+                f"Dòng {index + 1} phải có đúng 7 phần tử.",
                 code="row_length",
                 row_index=index,
             )
@@ -141,7 +141,7 @@ def coerce_document(
             row = item if isinstance(item, DataRow) else DataRow.from_sequence(item)
         except (TypeError, ValueError) as exc:
             raise SchemaError(
-                f"Dòng {index + 1} phải là một mảng có đúng 5 phần tử.",
+                f"Dòng {index + 1} phải là một mảng có đúng 7 phần tử.",
                 code="row_length",
                 row_index=index,
             ) from exc

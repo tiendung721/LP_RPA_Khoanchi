@@ -124,7 +124,16 @@ class BatchService:
 
     def get_current_output_batch(self) -> BatchMetadata | None:
         batch_id = self._current_output_batch_id
-        return self.repository.get_by_id(batch_id) if batch_id is not None else None
+        if batch_id is None:
+            return None
+        metadata = self.repository.get_by_id(batch_id)
+        if metadata is None or metadata.status is not BatchStatus.INVALID:
+            return metadata
+        try:
+            return self.load_batch(batch_id).metadata
+        except BatchDataError:
+            # File vẫn sai cấu trúc theo schema hiện hành; giữ nguyên INVALID.
+            return self.repository.get_by_id(batch_id)
 
     @staticmethod
     def _coerce_paths(
@@ -299,7 +308,7 @@ class BatchService:
         validation = self.validation_service.validate_document(document)
         new_status = (
             BatchStatus.REVIEWING
-            if metadata.status is BatchStatus.RECEIVED
+            if metadata.status in {BatchStatus.RECEIVED, BatchStatus.INVALID}
             else metadata.status
         )
         metadata = self.repository.update_batch(

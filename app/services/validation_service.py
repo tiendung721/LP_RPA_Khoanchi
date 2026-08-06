@@ -77,6 +77,19 @@ def normalize_rule(value: str | None) -> str | None:
     return normalized
 
 
+def normalize_optional_text(
+    value: str | None,
+    *,
+    field_name: str = "Giá trị",
+) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} phải là chuỗi hoặc để trống.")
+    normalized = _COLLAPSE_WHITESPACE_RE.sub(" ", value.strip())
+    return normalized or None
+
+
 def parse_amount(value: int | str | None) -> int | None:
     """Parse số nguyên VND; không suy đoán ký hiệu thập phân."""
 
@@ -127,6 +140,8 @@ class ValidationService:
         bl: str | None = None,
         fee: str | None = None,
         rule: str | None = None,
+        invoice_no: str | None = None,
+        carrier: str | None = None,
         amount: int | str | None = None,
     ) -> DataRow:
         if row is not None:
@@ -134,6 +149,8 @@ class ValidationService:
             bl = row.bl
             fee = row.fee
             rule = row.rule
+            invoice_no = row.invoice_no
+            carrier = row.carrier
             amount = row.amount
         if fee is None:
             raise ValueError("Vui lòng chọn mã loại cước.")
@@ -143,6 +160,8 @@ class ValidationService:
             fee=normalize_fee(fee),
             rule=normalize_rule(rule),
             amount=parse_amount(amount),
+            invoice_no=normalize_optional_text(invoice_no, field_name="Số HĐ"),
+            carrier=normalize_optional_text(carrier, field_name="Bên vận tải"),
         )
 
     def validate_row(self, row: DataRow, index: int = 0) -> RowValidation:
@@ -164,6 +183,10 @@ class ValidationService:
         rule_valid = row.rule is None or (
             isinstance(row.rule, str) and row.rule in RULE_CODES
         )
+        invoice_no_valid_type = row.invoice_no is None or isinstance(
+            row.invoice_no, str
+        )
+        carrier_valid_type = row.carrier is None or isinstance(row.carrier, str)
         amount_valid_type = row.amount is None or type(row.amount) is int
 
         if not cont_valid_type:
@@ -195,6 +218,12 @@ class ValidationService:
                 "Mã xử lý tiền phải là HD, ST, CV, GV hoặc null.",
                 "rule",
             )
+
+        if not invoice_no_valid_type:
+            error("invoice_no_type", "Số HĐ phải là chuỗi hoặc null.", "invoice_no")
+
+        if not carrier_valid_type:
+            error("carrier_type", "Bên vận tải phải là chuỗi hoặc null.", "carrier")
 
         if not amount_valid_type:
             if isinstance(row.amount, bool):

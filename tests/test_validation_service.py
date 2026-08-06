@@ -8,6 +8,7 @@ from app.services.validation_service import (
     ValidationService,
     normalize_bl,
     normalize_container,
+    normalize_optional_text,
     parse_amount,
 )
 
@@ -27,6 +28,28 @@ def validator() -> ValidationService:
         (DataRow("DRYU3026167", None, "VTN", "CV", -1), "amount_negative"),
         (DataRow("DRYU3026167", None, "VTN", "HD", 1), "hd_requires_cb"),
         (DataRow("DRYU3026167", "BL1", "CB", "CV", 1), "cb_requires_hd"),
+        (
+            DataRow(
+                "DRYU3026167",
+                None,
+                "VTN",
+                "CV",
+                1,
+                invoice_no=130,  # type: ignore[arg-type]
+            ),
+            "invoice_no_type",
+        ),
+        (
+            DataRow(
+                "DRYU3026167",
+                None,
+                "VTN",
+                "CV",
+                1,
+                carrier=123,  # type: ignore[arg-type]
+            ),
+            "carrier_type",
+        ),
     ],
 )
 def test_blocking_row_rules(
@@ -52,6 +75,8 @@ def test_normalization_never_guesses_ocr_characters() -> None:
     assert normalize_container("   ") is None
     assert normalize_bl("  hbl /  2026-01  ") == "HBL / 2026-01"
     assert normalize_bl("") is None
+    assert normalize_optional_text("  000130 / HD  ") == "000130 / HD"
+    assert normalize_optional_text("   ") is None
 
 
 @pytest.mark.parametrize(

@@ -26,9 +26,9 @@ def _payload(amount: object = 100) -> dict:
         "document": {
             "v": 1,
             "d": [
-                [None, "VS26060269", "CB", "HD", amount],
-                ["DRYU3026167", None, "VTN", "CV", 50],
-                [None, None, "VTN", "CV", 25],
+                [None, "VS26060269", "CB", "HD", "HD-130", "Vận tải ABC", amount],
+                ["DRYU3026167", None, "VTN", "CV", None, None, 50],
+                [None, None, "VTN", "CV", None, None, 25],
             ],
         },
     }
@@ -193,7 +193,7 @@ def test_controller_allows_only_one_active_load_and_reports_busy(
         batch_id=9,
         source_row=0,
         row_runtime_id="row-1",
-        row_snapshot=[None, "VS26060269", "CB", "HD", 100],
+        row_snapshot=[None, "VS26060269", "CB", "HD", "HD-130", "Vận tải ABC", 100],
     )
 
     try:
@@ -206,7 +206,7 @@ def test_controller_allows_only_one_active_load_and_reports_busy(
                 batch_id=9,
                 source_row=1,
                 row_runtime_id="row-2",
-                row_snapshot=[None, "BL2", "CB", "HD", 100],
+                row_snapshot=[None, "BL2", "CB", "HD", None, None, 100],
             )
         assert service.clear_calls == 1
         assert service.launch_calls == 1
@@ -235,7 +235,7 @@ def test_controller_accepts_valid_json_and_keeps_session_until_confirmation(
         batch_id=9,
         source_row=0,
         row_runtime_id="row-1",
-        row_snapshot=[None, "VS26060269", "CB", "HD", 100],
+        row_snapshot=[None, "VS26060269", "CB", "HD", "HD-130", "Vận tải ABC", 100],
     )
     result_file = output / "tên tải về bất kỳ.json"
     result_file.write_text(
@@ -278,7 +278,7 @@ def test_controller_ignores_existing_and_non_container_json(
         batch_id=9,
         source_row=0,
         row_runtime_id="row-1",
-        row_snapshot=[None, "VS26060269", "CB", "HD", 100],
+        row_snapshot=[None, "VS26060269", "CB", "HD", "HD-130", "Vận tải ABC", 100],
     )
 
     try:
@@ -331,9 +331,9 @@ def test_review_confirmation_replaces_row_and_splits_amount_exactly(
         )
 
         assert window.model.rows_as_arrays()[:3] == [
-            ["MSCU1234566", "VS26060269", "CB", "HD", 34],
-            ["DRYU3026167", "VS26060269", "CB", "HD", 33],
-            ["GAOU2112422", "VS26060269", "CB", "HD", 33],
+            ["MSCU1234566", "VS26060269", "CB", "HD", "HD-130", "Vận tải ABC", 34],
+            ["DRYU3026167", "VS26060269", "CB", "HD", "HD-130", "Vận tải ABC", 33],
+            ["GAOU2112422", "VS26060269", "CB", "HD", "HD-130", "Vận tải ABC", 33],
         ]
         assert window.model.dirty
         assert controller.finished == ["session-1"]

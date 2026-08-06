@@ -28,8 +28,16 @@ def _settings(tmp_path: Path) -> AppSettings:
 
 def _write_json(path: Path, rows: list[list[object]]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
+    normalized_rows = [
+        [*row[:4], None, None, row[4]] if len(row) == 5 else row
+        for row in rows
+    ]
     path.write_text(
-        json.dumps({"v": 1, "d": rows}, ensure_ascii=False, separators=(",", ":")),
+        json.dumps(
+            {"v": 1, "d": normalized_rows},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
         encoding="utf-8",
     )
     return path
@@ -37,8 +45,8 @@ def _write_json(path: Path, rows: list[list[object]]) -> Path:
 
 def _valid_rows() -> list[list[object]]:
     return [
-        ["DRYU3026167", None, "VTN", "CV", 13_554_000],
-        [None, "BL123456789", "CB", "HD", 27_500_000],
+        ["DRYU3026167", None, "VTN", "CV", None, None, 13_554_000],
+        [None, "BL123456789", "CB", "HD", None, None, 27_500_000],
     ]
 
 
@@ -181,6 +189,36 @@ def test_invalid_new_download_still_replaces_old_output(tmp_path: Path) -> None:
     assert result.batch.last_saved_at is None
     assert current.read_text(encoding="utf-8") == '{"v":1,"rows":[]}'
     assert not incoming.exists()
+    service.close()
+
+
+def test_current_invalid_batch_recovers_after_file_matches_current_schema(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    source = settings.output_dir / "ket_qua_boc_tach.json"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        '{"v":1,"d":[["DRYU3026167",null,"VTN","CV",100]]}',
+        encoding="utf-8",
+    )
+    service = BatchService(settings)
+    invalid = service.receive_file(source)
+    assert invalid.batch.status is BatchStatus.INVALID
+
+    current = _current_json(settings)
+    current.write_text(
+        '{"v":1,"d":[["DRYU3026167",null,"VTN","CV","HD-130",'
+        '"Vận tải ABC",100]]}',
+        encoding="utf-8",
+    )
+
+    recovered = service.get_current_output_batch()
+
+    assert recovered is not None
+    assert recovered.status is BatchStatus.REVIEWING
+    assert recovered.last_error is None
+    assert recovered.row_count == 1
     service.close()
 
 

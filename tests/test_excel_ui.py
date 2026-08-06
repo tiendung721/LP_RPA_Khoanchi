@@ -210,6 +210,18 @@ def test_payment_sync_confirmation_discloses_new_sheet_template(
         new_count=0,
         conflict_count=0,
         normalization_sheet_count=0,
+        targets={
+            "HP": SimpleNamespace(
+                sheet_name="T06 26 HP", sheet_to_create=True,
+                template_sheet="T05 26 HP", new_count=1,
+                update_count=2, unchanged_count=3, conflict_count=0,
+            ),
+            "NAM": SimpleNamespace(
+                sheet_name="T06 26 NAM", sheet_to_create=True,
+                template_sheet="T05 26 NAM", new_count=4,
+                update_count=5, unchanged_count=6, conflict_count=1,
+            ),
+        },
     )
 
     class Tasks:
@@ -248,6 +260,10 @@ def test_payment_sync_confirmation_discloses_new_sheet_template(
     MainWindow._handle_payment_sync_plan(owner, plan)
 
     assert len(tasks.apply_calls) == 1
+    assert "T06 26 HP" in captured["text"]
+    assert "T05 26 HP" in captured["text"]
+    assert "T06 26 NAM" in captured["text"]
+    assert "T05 26 NAM" in captured["text"]
     assert captured["title"] == "Xác nhận đồng bộ BK → Thanh toán"
     assert "Sheet Thanh toán mới: Có, tạo từ T05 26" in captured["text"]
 
@@ -607,7 +623,7 @@ def test_month_and_conflict_dialogs_collect_generic_mapping(qtbot) -> None:
     )
     qtbot.addWidget(conflicts)
     occupied_combo = conflicts._action_combos["occupied"]
-    occupied_combo.setCurrentIndex(occupied_combo.findData("ADD"))
+    occupied_combo.setCurrentIndex(occupied_combo.findData("OVERWRITE"))
     fee_action = conflicts._action_combos["unknown"]
     fee_action.setCurrentIndex(fee_action.findData("SELECT_FEE"))
     conflicts._selected_fees["unknown"].setCurrentIndex(
@@ -616,7 +632,7 @@ def test_month_and_conflict_dialogs_collect_generic_mapping(qtbot) -> None:
 
     result = conflicts.resolution_map()
 
-    assert result["occupied"]["action"] == "ADD"
+    assert result["occupied"]["action"] == "OVERWRITE"
     assert result["unknown"]["action"] == "SELECT_FEE"
     assert result["unknown"]["selected_fee"] == "SC"
 
@@ -740,7 +756,6 @@ def test_conflict_actions_are_short_vietnamese_labels(qtbot) -> None:
                 "allowed_actions": [
                     "KEEP_EXISTING",
                     "OVERWRITE",
-                    "ADD",
                     "SKIP",
                 ],
             },
@@ -764,7 +779,7 @@ def test_conflict_actions_are_short_vietnamese_labels(qtbot) -> None:
     ]
 
     assert duplicate_labels == ["Bỏ qua", "Chọn dòng"]
-    assert occupied_labels == ["Giữ nguyên", "Ghi đè", "Cộng thêm", "Bỏ qua"]
+    assert occupied_labels == ["Giữ nguyên", "Ghi đè", "Bỏ qua"]
     assert "repeated" in dialog._selector_buttons
     assert not any(
         "_" in label
@@ -772,10 +787,55 @@ def test_conflict_actions_are_short_vietnamese_labels(qtbot) -> None:
     )
 
 
-def test_manual_row_picker_returns_only_workbook_row(qtbot) -> None:
-    dialog = ManualRowPickerDialog(
+def test_invoice_conflict_dialog_selects_one_invoice_and_has_only_two_value_actions(
+    qtbot,
+) -> None:
+    dialog = ConflictResolutionDialog(
         [
             {
+                "conflict_id": "multiple-invoices",
+                "type": "MULTIPLE_SOURCE_INVOICES",
+                "allowed_actions": ["SELECT_INVOICE"],
+                "details": {"invoice_candidates": ["INV-A", "INV-B"]},
+            },
+            {
+                "conflict_id": "invoice-value",
+                "type": "INVOICE_VALUE_CONFLICT",
+                "allowed_actions": ["KEEP_EXISTING", "OVERWRITE"],
+                "current_value": "INV-OLD",
+                "details": {"invoice_candidates": ["INV-NEW"]},
+            },
+        ]
+    )
+    qtbot.addWidget(dialog)
+
+    assert "Số HĐ từ JSON" in dialog.COLUMNS
+    value_labels = [
+        dialog._action_combos["invoice-value"].itemText(index)
+        for index in range(dialog._action_combos["invoice-value"].count())
+    ]
+    assert value_labels == ["Giữ HĐ hiện tại", "Ghi đè bằng HĐ mới"]
+    invoice_combo = dialog._selected_invoices["multiple-invoices"]
+    assert invoice_combo.currentData() is None
+
+    dialog._validate_and_accept()
+    assert dialog.result() == QDialog.DialogCode.Rejected
+    assert "chưa chọn Số HĐ" in dialog.validation_label.text()
+
+    invoice_combo.setCurrentIndex(invoice_combo.findData("INV-B"))
+    result = dialog.resolution_map()
+    assert result["multiple-invoices"] == {
+        "conflict_id": "multiple-invoices",
+        "action": "SELECT_INVOICE",
+        "selected_invoice": "INV-B",
+    }
+
+
+def test_manual_row_picker_returns_source_sheet_and_workbook_row(qtbot) -> None:
+    dialog = ManualRowPickerDialog(
+        [
+                {
+                    "source_sheet": "T06 26",
                 "row_number": 12,
                 "sqt": 700,
                 "container": "DRYU3026167",
@@ -791,7 +851,8 @@ def test_manual_row_picker_returns_only_workbook_row(qtbot) -> None:
     dialog.table.selectRow(0)
 
     assert dialog.selected_row == 12
-    assert dialog.table.columnCount() == 6
+    assert dialog.selected_source_sheet == "T06 26"
+    assert dialog.table.columnCount() == 7
     assert "Cột" not in [
         dialog.table.horizontalHeaderItem(column).text()
         for column in range(dialog.table.columnCount())

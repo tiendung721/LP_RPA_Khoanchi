@@ -14,6 +14,8 @@ from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
 
+from app.database import Database
+from app.repositories.expense_posting_repository import ExpensePostingRepository
 from app.services.excel.daily_sync import (
     SOURCE_HEADER_ALIASES,
     DailySyncError,
@@ -191,8 +193,14 @@ def _save_target(
 
 
 def _save_ready(path: Path, rows: Iterable[Iterable[Any]]) -> None:
+    normalized_rows = []
+    for row in rows:
+        values = list(row)
+        if len(values) == 5:
+            values = [*values[:4], None, None, values[4]]
+        normalized_rows.append(values)
     path.write_text(
-        json.dumps({"v": 1, "d": [list(row) for row in rows]}, ensure_ascii=False),
+        json.dumps({"v": 1, "d": normalized_rows}, ensure_ascii=False),
         encoding="utf-8",
     )
 
@@ -231,6 +239,120 @@ def _new_posting_sheet(workbook: Workbook, name: str) -> Any:
         "Hóa đơn"
     )
     return sheet
+
+
+POSTING_INVOICE_LAYOUT: dict[str, tuple[int, int | None]] = {
+    "CB": (7, 8),
+    "CBDH": (9, 10),
+    "VTN": (11, 12),
+    "NV": (13, 14),
+    "HH": (15, 16),
+    "NH": (17, 18),
+    "HV": (19, 20),
+    "VSDL": (21, 22),
+    "LC": (23, 24),
+    "QT": (25, 26),
+    "LL": (27, None),
+    "SC": (28, 29),
+}
+
+FULL_POSTING_LAYOUT: dict[str, tuple[int, int | None]] = {
+    "CB": (13, 14),
+    "CBDH": (17, 18),
+    "NV": (19, 20),
+    "HH": (21, 22),
+    "VTN": (24, 25),
+    "NH": (26, 27),
+    "HV": (28, 29),
+    "VSDL": (30, 31),
+    "LC": (32, 33),
+    "QT": (34, 35),
+    "LL": (36, None),
+    "SC": (37, 38),
+}
+
+
+def _new_full_posting_sheet(workbook: Workbook, name: str) -> Any:
+    sheet = workbook.active
+    if sheet.max_row == 1 and sheet.max_column == 1 and sheet["A1"].value is None:
+        sheet.title = name
+    else:
+        sheet = workbook.create_sheet(name)
+    for column, header in enumerate(SYNC_HEADERS[:11], 1):
+        sheet.cell(1, column).value = header
+    sheet.cell(1, 16).value = SYNC_HEADERS[11]
+    for fee, (amount_column, invoice_column) in FULL_POSTING_LAYOUT.items():
+        sheet.cell(1, amount_column).value = FEE_HEADER_ALIASES[fee][0]
+        if invoice_column is not None:
+            sheet.cell(1, invoice_column).value = "Số HĐ"
+    sheet.cell(1, 39).value = "GHI CHÚ"
+    return sheet
+
+
+def _add_full_plan_row(
+    sheet: Any,
+    row: int,
+    *,
+    sqt: int,
+    container: str,
+    closing_date: str,
+) -> list[Any]:
+    values = _sync_row(sqt, container, closing_date=closing_date)
+    for column, value in enumerate(values[:11], 1):
+        sheet.cell(row, column).value = value
+    sheet.cell(row, 16).value = values[11]
+    return values
+
+
+def _new_posting_sheet_with_invoices(workbook: Workbook, name: str) -> Any:
+    sheet = workbook.active
+    sheet.title = name
+    for column, title in enumerate(POSTING_BASE_HEADERS, 1):
+        sheet.cell(1, column).value = title
+    for fee, (amount_column, invoice_column) in POSTING_INVOICE_LAYOUT.items():
+        sheet.cell(1, amount_column).value = FEE_HEADER_ALIASES[fee][0]
+        if invoice_column is not None:
+            sheet.cell(1, invoice_column).value = (
+                "Hóa đơn cước biển" if fee == "CB" else "Số HĐ"
+            )
+    sheet.cell(1, 30).value = "GHI CHÚ"
+    return sheet
+
+
+def test_posting_reader_accepts_v1_review_fields_without_using_them_for_amount(
+    tmp_path: Path,
+) -> None:
+    service = ExpensePostingService(provider=object(), bk_path=tmp_path / "BK.xlsx")
+    raw = json.dumps(
+        {
+            "v": 1,
+            "d": [
+                [
+                    "GAOU2619968",
+                    None,
+                    "CBDH",
+                    "CV",
+                    "000130/HD",
+                    "Vận tải ABC",
+                    2_484_000,
+                ]
+            ],
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    assert service._validate_json(raw) == [
+        {
+            "source_item_index": 0,
+            "container": "GAOU2619968",
+            "bl": None,
+            "fee": "CBDH",
+            "rule": "CV",
+            "invoice_no": "000130/HD",
+            "carrier": "Vận tải ABC",
+            "amount": 2_484_000,
+        }
+    ]
 
 
 def _posting_service(
@@ -671,7 +793,197 @@ def test_daily_sync_aborts_before_backup_when_bk_changed_after_analyze(
     assert not (runtime_dir / "Backup").exists()
 
 
-def test_posting_groups_normalized_container_and_keeps_bl_only_rows_separate(
+def test_posting_carries_previous_month_plan_once_and_reuses_target_row(
+    tmp_path: Path,
+) -> None:
+    first_ready = tmp_path / "first.json"
+    second_ready = tmp_path / "second.json"
+    target = tmp_path / "BK 2026.xlsx"
+    container = "DRYU3026167"
+    _save_ready(first_ready, [[container, None, "VTN", "ST", "INV-1", None, 100]])
+    _save_ready(second_ready, [[container, None, "HH", "ST", "INV-2", None, 250]])
+
+    workbook = Workbook()
+    july = _new_full_posting_sheet(workbook, "T07 26")
+    _add_full_plan_row(
+        july,
+        2,
+        sqt=708,
+        container="MSCU1234567",
+        closing_date="2026-07-10",
+    )
+    june = _new_full_posting_sheet(workbook, "T06 26")
+    source_values = _add_full_plan_row(
+        june,
+        2,
+        sqt=619,
+        container=container,
+        closing_date="2026-06-10",
+    )
+    june.cell(2, FULL_POSTING_LAYOUT["CB"][0]).value = 999
+    april = _new_full_posting_sheet(workbook, "T04 26")
+    _add_full_plan_row(
+        april,
+        2,
+        sqt=401,
+        container=container,
+        closing_date="2026-04-10",
+    )
+    workbook.save(target)
+    workbook.close()
+
+    database = Database(tmp_path / "app_state.db")
+    postings = ExpensePostingRepository(database)
+    first_service = _posting_service(
+        first_ready,
+        target,
+        tmp_path / "First",
+        posting_repository=postings,
+    )
+    first_plan = first_service.analyze(sheet_name="T07 26")
+
+    assert not first_plan.conflicts
+    assert first_plan.items[0].selected_source_sheet == "T06 26"
+    assert first_plan.items[0].carry_forward_required
+    assert first_plan.items[0].target_row == 3
+    first_result = first_service.apply(first_plan, {})
+    assert first_result.backup_path is not None
+
+    workbook = load_workbook(target, data_only=False)
+    try:
+        july = workbook["T07 26"]
+        copied = [july.cell(3, column).value for column in range(1, 12)]
+        assert copied == source_values[:11]
+        assert july.cell(3, 16).value == source_values[11]
+        assert july.cell(3, FULL_POSTING_LAYOUT["CB"][0]).value is None
+        assert july.cell(3, FULL_POSTING_LAYOUT["VTN"][0]).value == 100
+    finally:
+        workbook.close()
+
+    second_service = _posting_service(
+        second_ready,
+        target,
+        tmp_path / "Second",
+        posting_repository=postings,
+    )
+    second_plan = second_service.analyze(sheet_name="T07 26")
+    assert not second_plan.conflicts
+    assert second_plan.items[0].selected_source_sheet == "T06 26"
+    assert not second_plan.items[0].carry_forward_required
+    assert second_plan.items[0].target_row == 3
+    second_service.apply(second_plan, {})
+
+    workbook = load_workbook(target, data_only=False)
+    try:
+        july = workbook["T07 26"]
+        assert july.cell(3, FULL_POSTING_LAYOUT["VTN"][0]).value == 100
+        assert july.cell(3, FULL_POSTING_LAYOUT["HH"][0]).value == 250
+        assert july.cell(4, 1).value is None
+    finally:
+        workbook.close()
+        database.close()
+
+
+def test_posting_three_month_window_handles_year_boundary(
+    tmp_path: Path,
+) -> None:
+    ready = tmp_path / "ready.json"
+    target = tmp_path / "BK 2027.xlsx"
+    container = "DRYU3026167"
+    _save_ready(ready, [[container, None, "VTN", "ST", 100]])
+    workbook = Workbook()
+    january = _new_full_posting_sheet(workbook, "T01 27")
+    _add_full_plan_row(
+        january,
+        2,
+        sqt=1001,
+        container="MSCU1234567",
+        closing_date="2027-01-10",
+    )
+    _new_full_posting_sheet(workbook, "T12 26")
+    november = _new_full_posting_sheet(workbook, "T11 26")
+    _add_full_plan_row(
+        november,
+        2,
+        sqt=1101,
+        container=container,
+        closing_date="2026-11-10",
+    )
+    october = _new_full_posting_sheet(workbook, "T10 26")
+    _add_full_plan_row(
+        october,
+        2,
+        sqt=1001,
+        container=container,
+        closing_date="2026-10-10",
+    )
+    workbook.save(target)
+    workbook.close()
+
+    plan = _posting_service(ready, target, tmp_path / "Excel").analyze(
+        sheet_name="T01 27"
+    )
+
+    assert not plan.conflicts
+    assert plan.items[0].selected_source_sheet == "T11 26"
+    assert plan.items[0].source_sqt == 1101
+
+
+def test_posting_duplicate_container_across_months_requires_source_sheet(
+    tmp_path: Path,
+) -> None:
+    ready = tmp_path / "ready.json"
+    target = tmp_path / "BK 2026.xlsx"
+    container = "DRYU3026167"
+    _save_ready(ready, [[container, None, "VTN", "ST", 100]])
+    workbook = Workbook()
+    july = _new_full_posting_sheet(workbook, "T07 26")
+    _add_full_plan_row(
+        july,
+        2,
+        sqt=708,
+        container=container,
+        closing_date="2026-07-10",
+    )
+    june = _new_full_posting_sheet(workbook, "T06 26")
+    _add_full_plan_row(
+        june,
+        2,
+        sqt=619,
+        container=container,
+        closing_date="2026-06-10",
+    )
+    workbook.save(target)
+    workbook.close()
+
+    service = _posting_service(ready, target, tmp_path / "Excel")
+    plan = service.analyze(sheet_name="T07 26")
+    conflict = next(
+        conflict
+        for conflict in plan.conflicts
+        if conflict.conflict_type is ConflictType.MULTIPLE_CONTAINER_MATCH
+    )
+    assert [candidate.source_sheet for candidate in conflict.row_candidates] == [
+        "T07 26",
+        "T06 26",
+    ]
+    refined = service.refine(
+        plan,
+        {
+            conflict.conflict_id: {
+                "action": "SELECT_ROW",
+                "selected_source_sheet": "T06 26",
+                "selected_row": 2,
+            }
+        },
+    )
+    assert not refined.conflicts
+    assert refined.items[0].selected_source_sheet == "T06 26"
+    assert refined.items[0].source_sqt == 619
+    assert refined.items[0].carry_forward_required
+
+
+def test_posting_keeps_normalized_duplicate_expenses_separate(
     tmp_path: Path,
 ) -> None:
     ready = tmp_path / "ready.json"
@@ -707,34 +1019,30 @@ def test_posting_groups_normalized_container_and_keeps_bl_only_rows_separate(
     assert plan.items[1].amount == 250
     assert plan.items[2].source_indices == [2]
     assert plan.items[3].source_indices == [3]
-    assert [
-        conflict.conflict_type for conflict in plan.conflicts
-    ] == [
-        ConflictType.REPEATED_SOURCE_CONTAINER,
-        ConflictType.REPEATED_SOURCE_CONTAINER,
+    assert [conflict.conflict_type for conflict in plan.conflicts] == [
         ConflictType.BL_ONLY_NO_CONTAINER,
         ConflictType.BL_ONLY_NO_CONTAINER,
+        ConflictType.MULTIPLE_EXPENSE_SAME_CELL,
     ]
-
-    repeated = [
+    same_cell = next(
         conflict
         for conflict in plan.conflicts
-        if conflict.conflict_type is ConflictType.REPEATED_SOURCE_CONTAINER
-    ]
+        if conflict.conflict_type is ConflictType.MULTIPLE_EXPENSE_SAME_CELL
+    )
     refined = service.refine(
         plan,
         {
-            conflict.conflict_id: {
-                "action": "SELECT_ROW",
-                "selected_row": 2,
+            same_cell.conflict_id: {
+                "action": "SELECT_SOURCE_ITEM",
+                "selected_source_item_index": 0,
             }
-            for conflict in repeated
         },
     )
 
-    assert len(refined.items) == 3
-    assert refined.items[0].source_indices == [0, 1]
-    assert refined.items[0].amount == 350
+    assert len(refined.items) == 4
+    assert refined.items[0].source_indices == [0]
+    assert refined.items[0].amount == 100
+    assert refined.items[1].status is PostingItemStatus.USER_SKIPPED
     assert [
         conflict.conflict_type for conflict in refined.conflicts
     ] == [
@@ -745,16 +1053,15 @@ def test_posting_groups_normalized_container_and_keeps_bl_only_rows_separate(
     result = service.apply(refined, {})
 
     assert result.status is ExcelRunStatus.SUCCEEDED
-    assert result.posted_source_items == 2
+    assert result.posted_source_items == 1
     assert result.written_cells == 1
-    assert result.skipped_source_items == 2
-    assert result.backup_path is None
-    assert not (runtime_dir / "Backup").exists()
+    assert result.skipped_source_items == 3
+    assert result.backup_path is not None
     workbook = load_workbook(target, data_only=False)
     try:
         assert workbook["T07 26"].cell(
             2, POSTING_FEE_COLUMNS["VTN"]
-        ).value == 350
+        ).value == 100
     finally:
         workbook.close()
 
@@ -785,7 +1092,7 @@ def test_posting_keeps_repeated_container_separate_for_different_sqt_choices(
     conflicts = [
         conflict
         for conflict in plan.conflicts
-        if conflict.conflict_type is ConflictType.REPEATED_SOURCE_CONTAINER
+        if conflict.conflict_type is ConflictType.MULTIPLE_CONTAINER_MATCH
     ]
 
     assert len(plan.items) == 2
@@ -827,7 +1134,7 @@ def test_posting_keeps_repeated_container_separate_for_different_sqt_choices(
         workbook.close()
 
 
-def test_posting_sums_repeated_container_only_after_same_sqt_is_selected(
+def test_posting_never_sums_repeated_expenses_for_same_target_cell(
     tmp_path: Path,
 ) -> None:
     ready = tmp_path / "ready.json"
@@ -853,7 +1160,7 @@ def test_posting_sums_repeated_container_only_after_same_sqt_is_selected(
     conflicts = [
         conflict
         for conflict in plan.conflicts
-        if conflict.conflict_type is ConflictType.REPEATED_SOURCE_CONTAINER
+        if conflict.conflict_type is ConflictType.MULTIPLE_CONTAINER_MATCH
     ]
     refined = service.refine(
         plan,
@@ -866,21 +1173,33 @@ def test_posting_sums_repeated_container_only_after_same_sqt_is_selected(
         },
     )
 
+    same_cell = next(
+        conflict
+        for conflict in refined.conflicts
+        if conflict.conflict_type is ConflictType.MULTIPLE_EXPENSE_SAME_CELL
+    )
+    refined = service.refine(
+        refined,
+        {
+            same_cell.conflict_id: {
+                "action": "SELECT_SOURCE_ITEM",
+                "selected_source_item_index": 1,
+            }
+        },
+    )
     assert not refined.conflicts
-    assert len(refined.items) == 1
-    assert refined.items[0].source_indices == [0, 1]
-    assert refined.items[0].amount == 350
-    assert refined.items[0].target_row == 2
+    assert len(refined.items) == 2
 
     result = service.apply(refined, {})
 
-    assert result.posted_source_items == 2
+    assert result.posted_source_items == 1
+    assert result.skipped_source_items == 1
     assert result.written_cells == 1
     workbook = load_workbook(target, data_only=False)
     try:
         sheet = workbook["T07 26"]
         column = POSTING_FEE_COLUMNS["VTN"]
-        assert sheet.cell(2, column).value == 350
+        assert sheet.cell(2, column).value == 250
         assert sheet.cell(3, column).value is None
     finally:
         workbook.close()
@@ -908,25 +1227,19 @@ def test_posting_requires_confirmation_for_repeated_container_with_one_bk_row(
 
     service = _posting_service(ready, target, runtime_dir)
     plan = service.analyze(sheet_name="T07 26")
-    conflicts = [
+    conflict = next(
         conflict
         for conflict in plan.conflicts
-        if conflict.conflict_type is ConflictType.REPEATED_SOURCE_CONTAINER
-    ]
-
-    assert len(conflicts) == 2
-    assert [conflict.amount for conflict in conflicts] == [100, 250]
-    assert [candidate.sqt for candidate in conflicts[0].row_candidates] == [701]
-    assert all(item.target_row is None for item in plan.items)
+        if conflict.conflict_type is ConflictType.MULTIPLE_EXPENSE_SAME_CELL
+    )
 
     refined = service.refine(
         plan,
         {
-            conflicts[0].conflict_id: {
-                "action": "SELECT_ROW",
-                "selected_row": 2,
+            conflict.conflict_id: {
+                "action": "SELECT_SOURCE_ITEM",
+                "selected_source_item_index": 0,
             },
-            conflicts[1].conflict_id: {"action": "SKIP"},
         },
     )
 
@@ -945,7 +1258,7 @@ def test_posting_requires_confirmation_for_repeated_container_with_one_bk_row(
         workbook.close()
 
 
-def test_posting_cell_conflicts_honor_add_overwrite_and_skip_resolutions(
+def test_posting_cell_conflicts_never_offer_add(
     tmp_path: Path,
 ) -> None:
     ready = tmp_path / "ready.json"
@@ -999,12 +1312,12 @@ def test_posting_cell_conflicts_honor_add_overwrite_and_skip_resolutions(
     assert conflicts[
         ConflictType.TARGET_CELL_OCCUPIED
     ].default_action is ResolutionAction.KEEP_EXISTING
-    assert ResolutionAction.ADD in conflicts[
+    assert ResolutionAction.ADD not in conflicts[
         ConflictType.TARGET_CELL_OCCUPIED
     ].allowed_actions
     resolutions = {
         conflicts[ConflictType.TARGET_CELL_OCCUPIED].conflict_id: {
-            "action": "ADD"
+            "action": "OVERWRITE"
         },
         conflicts[ConflictType.TARGET_CELL_FORMULA].conflict_id: {
             "action": "OVERWRITE"
@@ -1027,7 +1340,7 @@ def test_posting_cell_conflicts_honor_add_overwrite_and_skip_resolutions(
             100,
             200,
             300,
-            150,
+            100,
             400,
             "đã nhập tay",
         ]
@@ -1401,6 +1714,274 @@ def test_posting_history_preserves_keep_action_and_cell_value(
     assert postings.items[0]["value_after"] == existing
     assert postings.metadata["batch_id"] == 71
     assert not (runtime_dir / "Backup").exists()
+
+
+def test_posting_writes_invoice_next_to_each_supported_fee_and_skips_ll(
+    tmp_path: Path,
+) -> None:
+    ready = tmp_path / "ready.json"
+    target = tmp_path / "BK 2026.xlsx"
+    runtime_dir = tmp_path / "Excel"
+    rows: list[list[Any]] = []
+    workbook = Workbook()
+    sheet = _new_posting_sheet_with_invoices(workbook, "T07 26")
+    for offset, fee in enumerate(POSTING_INVOICE_LAYOUT, 2):
+        container = f"TEST{offset:07d}"
+        _add_posting_row(sheet, offset, container, sqt=700 + offset)
+        rows.append(
+            [
+                container,
+                None,
+                fee,
+                "HD" if fee == "CB" else "ST",
+                f"INV-{fee}",
+                None,
+                offset * 100,
+            ]
+        )
+    workbook.save(target)
+    workbook.close()
+    _save_ready(ready, rows)
+
+    runs = _RunHistoryRepository()
+    postings = _PostingHistoryRepository()
+    service = _posting_service(
+        ready,
+        target,
+        runtime_dir,
+        run_repository=runs,
+        posting_repository=postings,
+    )
+    plan = service.analyze(batch_id=71, sheet_name="T07 26")
+    assert not plan.conflicts
+
+    result = service.apply(plan, {})
+
+    assert result.written_cells == len(POSTING_INVOICE_LAYOUT)
+    assert result.invoice_written_cells == len(POSTING_INVOICE_LAYOUT) - 1
+    cb_history = next(
+        item for item in postings.items if item["fee_selected"] == "CB"
+    )
+    assert cb_history["invoice_no"] == "INV-CB"
+    assert cb_history["invoice_selected"] == "INV-CB"
+    assert cb_history["invoice_target_cell"] == "H2"
+    assert cb_history["invoice_value_after"] == "INV-CB"
+    assert cb_history["invoice_action"] is ResolutionAction.OVERWRITE
+    workbook = load_workbook(target, data_only=False)
+    try:
+        sheet = workbook["T07 26"]
+        for offset, fee in enumerate(POSTING_INVOICE_LAYOUT, 2):
+            amount_column, invoice_column = POSTING_INVOICE_LAYOUT[fee]
+            assert sheet.cell(offset, amount_column).value == offset * 100
+            if fee == "LL":
+                assert invoice_column is None
+            else:
+                assert sheet.cell(offset, int(invoice_column)).value == f"INV-{fee}"
+    finally:
+        workbook.close()
+
+
+@pytest.mark.parametrize("existing_invoice", ["INV-OLD", "=1+1"])
+def test_invoice_conflict_is_independent_from_amount_conflict(
+    tmp_path: Path,
+    existing_invoice: str,
+) -> None:
+    ready = tmp_path / "ready.json"
+    target = tmp_path / "BK 2026.xlsx"
+    container = "DRYU3026167"
+    _save_ready(
+        ready,
+        [[container, None, "CB", "HD", "INV-NEW", None, 100]],
+    )
+    workbook = Workbook()
+    sheet = _new_posting_sheet_with_invoices(workbook, "T07 26")
+    _add_posting_row(sheet, 2, container)
+    amount_column, invoice_column = POSTING_INVOICE_LAYOUT["CB"]
+    sheet.cell(2, amount_column).value = 50
+    sheet.cell(2, int(invoice_column)).value = existing_invoice
+    workbook.save(target)
+    workbook.close()
+
+    service = _posting_service(ready, target, tmp_path / "Excel")
+    plan = service.analyze(sheet_name="T07 26")
+    amount_conflict = next(
+        conflict
+        for conflict in plan.conflicts
+        if conflict.conflict_type is ConflictType.TARGET_CELL_OCCUPIED
+    )
+    invoice_conflict = next(
+        conflict
+        for conflict in plan.conflicts
+        if conflict.conflict_type is ConflictType.INVOICE_VALUE_CONFLICT
+    )
+    assert invoice_conflict.allowed_actions == (
+        ResolutionAction.KEEP_EXISTING,
+        ResolutionAction.OVERWRITE,
+    )
+
+    result = service.apply(
+        plan,
+        {
+            amount_conflict.conflict_id: {"action": "KEEP_EXISTING"},
+            invoice_conflict.conflict_id: {"action": "OVERWRITE"},
+        },
+    )
+
+    assert result.status is ExcelRunStatus.SUCCEEDED
+    assert result.written_cells == 0
+    assert result.invoice_written_cells == 1
+    workbook = load_workbook(target, data_only=False)
+    try:
+        sheet = workbook["T07 26"]
+        assert sheet.cell(2, amount_column).value == 50
+        assert sheet.cell(2, int(invoice_column)).value == "INV-NEW"
+    finally:
+        workbook.close()
+
+
+def test_same_cell_expenses_require_one_json_line_before_invoice_write(
+    tmp_path: Path,
+) -> None:
+    ready = tmp_path / "ready.json"
+    target = tmp_path / "BK 2026.xlsx"
+    container = "DRYU3026167"
+    _save_ready(
+        ready,
+        [
+            [container, None, "VTN", "ST", "INV-A", None, 100],
+            [container, None, "VTN", "ST", "INV-B", None, 200],
+        ],
+    )
+    workbook = Workbook()
+    sheet = _new_posting_sheet_with_invoices(workbook, "T07 26")
+    _add_posting_row(sheet, 2, container)
+    workbook.save(target)
+    workbook.close()
+
+    service = _posting_service(ready, target, tmp_path / "Excel")
+    plan = service.analyze(sheet_name="T07 26")
+    same_cell = next(
+        conflict
+        for conflict in plan.conflicts
+        if conflict.conflict_type is ConflictType.MULTIPLE_EXPENSE_SAME_CELL
+    )
+    selected = service.refine(
+        plan,
+        {
+            same_cell.conflict_id: {
+                "action": "SELECT_SOURCE_ITEM",
+                "selected_source_item_index": 1,
+            }
+        },
+    )
+    assert not selected.conflicts
+    result = service.apply(selected, {})
+
+    assert result.written_cells == 1
+    assert result.invoice_written_cells == 1
+    workbook = load_workbook(target, data_only=False)
+    try:
+        sheet = workbook["T07 26"]
+        amount_column, invoice_column = POSTING_INVOICE_LAYOUT["VTN"]
+        assert sheet.cell(2, amount_column).value == 200
+        assert sheet.cell(2, int(invoice_column)).value == "INV-B"
+    finally:
+        workbook.close()
+
+
+def test_blank_invoice_preserves_existing_value_and_missing_header_is_explicit(
+    tmp_path: Path,
+) -> None:
+    ready = tmp_path / "ready.json"
+    target = tmp_path / "BK 2026.xlsx"
+    container = "DRYU3026167"
+    _save_ready(ready, [[container, None, "CBDH", "ST", 100]])
+    workbook = Workbook()
+    sheet = _new_posting_sheet_with_invoices(workbook, "T07 26")
+    _add_posting_row(sheet, 2, container)
+    amount_column, invoice_column = POSTING_INVOICE_LAYOUT["CBDH"]
+    sheet.cell(2, int(invoice_column)).value = "INV-OLD"
+    workbook.save(target)
+    workbook.close()
+
+    service = _posting_service(ready, target, tmp_path / "Excel")
+    result = service.apply(service.analyze(sheet_name="T07 26"), {})
+    assert result.invoice_written_cells == 0
+    workbook = load_workbook(target, data_only=False)
+    try:
+        assert workbook["T07 26"].cell(2, int(invoice_column)).value == "INV-OLD"
+    finally:
+        workbook.close()
+
+    missing_ready = tmp_path / "missing-ready.json"
+    missing_target = tmp_path / "missing-BK.xlsx"
+    _save_ready(
+        missing_ready,
+        [[container, None, "CBDH", "ST", "INV-NEW", None, 200]],
+    )
+    workbook = Workbook()
+    sheet = _new_posting_sheet_with_invoices(workbook, "T07 26")
+    _add_posting_row(sheet, 2, container)
+    sheet.cell(1, int(invoice_column)).value = "Không phải hóa đơn"
+    workbook.save(missing_target)
+    workbook.close()
+    missing_service = _posting_service(
+        missing_ready, missing_target, tmp_path / "MissingExcel"
+    )
+    missing_plan = missing_service.analyze(sheet_name="T07 26")
+    missing_conflict = next(
+        conflict
+        for conflict in missing_plan.conflicts
+        if conflict.conflict_type is ConflictType.INVOICE_COLUMN_MISSING
+    )
+    assert missing_conflict.default_action is ResolutionAction.SKIP_INVOICE
+    missing_result = missing_service.apply(missing_plan, {})
+    assert missing_result.written_cells == 1
+    assert missing_result.invoice_written_cells == 0
+
+
+@pytest.mark.parametrize(
+    ("existing_invoice", "incoming_invoice", "expected_invoice", "written"),
+    [
+        (790, "790", 790, 0),
+        (None, "000790", "000790", 1),
+    ],
+)
+def test_invoice_comparison_is_textual_and_leading_zero_is_preserved(
+    tmp_path: Path,
+    existing_invoice: Any,
+    incoming_invoice: str,
+    expected_invoice: Any,
+    written: int,
+) -> None:
+    ready = tmp_path / "ready.json"
+    target = tmp_path / "BK 2026.xlsx"
+    container = "DRYU3026167"
+    _save_ready(
+        ready,
+        [[container, None, "HH", "ST", incoming_invoice, None, 100]],
+    )
+    workbook = Workbook()
+    sheet = _new_posting_sheet_with_invoices(workbook, "T07 26")
+    _add_posting_row(sheet, 2, container)
+    _, invoice_column = POSTING_INVOICE_LAYOUT["HH"]
+    sheet.cell(2, int(invoice_column)).value = existing_invoice
+    workbook.save(target)
+    workbook.close()
+
+    service = _posting_service(ready, target, tmp_path / "Excel")
+    plan = service.analyze(sheet_name="T07 26")
+    assert not any(
+        conflict.conflict_type is ConflictType.INVOICE_VALUE_CONFLICT
+        for conflict in plan.conflicts
+    )
+    result = service.apply(plan, {})
+    assert result.invoice_written_cells == written
+    workbook = load_workbook(target, data_only=False)
+    try:
+        assert workbook["T07 26"].cell(2, int(invoice_column)).value == expected_invoice
+    finally:
+        workbook.close()
 
 
 def test_daily_sync_ignores_filename_year_and_requires_target_sheet_when_ambiguous(

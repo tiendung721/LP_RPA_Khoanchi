@@ -134,7 +134,7 @@ def test_new_download_automatically_opens_review_window(
         json.dumps(
             {
                 "v": 1,
-                "d": [["DRYU3026167", None, "VTN", "CV", 100]],
+                "d": [["DRYU3026167", None, "VTN", "CV", None, None, 100]],
             }
         ),
         encoding="utf-8",
@@ -155,7 +155,7 @@ def test_new_download_automatically_opens_review_window(
             json.dumps(
                 {
                     "v": 1,
-                    "d": [["GAOU2112422", None, "VTN", "CV", 200]],
+                    "d": [["GAOU2112422", None, "VTN", "CV", None, None, 200]],
                 }
             ),
             encoding="utf-8",

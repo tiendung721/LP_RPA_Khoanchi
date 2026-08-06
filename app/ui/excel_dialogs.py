@@ -277,7 +277,7 @@ class MonthSelectionDialog(QDialog):
 
 
 class ManualRowPickerDialog(QDialog):
-    """Chọn một dòng BK trong sheet đã chốt, không cho phép chọn cột."""
+    """Chọn một dòng BK trong cửa sổ ba tháng, không cho phép chọn cột."""
 
     def __init__(
         self,
@@ -298,16 +298,24 @@ class ManualRowPickerDialog(QDialog):
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
         note = QLabel(
-            "Chỉ chọn dòng dữ liệu trong sheet đã xác định. "
+            "Chọn đúng sheet nguồn và dòng kế hoạch. "
             "Cột khoản chi vẫn do tiêu đề workbook quyết định."
         )
         note.setWordWrap(True)
         layout.addWidget(note)
 
-        self.table = QTableWidget(0, 6)
+        self.table = QTableWidget(0, 7)
         self.table.setObjectName("manualRowCandidateTable")
         self.table.setHorizontalHeaderLabels(
-            ["SQT", "Container", "Loại hàng", "Ngày đóng", "Tàu", "Người nhận"]
+            [
+                "Sheet nguồn",
+                "SQT",
+                "Container",
+                "Loại hàng",
+                "Ngày đóng",
+                "Tàu",
+                "Người nhận",
+            ]
         )
         self.table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -327,6 +335,7 @@ class ManualRowPickerDialog(QDialog):
             row = self.table.rowCount()
             self.table.insertRow(row)
             values = (
+                _value(candidate, "source_sheet", "sheet_name", "sheet"),
                 _value(candidate, "sqt", "sequence_number"),
                 _value(candidate, "container", "container_number"),
                 _value(candidate, "cargo_type", "goods_type", "loai_hang"),
@@ -391,6 +400,12 @@ class ManualRowPickerDialog(QDialog):
             default=(candidate if isinstance(candidate, int) else None),
         )
 
+    @property
+    def selected_source_sheet(self) -> str | None:
+        candidate = self.selected_candidate
+        value = _value(candidate, "source_sheet", "sheet_name", "sheet")
+        return str(value) if value not in (None, "") else None
+
 
 DEFAULT_ACTIONS: dict[str, tuple[str, ...]] = {
     "INVALID_SQT": ("SKIP_INVALID", "CANCEL_ALL"),
@@ -403,7 +418,7 @@ DEFAULT_ACTIONS: dict[str, tuple[str, ...]] = {
     "CONTAINER_NOT_FOUND": ("SKIP", "SELECT_ROW"),
     "MULTIPLE_CONTAINER_MATCH": ("SKIP", "SELECT_ROW"),
     "REPEATED_SOURCE_CONTAINER": ("SKIP", "SELECT_ROW"),
-    "TARGET_CELL_OCCUPIED": ("KEEP_EXISTING", "OVERWRITE", "ADD", "SKIP"),
+    "TARGET_CELL_OCCUPIED": ("KEEP_EXISTING", "OVERWRITE", "SKIP"),
     "TARGET_CELL_FORMULA": ("KEEP_FORMULA", "OVERWRITE", "SKIP"),
     "TARGET_CELL_TEXT": ("KEEP_EXISTING", "OVERWRITE", "SKIP"),
     "UNKNOWN_FEE_CODE": ("SELECT_FEE", "SKIP"),
@@ -411,6 +426,17 @@ DEFAULT_ACTIONS: dict[str, tuple[str, ...]] = {
     "BL_ONLY_NO_CONTAINER": ("SKIP", "SELECT_ROW"),
     "PARTIAL_KEY_MATCH": ("SKIP", "SELECT_ROW", "CANCEL_ALL"),
     "PAYMENT_SOURCE_INVALID": ("SKIP", "CANCEL_ALL"),
+    "PAYMENT_CLEAR_VALUE": (
+        "KEEP_EXISTING",
+        "OVERWRITE",
+        "SKIP",
+        "CANCEL_ALL",
+    ),
+    "MULTIPLE_SOURCE_INVOICES": ("SELECT_INVOICE",),
+    "INVOICE_VALUE_CONFLICT": ("KEEP_EXISTING", "OVERWRITE"),
+    "INVOICE_COLUMN_MISSING": ("SKIP_INVOICE", "CANCEL_ALL"),
+    "MULTIPLE_EXPENSE_SAME_CELL": ("SELECT_SOURCE_ITEM",),
+    "CARRY_FORWARD_MAPPING_INVALID": ("SKIP", "CANCEL_ALL"),
     "BATCH_ALREADY_POSTED": ("POST_UNPOSTED_ONLY", "CANCEL"),
     "FILE_CHANGED": ("REANALYZE", "CANCEL"),
     "FILE_LOCKED": ("RETRY", "CANCEL"),
@@ -435,6 +461,12 @@ DEFAULT_RESOLUTION: dict[str, str] = {
     "BL_ONLY_NO_CONTAINER": "SKIP",
     "PARTIAL_KEY_MATCH": "SKIP",
     "PAYMENT_SOURCE_INVALID": "SKIP",
+    "PAYMENT_CLEAR_VALUE": "KEEP_EXISTING",
+    "MULTIPLE_SOURCE_INVOICES": "SELECT_INVOICE",
+    "INVOICE_VALUE_CONFLICT": "KEEP_EXISTING",
+    "INVOICE_COLUMN_MISSING": "SKIP_INVOICE",
+    "MULTIPLE_EXPENSE_SAME_CELL": "SELECT_SOURCE_ITEM",
+    "CARRY_FORWARD_MAPPING_INVALID": "SKIP",
     "BATCH_ALREADY_POSTED": "POST_UNPOSTED_ONLY",
     "FILE_CHANGED": "REANALYZE",
     "FILE_LOCKED": "RETRY",
@@ -442,6 +474,7 @@ DEFAULT_RESOLUTION: dict[str, str] = {
 
 ACTION_LABELS = {
     "SKIP": "Bỏ qua",
+    "SKIP_INVOICE": "Bỏ ghi HĐ",
     "SKIP_INVALID": "Bỏ qua dòng lỗi",
     "CANCEL": "Hủy",
     "CANCEL_ALL": "Hủy toàn bộ",
@@ -451,10 +484,11 @@ ACTION_LABELS = {
     "SELECT_MONTH": "Chọn tháng",
     "SELECT_ROW": "Chọn dòng",
     "SELECT_FEE": "Chọn mã phí",
+    "SELECT_INVOICE": "Chọn một Số HĐ",
+    "SELECT_SOURCE_ITEM": "Chọn một dòng JSON",
     "KEEP_EXISTING": "Giữ nguyên",
     "KEEP_FORMULA": "Giữ công thức",
     "OVERWRITE": "Ghi đè",
-    "ADD": "Cộng thêm",
     "POST_UNPOSTED_ONLY": "Chỉ nhập khoản chưa xử lý",
     "REANALYZE": "Đọc lại dữ liệu",
     "RETRY": "Thử lại",
@@ -633,6 +667,7 @@ class ConflictResolutionDialog(QDialog):
         "Sheet",
         "Dòng",
         "Cột / ô",
+        "Số HĐ từ JSON",
         "Giá trị hiện tại",
         "Vấn đề",
         "Cách xử lý",
@@ -658,9 +693,12 @@ class ConflictResolutionDialog(QDialog):
         self.valid_fee_codes = tuple(valid_fee_codes)
         self._action_combos: dict[str, QComboBox] = {}
         self._selected_rows: dict[str, Any] = {}
+        self._selected_source_sheets: dict[str, str] = {}
+        self._selected_source_items: dict[str, QComboBox] = {}
         self._selected_fees: dict[str, QComboBox] = {}
         self._selected_sheets: dict[str, QComboBox] = {}
         self._selected_months: dict[str, QComboBox] = {}
+        self._selected_invoices: dict[str, QComboBox] = {}
         self._selector_buttons: dict[str, QPushButton] = {}
         self.setObjectName("excelConflictResolutionDialog")
         self.setWindowTitle("Xử lý xung đột Excel")
@@ -694,7 +732,7 @@ class ConflictResolutionDialog(QDialog):
             QHeaderView.ResizeMode.ResizeToContents
         )
         self.table.horizontalHeader().setSectionResizeMode(
-            9, QHeaderView.ResizeMode.Stretch
+            10, QHeaderView.ResizeMode.Stretch
         )
         layout.addWidget(self.table, 1)
 
@@ -734,6 +772,11 @@ class ConflictResolutionDialog(QDialog):
         conflict_type = _code(
             _value(conflict, "conflict_type", "type", "kind", default="CONFLICT")
         )
+        details = _value(conflict, "details", default={})
+        invoice_candidates = _sequence(
+            _value(details, "invoice_candidates", default=())
+        )
+        invoice_display = ", ".join(str(value) for value in invoice_candidates)
         values = (
             _value(conflict, "container", "container_number"),
             _value(conflict, "bl", "bill_of_lading"),
@@ -743,6 +786,7 @@ class ConflictResolutionDialog(QDialog):
             _value(conflict, "sheet_name", "sheet", "target_sheet"),
             _value(conflict, "target_row", "row", "row_number"),
             column_cell,
+            invoice_display or None,
             _value(
                 conflict,
                 "current_value",
@@ -777,17 +821,29 @@ class ConflictResolutionDialog(QDialog):
                 code,
                 str(_value(option, "label", default=code)),
             )
+            if conflict_type == "PAYMENT_CLEAR_VALUE":
+                label = {
+                    "KEEP_EXISTING": "Giữ giá trị Thanh toán",
+                    "OVERWRITE": "Xóa theo BK",
+                    "SKIP": "Bỏ qua bản ghi",
+                    "CANCEL_ALL": "Hủy toàn bộ",
+                }.get(code, label)
+            elif conflict_type == "INVOICE_VALUE_CONFLICT":
+                label = {
+                    "KEEP_EXISTING": "Giữ HĐ hiện tại",
+                    "OVERWRITE": "Ghi đè bằng HĐ mới",
+                }.get(code, label)
             action_combo.addItem(label, code)
         default_index = action_combo.findData(default_action)
         action_combo.setCurrentIndex(max(0, default_index))
         self._action_combos[conflict_id] = action_combo
-        self.table.setCellWidget(row, 10, action_combo)
+        self.table.setCellWidget(row, 11, action_combo)
 
         selector = self._selector_for(row, conflict, conflict_id, conflict_type)
         if selector is not None:
-            self.table.setCellWidget(row, 11, selector)
+            self.table.setCellWidget(row, 12, selector)
         else:
-            self.table.setItem(row, 11, QTableWidgetItem("—"))
+            self.table.setItem(row, 12, QTableWidgetItem("—"))
 
     def _selector_for(
         self,
@@ -839,6 +895,32 @@ class ConflictResolutionDialog(QDialog):
             return combo
 
         details = _value(conflict, "details", default={})
+        if conflict_type == "MULTIPLE_EXPENSE_SAME_CELL":
+            combo = QComboBox()
+            combo.setObjectName(f"selectConflictSourceItem_{row}")
+            combo.addItem("— Chọn dòng JSON —", None)
+            for option in _sequence(
+                _value(details, "source_item_options", default=())
+            ):
+                source_index = _value(option, "source_item_index")
+                amount = _format_amount(_value(option, "amount"))
+                invoice = _value(option, "invoice_no")
+                label = f"Dòng {int(source_index) + 1}: {amount}"
+                if invoice not in (None, ""):
+                    label += f" – HĐ {invoice}"
+                combo.addItem(label, source_index)
+            self._selected_source_items[conflict_id] = combo
+            return combo
+        if conflict_type == "MULTIPLE_SOURCE_INVOICES":
+            combo = QComboBox()
+            combo.setObjectName(f"selectConflictInvoice_{row}")
+            combo.addItem("— Chọn Số HĐ —", None)
+            for invoice in _sequence(
+                _value(details, "invoice_candidates", default=())
+            ):
+                combo.addItem(str(invoice), str(invoice))
+            self._selected_invoices[conflict_id] = combo
+            return combo
         sheet_candidates = _sequence(
             _value(
                 conflict,
@@ -901,7 +983,14 @@ class ConflictResolutionDialog(QDialog):
             return
         selected_row = dialog.selected_row
         self._selected_rows[conflict_id] = selected_row
-        button.setText(f"Dòng {selected_row}")
+        selected_source_sheet = dialog.selected_source_sheet
+        if selected_source_sheet:
+            self._selected_source_sheets[conflict_id] = selected_source_sheet
+        button.setText(
+            f"{selected_source_sheet} – dòng {selected_row}"
+            if selected_source_sheet
+            else f"Dòng {selected_row}"
+        )
 
     @staticmethod
     def _actions(conflict: Any, conflict_type: str) -> tuple[Any, ...]:
@@ -915,7 +1004,12 @@ class ConflictResolutionDialog(QDialog):
                 default=(),
             )
         )
-        return explicit or DEFAULT_ACTIONS.get(conflict_type, ("SKIP", "CANCEL_ALL"))
+        actions = explicit or DEFAULT_ACTIONS.get(
+            conflict_type, ("SKIP", "CANCEL_ALL")
+        )
+        if conflict_type == "TARGET_CELL_OCCUPIED":
+            actions = tuple(action for action in actions if _code(action) != "ADD")
+        return actions
 
     @staticmethod
     def _conflict_id(conflict: Any, row: int) -> str:
@@ -934,6 +1028,9 @@ class ConflictResolutionDialog(QDialog):
             if conflict_id in self._selected_rows:
                 payload["selected_row"] = self._selected_rows[conflict_id]
                 payload["row"] = self._selected_rows[conflict_id]
+                payload["selected_source_sheet"] = self._selected_source_sheets.get(
+                    conflict_id
+                )
             if conflict_id in self._selected_fees:
                 fee = self._selected_fees[conflict_id].currentData()
                 payload["selected_fee"] = fee
@@ -947,6 +1044,13 @@ class ConflictResolutionDialog(QDialog):
                 month = self._selected_months[conflict_id].currentData()
                 payload["selected_month"] = month
                 payload["month"] = month
+            if conflict_id in self._selected_invoices:
+                invoice = self._selected_invoices[conflict_id].currentData()
+                payload["selected_invoice"] = invoice
+            if conflict_id in self._selected_source_items:
+                payload["selected_source_item_index"] = self._selected_source_items[
+                    conflict_id
+                ].currentData()
             resolutions[conflict_id] = payload
         return resolutions
 
@@ -974,6 +1078,14 @@ class ConflictResolutionDialog(QDialog):
                 combo = self._selected_months.get(conflict_id)
                 if combo is None or combo.currentData() in (None, ""):
                     missing.append(f"dòng {row + 1}: chưa chọn tháng")
+            if action == "SELECT_INVOICE":
+                combo = self._selected_invoices.get(conflict_id)
+                if combo is None or combo.currentData() in (None, ""):
+                    missing.append(f"dòng {row + 1}: chưa chọn Số HĐ")
+            if action == "SELECT_SOURCE_ITEM":
+                combo = self._selected_source_items.get(conflict_id)
+                if combo is None or combo.currentData() is None:
+                    missing.append(f"dòng {row + 1}: chưa chọn dòng JSON")
         if missing:
             self.validation_label.setText(" • ".join(missing))
             return
@@ -986,6 +1098,7 @@ class PaymentNewRowsDialog(QDialog):
 
     COLUMNS = (
         "Nhập",
+        "Loại sheet",
         "Dòng BK",
         "SQT",
         "Container",
@@ -1041,7 +1154,7 @@ class PaymentNewRowsDialog(QDialog):
             QHeaderView.ResizeMode.ResizeToContents
         )
         self.table.horizontalHeader().setSectionResizeMode(
-            4, QHeaderView.ResizeMode.Stretch
+            5, QHeaderView.ResizeMode.Stretch
         )
         layout.addWidget(self.table, 1)
 
@@ -1082,6 +1195,7 @@ class PaymentNewRowsDialog(QDialog):
                 if value not in (None, "", 0)
             )
             cells = (
+                _value(source, "target_type", default="—"),
                 _value(source, "source_row"),
                 _value(source, "sqt"),
                 _value(source, "container"),

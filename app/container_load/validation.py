@@ -98,8 +98,8 @@ def validate_iso6346(value: object) -> str:
 
 
 def row_fingerprint(row: Sequence[Any]) -> str:
-    if len(row) != 5:
-        raise ValueError("Dòng dùng để tạo fingerprint phải có đúng 5 giá trị.")
+    if len(row) != 7:
+        raise ValueError("Dòng dùng để tạo fingerprint phải có đúng 7 giá trị.")
     payload = json.dumps(
         list(row),
         ensure_ascii=False,

@@ -30,30 +30,56 @@ class Severity(str, Enum):
 
 @dataclass(slots=True)
 class DataRow:
-    """Một dòng theo đúng thứ tự ``[cont, bl, fee, rule, amount]``."""
+    """Một dòng schema v1.
 
-    FIELD_NAMES: ClassVar[tuple[str, ...]] = ("cont", "bl", "fee", "rule", "amount")
+    Thứ tự JSON chính thức là
+    ``[cont, bl, fee, rule, invoice_no, carrier, amount]``. Thuộc tính
+    ``amount`` vẫn đứng trước hai trường mới trong dataclass để các adapter
+    Python cũ dùng năm đối số vị trí không bị hiểu sai.
+    """
+
+    FIELD_NAMES: ClassVar[tuple[str, ...]] = (
+        "cont",
+        "bl",
+        "fee",
+        "rule",
+        "amount",
+        "invoice_no",
+        "carrier",
+    )
 
     cont: str | None
     bl: str | None
     fee: str
     rule: str | None
     amount: int | None
+    invoice_no: str | None = None
+    carrier: str | None = None
 
     @classmethod
     def from_sequence(cls, value: Sequence[Any]) -> "DataRow":
-        if isinstance(value, (str, bytes, bytearray)) or len(value) != 5:
-            raise ValueError("Mỗi dòng dữ liệu phải là một mảng có đúng 5 phần tử.")
+        if isinstance(value, (str, bytes, bytearray)) or len(value) != 7:
+            raise ValueError("Mỗi dòng dữ liệu phải là một mảng có đúng 7 phần tử.")
         return cls(
             cont=value[0],
             bl=value[1],
             fee=value[2],
             rule=value[3],
-            amount=value[4],
+            invoice_no=value[4],
+            carrier=value[5],
+            amount=value[6],
         )
 
     def to_list(self) -> list[Any]:
-        return [self.cont, self.bl, self.fee, self.rule, self.amount]
+        return [
+            self.cont,
+            self.bl,
+            self.fee,
+            self.rule,
+            self.invoice_no,
+            self.carrier,
+            self.amount,
+        ]
 
     def copy_with(self, **changes: Any) -> "DataRow":
         unknown = set(changes).difference(self.FIELD_NAMES)
