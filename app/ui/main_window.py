@@ -993,6 +993,12 @@ class MainWindow(QMainWindow):
                 self._excel_tasks.cancel_waiting()
                 return
             resolutions.update(conflict_dialog.resolution_map())
+            self._excel_tasks.refine_plan(
+                plan,
+                resolutions,
+                operation="payment_sync",
+            )
+            return
 
         new_rows = list(_attribute(plan, "new_rows", default=()) or ())
         if new_rows:
@@ -1021,6 +1027,7 @@ class MainWindow(QMainWindow):
             section += (
                 f"- Dòng mới: {_attribute(target, 'new_count', default=0)}\n"
                 f"- Cập nhật: {_attribute(target, 'update_count', default=0)}\n"
+                f"- Ô Số HĐ sẽ cập nhật: {_attribute(target, 'invoice_change_count', default=0)}\n"
                 f"- Không đổi: {_attribute(target, 'unchanged_count', default=0)}\n"
                 f"- Xung đột: {_attribute(target, 'conflict_count', default=0)}"
             )
@@ -1029,6 +1036,9 @@ class MainWindow(QMainWindow):
         updates = int(_attribute(plan, "update_count", default=0) or 0)
         unchanged = int(_attribute(plan, "unchanged_count", default=0) or 0)
         new_count = int(_attribute(plan, "new_count", default=0) or 0)
+        invoice_changes = int(
+            _attribute(plan, "invoice_change_count", default=0) or 0
+        )
         selected_new_count = len(
             resolutions.get("selected_new_rows", [None] * new_count)
         )
@@ -1057,6 +1067,7 @@ class MainWindow(QMainWindow):
                 f"{creation_detail}"
                 f"{target_detail}\n\n"
                 f"Cập nhật: {updates} dòng\n"
+                f"Ô Số HĐ sẽ cập nhật: {invoice_changes}\n"
                 f"Không đổi: {unchanged} dòng\n"
                 f"Dòng mới được chọn: {selected_new_count}/{new_count}\n"
                 f"Bỏ qua dòng mới: {skipped_new}\n"
@@ -1120,6 +1131,7 @@ class MainWindow(QMainWindow):
                         f"- Đã tạo mới: {'Có' if bool(_attribute(target_result, 'sheet_created', default=False)) else 'Không'}\n"
                         f"- Đã cập nhật: {_attribute(target_result, 'updated_rows', default=0)}\n"
                         f"- Đã thêm: {_attribute(target_result, 'inserted_rows', default=0)}\n"
+                        f"- Ô Số HĐ đã ghi: {_attribute(target_result, 'invoice_written_cells', default=0)}\n"
                         f"- Không đổi: {_attribute(target_result, 'unchanged_rows', default=0)}\n"
                         f"- Bỏ qua: {_attribute(target_result, 'skipped_rows', default=0)}"
                     )
@@ -1134,6 +1146,7 @@ class MainWindow(QMainWindow):
                 f"{'Có' if bool(_attribute(result, 'sheet_created', default=False)) else 'Không'}\n"
                 f"Đã cập nhật: {_attribute(result, 'updated_rows', default=0)} dòng\n"
                 f"Đã thêm: {_attribute(result, 'inserted_rows', default=0)} dòng\n"
+                f"Ô Số HĐ đã ghi: {_attribute(result, 'invoice_written_cells', default=0) or 0}\n"
                 f"Không đổi: {_attribute(result, 'unchanged_rows', default=0)} dòng\n"
                 f"Bỏ qua: {_attribute(result, 'skipped_rows', default=0)} dòng"
             )

@@ -545,8 +545,16 @@ class PaymentSyncItem:
     values: dict[str, Any]
     target_type: str = "NAM"
     target_row: int | None = None
+    write_identity: bool = False
+    skip_item: bool = False
     status: str = "NEW"
     differences: dict[str, tuple[Any, Any]] = field(default_factory=dict)
+    amount_actions: dict[str, ResolutionAction] = field(default_factory=dict)
+    invoice_values: dict[str, str | None] = field(default_factory=dict)
+    invoice_candidates: dict[str, list[str]] = field(default_factory=dict)
+    selected_invoices: dict[str, str] = field(default_factory=dict)
+    invoice_actions: dict[str, ResolutionAction] = field(default_factory=dict)
+    invoice_differences: dict[str, tuple[Any, str]] = field(default_factory=dict)
 
     @property
     def is_new(self) -> bool:
@@ -577,6 +585,12 @@ class PaymentSyncConflict:
     )
     default_action: ResolutionAction = ResolutionAction.SKIP
     row_candidates: list[RowCandidate] = field(default_factory=list)
+    fee: str | None = None
+    sheet_name: str | None = None
+    target_row: int | None = None
+    target_column: int | None = None
+    target_cell: str | None = None
+    current_value: Any = None
     details: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -624,6 +638,10 @@ class PaymentTargetPlan:
     @property
     def conflict_count(self) -> int:
         return len(self.conflicts)
+
+    @property
+    def invoice_change_count(self) -> int:
+        return sum(len(item.invoice_differences) for item in self.items)
 
 
 @dataclass(slots=True)
@@ -706,6 +724,10 @@ class PaymentSyncPlan:
         return len(self.conflicts)
 
     @property
+    def invoice_change_count(self) -> int:
+        return sum(target.invoice_change_count for target in self.targets.values())
+
+    @property
     def has_changes(self) -> bool:
         return (
             self.target_sheet_created
@@ -735,6 +757,7 @@ class PaymentTargetResult:
     unchanged_rows: int = 0
     skipped_rows: int = 0
     conflict_count: int = 0
+    invoice_written_cells: int = 0
 
 
 @dataclass(slots=True)
@@ -793,6 +816,12 @@ class PaymentSyncResult:
     @property
     def conflict_count(self) -> int:
         return sum(result.conflict_count for result in self.target_results.values())
+
+    @property
+    def invoice_written_cells(self) -> int:
+        return sum(
+            result.invoice_written_cells for result in self.target_results.values()
+        )
 
 
 Plan = SyncPlan | PostingPlan | PaymentSyncPlan

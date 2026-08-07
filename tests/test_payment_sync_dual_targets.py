@@ -131,6 +131,91 @@ def _save_payment(
     workbook.close()
 
 
+def _save_invoice_bk(path: Path, rows: list[dict[str, object]]) -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "T06 26"
+    headers = [
+        "SQT", "Số Container", "Cước biển", "Cước bộ đóng hàng",
+        "Nâng vỏ", "Số HĐ", "Hạ Hàng", "Cột phụ", "Hóa đơn",
+        "Cước VTN", "Hóa đơn VTN", "Nâng Hàng", "số hd", "Hạ vỏ",
+        "Hoá đơn", "VS + D/O", "HD", "LÀM LỆNH", "Lưu cont",
+        "Số hóa đơn", "Quá tải", "HD", "SỬA CHỮA", "Hoá đơn",
+        *SUMMARY_HEADERS,
+    ]
+    for column, header in enumerate(headers, 1):
+        sheet.cell(1, column).value = header
+    amount_columns = {
+        "empty_lift": 5,
+        "loaded_drop": 7,
+        "loaded_lift": 12,
+        "empty_drop": 14,
+        "vs_do": 16,
+        "command_fee": 18,
+        "storage": 19,
+        "overweight": 21,
+        "repair": 23,
+    }
+    invoice_columns = {
+        "empty_lift": 6,
+        "loaded_drop": 9,
+        "loaded_lift": 13,
+        "empty_drop": 15,
+        "vs_do": 17,
+        "storage": 20,
+        "overweight": 22,
+        "repair": 24,
+    }
+    for row_number, values in enumerate(rows, 2):
+        sheet.cell(row_number, 1).value = values["sqt"]
+        sheet.cell(row_number, 2).value = values["container"]
+        for field, column in amount_columns.items():
+            sheet.cell(row_number, column).value = values.get(field)
+        for field, column in invoice_columns.items():
+            sheet.cell(row_number, column).value = values.get(f"invoice_{field}")
+    workbook.save(path)
+    workbook.close()
+
+
+def _save_invoice_payment(
+    path: Path,
+    *,
+    hp_invoice: object | None = None,
+    nam_invoice: object | None = None,
+) -> None:
+    workbook = Workbook()
+    hp = workbook.active
+    hp.title = "T06 26 HP"
+    hp_headers = ("QT", "SỐ CONT", "HẠ HÀNG", "Cột phụ", "Số HD", "Ghi chú", "Date cập nhật")
+    for column, header in enumerate(hp_headers, 1):
+        hp.cell(7, column).value = header
+    hp.append([])
+    hp["A8"], hp["B8"], hp["C8"], hp["E8"] = 700, "CONT700", 20, hp_invoice
+    hp["C12"] = "=SUM(C8:C11)"
+
+    nam = workbook.create_sheet("T06 26 NAM")
+    nam_headers = (
+        "QT", "SỐ CONT", "NÂNG VỎ", "Số HD", "NÂNG HÀNG", "Số HD",
+        "HẠ VỎ", "Số HD", "VS + D/O", "Số HD", "LÀM LỆNH",
+        "Lưu Cont", "Số HD", "Sửa chữa Cont", "Số HD", "QUÁ TẢI",
+        "Số HD", "QT", "Tổng", "Date cập nhật",
+    )
+    for column, header in enumerate(nam_headers, 1):
+        nam.cell(7, column).value = header
+    nam["A8"], nam["B8"] = 700, "CONT700"
+    for coordinate, value in {
+        "C8": 10, "E8": 30, "G8": 40, "I8": 50, "K8": 60,
+        "L8": 70, "N8": 80, "P8": 90,
+    }.items():
+        nam[coordinate] = value
+    nam["D8"] = nam_invoice
+    for column in (3, 5, 7, 9, 11, 12, 14, 16):
+        letter = nam.cell(1, column).column_letter
+        nam.cell(12, column).value = f"=SUM({letter}8:{letter}11)"
+    workbook.save(path)
+    workbook.close()
+
+
 def _service(
     bk: Path,
     payment: Path,
@@ -415,13 +500,235 @@ def test_real_workbooks_analyze_and_apply_only_on_temporary_copies(tmp_path: Pat
     plan = service.analyze(source_sheet_name="T06 26")
     result = service.apply(plan, {})
 
-    assert plan.targets["HP"].template_sheet == "T05 26 HP"
-    assert plan.targets["NAM"].template_sheet == "T05 26 NAM"
-    assert result.target_results["HP"].inserted_rows > 0
-    assert result.target_results["NAM"].inserted_rows > 0
+    assert not plan.targets["HP"].sheet_to_create
+    assert not plan.targets["NAM"].sheet_to_create
+    assert plan.invoice_change_count == 117
+    assert result.invoice_written_cells == 117
+    written = load_workbook(target, read_only=False, data_only=False, keep_vba=True)
+    try:
+        assert written["T06 26 HP"]["D8"].value == "17510 - HA"
+        assert written["T06 26 NAM"]["D8"].value == "102"
+    finally:
+        written.close()
     with zipfile.ZipFile(target) as package:
         assert any(name.lower().endswith("vbaproject.bin") for name in package.namelist())
     assert [path.name for path in (tmp_path / "runtime" / "Backup").glob("*")] == [
         "THANH_TOAN_NANG_HA_VS_DO_latest.xlsm"
     ]
     assert (_sha(source_fixture), _sha(target_fixture)) == original_hashes
+
+
+def _invoice_source_row(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "sqt": 700,
+        "container": "CONT700",
+        "empty_lift": 10,
+        "loaded_drop": 20,
+        "loaded_lift": 30,
+        "empty_drop": 40,
+        "vs_do": 50,
+        "command_fee": 60,
+        "storage": 70,
+        "repair": 80,
+        "overweight": 90,
+        "invoice_empty_lift": "INV-NV",
+        "invoice_loaded_drop": "INV-HH",
+        "invoice_loaded_lift": "INV-NH",
+        "invoice_empty_drop": "INV-HV",
+        "invoice_vs_do": "INV-VS",
+        "invoice_storage": "INV-LC",
+        "invoice_repair": "INV-SC",
+        "invoice_overweight": "INV-QT",
+    }
+    row.update(overrides)
+    return row
+
+
+def test_payment_sync_resolves_shifted_invoice_headers_and_writes_invoice_only(
+    tmp_path: Path,
+) -> None:
+    bk, payment = tmp_path / "bk.xlsx", tmp_path / "payment.xlsx"
+    _save_invoice_bk(bk, [_invoice_source_row()])
+    _save_invoice_payment(payment)
+    service = _service(bk, payment, tmp_path / "runtime")
+
+    plan = service.analyze(source_sheet_name="T06 26")
+
+    assert plan.conflict_count == 0
+    assert plan.invoice_change_count == 8
+    assert plan.update_count == 2
+    result = service.apply(plan, {})
+    assert result.invoice_written_cells == 8
+    workbook = load_workbook(payment, data_only=False)
+    try:
+        assert workbook["T06 26 HP"]["E8"].value == "INV-HH"
+        assert [
+            workbook["T06 26 NAM"][coordinate].value
+            for coordinate in ("D8", "F8", "H8", "J8", "M8", "O8", "Q8")
+        ] == [
+            "INV-NV", "INV-NH", "INV-HV", "INV-VS", "INV-LC", "INV-SC", "INV-QT"
+        ]
+        assert workbook["T06 26 HP"]["G8"].value is not None
+        assert workbook["T06 26 NAM"]["T8"].value is not None
+    finally:
+        workbook.close()
+
+
+def test_payment_invoice_conflict_defaults_to_keep_existing(tmp_path: Path) -> None:
+    bk, payment = tmp_path / "bk.xlsx", tmp_path / "payment.xlsx"
+    row = _invoice_source_row(**{
+        key: None
+        for key in _invoice_source_row()
+        if key.startswith("invoice_")
+    })
+    row["invoice_loaded_drop"] = "00102"
+    _save_invoice_bk(bk, [row])
+    _save_invoice_payment(payment, hp_invoice=102)
+    service = _service(bk, payment, tmp_path / "runtime")
+
+    plan = service.analyze(source_sheet_name="T06 26")
+    conflict = next(
+        conflict
+        for conflict in plan.conflicts
+        if conflict.conflict_type is ConflictType.INVOICE_VALUE_CONFLICT
+    )
+    assert conflict.default_action is ResolutionAction.KEEP_EXISTING
+
+    result = service.apply(plan, {})
+    assert result.invoice_written_cells == 0
+    workbook = load_workbook(payment, data_only=False)
+    try:
+        assert workbook["T06 26 HP"]["E8"].value == 102
+    finally:
+        workbook.close()
+
+
+def test_payment_invoice_conflict_can_overwrite_without_skipping_amount(
+    tmp_path: Path,
+) -> None:
+    bk, payment = tmp_path / "bk.xlsx", tmp_path / "payment.xlsx"
+    row = _invoice_source_row(loaded_drop=25)
+    _save_invoice_bk(bk, [row])
+    _save_invoice_payment(payment, hp_invoice="OLD")
+    service = _service(bk, payment, tmp_path / "runtime")
+    plan = service.analyze(source_sheet_name="T06 26")
+    conflict = next(
+        conflict
+        for conflict in plan.conflicts
+        if conflict.conflict_type is ConflictType.INVOICE_VALUE_CONFLICT
+        and conflict.details["field"] == "loaded_drop"
+    )
+
+    result = service.apply(
+        plan,
+        {conflict.conflict_id: {"action": "OVERWRITE"}},
+    )
+
+    assert result.invoice_written_cells >= 1
+    workbook = load_workbook(payment, data_only=False)
+    try:
+        assert workbook["T06 26 HP"]["C8"].value == 25
+        assert workbook["T06 26 HP"]["E8"].value == "INV-HH"
+    finally:
+        workbook.close()
+
+
+def test_payment_multiple_source_invoices_are_refined_before_apply(
+    tmp_path: Path,
+) -> None:
+    bk, payment = tmp_path / "bk.xlsx", tmp_path / "payment.xlsx"
+    first = _invoice_source_row(invoice_loaded_drop="INV-A")
+    second = _invoice_source_row(invoice_loaded_drop="INV-B")
+    for field in ("empty_lift", "loaded_lift", "empty_drop", "vs_do", "command_fee", "storage", "repair", "overweight"):
+        second[field] = None
+        second[f"invoice_{field}"] = None
+    _save_invoice_bk(bk, [first, second])
+    _save_invoice_payment(payment)
+    service = _service(bk, payment, tmp_path / "runtime")
+    plan = service.analyze(source_sheet_name="T06 26")
+    conflict = next(
+        conflict
+        for conflict in plan.conflicts
+        if conflict.conflict_type is ConflictType.MULTIPLE_SOURCE_INVOICES
+    )
+
+    refined = service.refine(
+        plan,
+        {
+            conflict.conflict_id: {
+                "action": "SELECT_INVOICE",
+                "selected_invoice": "INV-B",
+            }
+        },
+    )
+
+    assert not refined.conflicts
+    result = service.apply(refined, {})
+    assert result.invoice_written_cells == 8
+    workbook = load_workbook(payment, data_only=False)
+    try:
+        assert workbook["T06 26 HP"]["E8"].value == "INV-B"
+    finally:
+        workbook.close()
+
+
+@pytest.mark.parametrize("headers", [(None, "Ghi chú"), ("Số HD", "HD")])
+def test_missing_or_ambiguous_payment_invoice_header_skips_only_invoice(
+    tmp_path: Path,
+    headers: tuple[str | None, str],
+) -> None:
+    bk, payment = tmp_path / "bk.xlsx", tmp_path / "payment.xlsx"
+    row = _invoice_source_row(loaded_drop=25)
+    for key in tuple(row):
+        if key.startswith("invoice_") and key != "invoice_loaded_drop":
+            row[key] = None
+    _save_invoice_bk(bk, [row])
+    _save_invoice_payment(payment)
+    workbook = load_workbook(payment)
+    workbook["T06 26 HP"]["E7"], workbook["T06 26 HP"]["F7"] = headers
+    workbook.save(payment)
+    workbook.close()
+    service = _service(bk, payment, tmp_path / "runtime")
+
+    plan = service.analyze(source_sheet_name="T06 26")
+    conflict = next(
+        conflict
+        for conflict in plan.conflicts
+        if conflict.conflict_type is ConflictType.INVOICE_COLUMN_MISSING
+    )
+    assert conflict.default_action is ResolutionAction.SKIP_INVOICE
+
+    result = service.apply(plan, {})
+    assert result.invoice_written_cells == 0
+    workbook = load_workbook(payment, data_only=False)
+    try:
+        assert workbook["T06 26 HP"]["C8"].value == 25
+    finally:
+        workbook.close()
+
+
+def test_blank_bk_invoice_never_clears_existing_payment_invoice(tmp_path: Path) -> None:
+    bk, payment = tmp_path / "bk.xlsx", tmp_path / "payment.xlsx"
+    row = _invoice_source_row()
+    for key in tuple(row):
+        if key.startswith("invoice_"):
+            row[key] = None
+    _save_invoice_bk(bk, [row])
+    _save_invoice_payment(payment, hp_invoice="KEEP-ME", nam_invoice="KEEP-NAM")
+    service = _service(bk, payment, tmp_path / "runtime")
+
+    plan = service.analyze(source_sheet_name="T06 26")
+    assert not any(
+        conflict.conflict_type
+        in {ConflictType.INVOICE_VALUE_CONFLICT, ConflictType.INVOICE_COLUMN_MISSING}
+        for conflict in plan.conflicts
+    )
+    result = service.apply(plan, {})
+
+    assert result.invoice_written_cells == 0
+    workbook = load_workbook(payment, data_only=False)
+    try:
+        assert workbook["T06 26 HP"]["E8"].value == "KEEP-ME"
+        assert workbook["T06 26 NAM"]["D8"].value == "KEEP-NAM"
+    finally:
+        workbook.close()

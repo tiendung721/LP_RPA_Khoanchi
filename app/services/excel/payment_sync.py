@@ -110,6 +110,37 @@ NAM_FIELDS: tuple[str, ...] = (
 )
 SYNC_SOURCE_FIELDS: tuple[str, ...] = ("sqt", "container", *HP_FIELDS, *NAM_FIELDS)
 
+INVOICE_FIELDS: tuple[str, ...] = (
+    "empty_lift",
+    "loaded_drop",
+    "loaded_lift",
+    "empty_drop",
+    "vs_do",
+    "storage",
+    "repair",
+    "overweight",
+)
+INVOICE_HEADER_ALIASES: tuple[str, ...] = (
+    "Số HĐ",
+    "Số HD",
+    "Số hóa đơn",
+    "Số hoá đơn",
+    "Hóa đơn",
+    "Hoá đơn",
+    "HD",
+)
+FIELD_LABELS: dict[str, str] = {
+    "empty_lift": "Nâng vỏ",
+    "loaded_drop": "Hạ hàng",
+    "loaded_lift": "Nâng hàng",
+    "empty_drop": "Hạ vỏ",
+    "vs_do": "VS + D/O",
+    "command_fee": "Làm lệnh",
+    "storage": "Lưu cont",
+    "repair": "Sửa chữa",
+    "overweight": "Quá tải",
+}
+
 TARGET_DETAIL_HEADERS: dict[str, tuple[str, ...]] = {
     "sqt": ("QT",),
     "container": ("SỐ CONT", "Số Container"),
@@ -216,6 +247,41 @@ def _number(value: Decimal) -> int | float:
     if value == integral:
         return int(integral)
     return float(value)
+
+
+def _invoice_text(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    text = str(value).strip()
+    return text or None
+
+
+def _invoice_key(value: Any) -> str | None:
+    text = _invoice_text(value)
+    if text is None:
+        return None
+    return " ".join(text.split()).casefold()
+
+
+def _unique_invoice_values(values: Sequence[Any]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = _invoice_text(value)
+        key = _invoice_key(text)
+        if text is None or key is None or key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
 
 
 class ArithmeticFormulaEvaluator:
@@ -363,6 +429,53 @@ def _required_column(
             f"{len(matches)} cột phù hợp."
         )
     return matches[0]
+
+
+@dataclass(frozen=True, slots=True)
+class InvoiceColumnResolution:
+    columns: dict[str, int]
+    candidates: dict[str, tuple[int, ...]]
+
+    def issue(self, field: str) -> str | None:
+        matches = self.candidates.get(field, ())
+        if len(matches) == 1:
+            return None
+        if not matches:
+            return "không tìm thấy header Số HĐ trong nhóm khoản chi"
+        return f"có {len(matches)} header Số HĐ trong cùng nhóm khoản chi"
+
+
+def _resolve_paired_invoice_columns(
+    headers: Mapping[int, str],
+    amount_columns: Mapping[str, int],
+    *,
+    boundary: int | None,
+) -> InvoiceColumnResolution:
+    """Ghép header hóa đơn theo vùng từ khoản chi đến khoản chi kế tiếp."""
+
+    invoice_headers = {normalize_header(value) for value in INVOICE_HEADER_ALIASES}
+    ordered_amount_columns = sorted(set(amount_columns.values()))
+    result: dict[str, int] = {}
+    candidates: dict[str, tuple[int, ...]] = {}
+    for field in INVOICE_FIELDS:
+        amount_column = amount_columns.get(field)
+        if amount_column is None:
+            continue
+        following = [
+            column for column in ordered_amount_columns if column > amount_column
+        ]
+        end = following[0] if following else boundary
+        matches = tuple(
+            column
+            for column, header in headers.items()
+            if column > amount_column
+            and (end is None or column < end)
+            and header in invoice_headers
+        )
+        candidates[field] = matches
+        if len(matches) == 1:
+            result[field] = matches[0]
+    return InvoiceColumnResolution(result, candidates)
 
 
 def _copy_cell_style(source: Any, target: Any) -> None:
@@ -940,6 +1053,9 @@ def _analyze_target(
     evaluator = ArithmeticFormulaEvaluator(worksheet)
     conflicts: list[PaymentSyncConflict] = []
     for item in items:
+        if item.skip_item:
+            item.status = "SKIPPED"
+            continue
         if item.item_id in item_errors:
             conflicts.append(
                 PaymentSyncConflict(
@@ -1432,6 +1548,8 @@ class ResolvedPaymentProfile:
     target_type: str
     header_row: int
     columns: dict[str, int]
+    invoice_columns: dict[str, int]
+    invoice_candidates: dict[str, tuple[int, ...]]
     data_start_row: int
     total_row: int
     effective_max_column: int
@@ -1445,10 +1563,12 @@ class PaymentSheetProfile:
     def resolve(self, worksheet: Any) -> ResolvedPaymentProfile:
         scan_columns = _effective_max_column(worksheet)
         scan_rows = min(30, _effective_max_row(worksheet))
-        required = ("sqt", "container", *self.managed_fields, "date")
+        required = ("sqt", "container", "date")
+        fields = ("sqt", "container", *self.managed_fields, "date")
         best_row = 1
         best_score = -1
         best_matches: dict[str, list[int]] = {}
+        best_boundary: int | None = None
         for row in range(1, scan_rows + 1):
             headers = {
                 column: normalize_header(worksheet.cell(row, column).value)
@@ -1460,7 +1580,7 @@ class PaymentSheetProfile:
             # between detail columns and that summary block.
             detail_boundary = qt_matches[1] if len(qt_matches) > 1 else None
             matches = {}
-            for field in required:
+            for field in fields:
                 matches[field] = _matching_columns(
                     headers,
                     self.aliases[field],
@@ -1469,21 +1589,46 @@ class PaymentSheetProfile:
             score = sum(bool(value) for value in matches.values())
             if score > best_score:
                 best_row, best_score, best_matches = row, score, matches
-            if all(len(value) == 1 for value in matches.values()):
-                best_row, best_matches = row, matches
-                break
+                best_boundary = detail_boundary
         invalid = {
             field: len(best_matches.get(field, ()))
             for field in required
             if len(best_matches.get(field, ())) != 1
         }
+        ambiguous_optional = {
+            field: len(best_matches.get(field, ()))
+            for field in self.managed_fields
+            if len(best_matches.get(field, ())) > 1
+        }
+        invalid.update(ambiguous_optional)
         if invalid:
             detail = ", ".join(f"{field}={count}" for field, count in invalid.items())
             raise PaymentSyncError(
                 f"Cấu trúc sheet {worksheet.title} ({self.target_type}) không hợp lệ; "
                 f"cột bắt buộc thiếu hoặc trùng: {detail}."
             )
-        columns = {field: values[0] for field, values in best_matches.items()}
+        columns = {
+            field: values[0]
+            for field, values in best_matches.items()
+            if len(values) == 1
+        }
+        headers = {
+            column: normalize_header(worksheet.cell(best_row, column).value)
+            for column in range(1, scan_columns + 1)
+        }
+        invoice_boundary_candidates = [
+            value
+            for value in (best_boundary, columns.get("date"))
+            if value is not None
+        ]
+        invoice_boundary = (
+            min(invoice_boundary_candidates) if invoice_boundary_candidates else None
+        )
+        invoice_resolution = _resolve_paired_invoice_columns(
+            headers,
+            {field: columns[field] for field in self.managed_fields if field in columns},
+            boundary=invoice_boundary,
+        )
         total_row = self.find_total_row(
             worksheet,
             header_row=best_row,
@@ -1493,6 +1638,8 @@ class PaymentSheetProfile:
             target_type=self.target_type,
             header_row=best_row,
             columns=columns,
+            invoice_columns=invoice_resolution.columns,
+            invoice_candidates=invoice_resolution.candidates,
             data_start_row=best_row + 1,
             total_row=total_row,
             effective_max_column=max(scan_columns, max(columns.values())),
@@ -1518,6 +1665,7 @@ class PaymentSheetProfile:
                     re.IGNORECASE,
                 )
                 for field in self.managed_fields
+                if field in columns
             ):
                 return row
         raise PaymentSyncError(
@@ -1530,7 +1678,11 @@ class PaymentSheetProfile:
         row: int,
         resolved: ResolvedPaymentProfile,
     ) -> bool:
-        fields = ("sqt", "container", *self.managed_fields)
+        fields = (
+            "sqt",
+            "container",
+            *(field for field in self.managed_fields if field in resolved.columns),
+        )
         return all(
             worksheet.cell(row, resolved.columns[field]).value in (None, "", 0, 0.0)
             for field in fields
@@ -1581,10 +1733,17 @@ def _has_money(value: Any) -> bool:
         return True
 
 
-def _source_sync_columns(worksheet: Any) -> dict[str, int]:
+@dataclass(frozen=True, slots=True)
+class ResolvedSourceSyncColumns:
+    columns: dict[str, int]
+    invoice_columns: dict[str, int]
+    invoice_candidates: dict[str, tuple[int, ...]]
+
+
+def _source_sync_columns(worksheet: Any) -> ResolvedSourceSyncColumns:
     summary_start = find_summary_start(worksheet)
     headers = _header_values(worksheet)
-    return {
+    columns = {
         field: _required_column(
             headers,
             BK_HEADER_ALIASES[field],
@@ -1593,6 +1752,25 @@ def _source_sync_columns(worksheet: Any) -> dict[str, int]:
         )
         for field in SYNC_SOURCE_FIELDS
     }
+    pairing_amount_columns = dict(columns)
+    for field in PAYMENT_FIELDS:
+        matches = _matching_columns(
+            headers,
+            BK_HEADER_ALIASES[field],
+            before=summary_start,
+        )
+        if len(matches) == 1:
+            pairing_amount_columns[field] = matches[0]
+    invoice_resolution = _resolve_paired_invoice_columns(
+        headers,
+        pairing_amount_columns,
+        boundary=summary_start,
+    )
+    return ResolvedSourceSyncColumns(
+        columns=columns,
+        invoice_columns=invoice_resolution.columns,
+        invoice_candidates=invoice_resolution.candidates,
+    )
 
 
 def _source_target_items(
@@ -1600,7 +1778,8 @@ def _source_target_items(
     *,
     normalization_issues: Sequence[NormalizationIssue],
 ) -> tuple[dict[str, list[PaymentSyncItem]], dict[str, str]]:
-    columns = _source_sync_columns(worksheet)
+    source_columns = _source_sync_columns(worksheet)
+    columns = source_columns.columns
     evaluator = ArithmeticFormulaEvaluator(worksheet)
     grouped: dict[tuple[int, str], list[int]] = defaultdict(list)
     for row in _data_rows(
@@ -1621,30 +1800,72 @@ def _source_target_items(
     errors: dict[str, str] = {}
     for (sqt, container), rows in grouped.items():
         values: dict[str, Any] = {}
-        row_errors = [issues_by_row[row] for row in rows if row in issues_by_row]
+        invoice_values: dict[str, str | None] = {}
+        invoice_candidates: dict[str, list[str]] = {}
+        base_errors = [issues_by_row[row] for row in rows if row in issues_by_row]
+        field_errors: dict[str, list[str]] = defaultdict(list)
         for field in (*HP_FIELDS, *NAM_FIELDS):
             nonzero: list[Any] = []
             saw_zero = False
+            invoices_for_money: list[str] = []
+            orphan_invoices: list[str] = []
+            invoice_column = source_columns.invoice_columns.get(field)
             for row in rows:
                 cell = worksheet.cell(row, columns[field])
+                amount_has_money = False
                 if cell.value in (None, ""):
-                    continue
-                try:
-                    value = evaluator.value(cell)
-                except PaymentSyncError as exc:
-                    row_errors.append(f"{field}: {exc}")
-                    continue
-                if _has_money(value):
-                    nonzero.append(value)
+                    value = None
                 else:
-                    saw_zero = True
-            if len(nonzero) > 1:
-                row_errors.append(
-                    f"{field}: có nhiều dòng cùng SQT/container chứa số tiền."
+                    try:
+                        value = evaluator.value(cell)
+                    except PaymentSyncError as exc:
+                        field_errors[field].append(f"{field}: {exc}")
+                        value = None
+                    if _has_money(value):
+                        amount_has_money = True
+                        nonzero.append(value)
+                    else:
+                        saw_zero = True
+                invoice = (
+                    _invoice_text(worksheet.cell(row, invoice_column).value)
+                    if invoice_column is not None
+                    else None
                 )
+                if invoice is not None:
+                    if amount_has_money:
+                        invoices_for_money.append(invoice)
+                    else:
+                        orphan_invoices.append(invoice)
+            if len(nonzero) > 1:
+                first = nonzero[0]
+                if any(not _numeric_equal(first, value) for value in nonzero[1:]):
+                    field_errors[field].append(
+                        f"{field}: có nhiều dòng cùng SQT/container chứa số tiền khác nhau."
+                    )
             values[field] = nonzero[0] if nonzero else (0 if saw_zero else None)
+            unique_invoices = _unique_invoice_values(invoices_for_money)
+            invoice_candidates[field] = unique_invoices
+            invoice_values[field] = (
+                unique_invoices[0] if len(unique_invoices) == 1 else None
+            )
+            if orphan_invoices:
+                field_errors[field].append(
+                    f"{field}: có Số HĐ nhưng khoản chi tương ứng trống hoặc bằng 0."
+                )
+            source_matches = source_columns.invoice_candidates.get(field, ())
+            if len(source_matches) > 1 and any(
+                _invoice_text(worksheet.cell(row, column).value) is not None
+                for row in rows
+                for column in source_matches
+            ):
+                field_errors[field].append(
+                    f"{field}: không xác định duy nhất cột Số HĐ nguồn."
+                )
         for target_type, fields in (("HP", HP_FIELDS), ("NAM", NAM_FIELDS)):
-            if not any(_has_money(values[field]) for field in fields):
+            if not any(
+                _has_money(values[field]) or invoice_candidates.get(field)
+                for field in fields
+            ):
                 continue
             item_id = _stable_id(worksheet.title, target_type, sqt, container, rows)
             item = PaymentSyncItem(
@@ -1654,11 +1875,30 @@ def _source_target_items(
                 sqt=sqt,
                 container=container,
                 values={field: values[field] for field in fields},
+                invoice_values={
+                    field: invoice_values.get(field)
+                    for field in fields
+                    if field in INVOICE_FIELDS
+                },
+                invoice_candidates={
+                    field: list(invoice_candidates.get(field, ()))
+                    for field in fields
+                    if field in INVOICE_FIELDS
+                    and invoice_candidates.get(field)
+                },
                 target_type=target_type,
             )
-            if row_errors:
+            target_errors = [
+                *base_errors,
+                *(
+                    error
+                    for field in fields
+                    for error in field_errors.get(field, ())
+                ),
+            ]
+            if target_errors:
                 item.status = "INVALID"
-                errors[item_id] = " • ".join(dict.fromkeys(row_errors))
+                errors[item_id] = " • ".join(dict.fromkeys(target_errors))
             result[target_type].append(item)
     return result, errors
 
@@ -1684,11 +1924,208 @@ def _profile_target_index(
     return exact, by_sqt, by_container
 
 
+def _invoice_conflict(
+    *,
+    item: PaymentSyncItem,
+    worksheet: Any,
+    field: str,
+    conflict_type: ConflictType,
+    message: str,
+    allowed_actions: tuple[ResolutionAction, ...],
+    default_action: ResolutionAction,
+    row: int | None = None,
+    column: int | None = None,
+    current_value: Any = None,
+    details: Mapping[str, Any] | None = None,
+) -> PaymentSyncConflict:
+    payload = {
+        "scope": "invoice",
+        "field": field,
+        "fee_label": FIELD_LABELS.get(field, field),
+        "sheet_name": worksheet.title,
+        "target_type": item.target_type,
+        **dict(details or {}),
+    }
+    return PaymentSyncConflict(
+        conflict_id=_stable_id(
+            conflict_type.value,
+            item.item_id,
+            field,
+            row,
+            column,
+            _invoice_text(current_value),
+        ),
+        conflict_type=conflict_type,
+        message=message,
+        item_id=item.item_id,
+        source_row=item.source_row,
+        sqt=item.sqt,
+        container=item.container,
+        allowed_actions=allowed_actions,
+        default_action=default_action,
+        fee=FIELD_LABELS.get(field, field),
+        sheet_name=worksheet.title,
+        target_row=row,
+        target_column=column,
+        target_cell=(
+            worksheet.cell(row, column).coordinate
+            if row is not None and column is not None
+            else None
+        ),
+        current_value=current_value,
+        details=payload,
+    )
+
+
+def _analyze_item_invoices(
+    worksheet: Any,
+    resolved: ResolvedPaymentProfile,
+    item: PaymentSyncItem,
+    *,
+    row: int | None,
+) -> list[PaymentSyncConflict]:
+    conflicts: list[PaymentSyncConflict] = []
+    item.invoice_differences = {}
+    for field in INVOICE_FIELDS:
+        if field not in item.values:
+            continue
+        candidates = list(item.invoice_candidates.get(field, ()))
+        selected = item.selected_invoices.get(field)
+        if selected is not None and _invoice_key(selected) not in {
+            _invoice_key(value) for value in candidates
+        }:
+            selected = None
+            item.selected_invoices.pop(field, None)
+        if len(candidates) > 1 and selected is None:
+            candidate_column = resolved.invoice_columns.get(field)
+            candidate_current = (
+                worksheet.cell(row, candidate_column).value
+                if row is not None and candidate_column is not None
+                else None
+            )
+            conflicts.append(
+                _invoice_conflict(
+                    item=item,
+                    worksheet=worksheet,
+                    field=field,
+                    conflict_type=ConflictType.MULTIPLE_SOURCE_INVOICES,
+                    message=(
+                        "Nhiều Số HĐ khác nhau cùng trỏ tới một khoản chi; "
+                        "hãy chọn một Số HĐ."
+                    ),
+                    allowed_actions=(ResolutionAction.SELECT_INVOICE,),
+                    default_action=ResolutionAction.SELECT_INVOICE,
+                    row=row,
+                    column=candidate_column,
+                    current_value=candidate_current,
+                    details={"invoice_candidates": candidates},
+                )
+            )
+            continue
+        incoming = selected or item.invoice_values.get(field)
+        if incoming is None and len(candidates) == 1:
+            incoming = candidates[0]
+        incoming = _invoice_text(incoming)
+        if incoming is None:
+            continue
+        action = item.invoice_actions.get(field)
+        if field not in resolved.columns:
+            if action not in {ResolutionAction.SKIP_INVOICE, ResolutionAction.SKIP}:
+                conflicts.append(
+                    _invoice_conflict(
+                        item=item,
+                        worksheet=worksheet,
+                        field=field,
+                        conflict_type=ConflictType.INVOICE_COLUMN_MISSING,
+                        message=(
+                            "Sheet Thanh toán không có khoản chi tương ứng để ghi Số HĐ."
+                        ),
+                        allowed_actions=(
+                            ResolutionAction.SKIP_INVOICE,
+                            ResolutionAction.CANCEL_ALL,
+                        ),
+                        default_action=ResolutionAction.SKIP_INVOICE,
+                        row=row,
+                        details={"invoice_candidates": [incoming]},
+                    )
+                )
+            continue
+        column = resolved.invoice_columns.get(field)
+        if column is None:
+            if action not in {ResolutionAction.SKIP_INVOICE, ResolutionAction.SKIP}:
+                candidate_columns = resolved.invoice_candidates.get(field, ())
+                reason = (
+                    "không có header Số HĐ"
+                    if not candidate_columns
+                    else "có nhiều header Số HĐ"
+                )
+                conflicts.append(
+                    _invoice_conflict(
+                        item=item,
+                        worksheet=worksheet,
+                        field=field,
+                        conflict_type=ConflictType.INVOICE_COLUMN_MISSING,
+                        message=(
+                            f"Nhóm {FIELD_LABELS.get(field, field)} {reason}; "
+                            "không thể xác định ô ghi an toàn."
+                        ),
+                        allowed_actions=(
+                            ResolutionAction.SKIP_INVOICE,
+                            ResolutionAction.CANCEL_ALL,
+                        ),
+                        default_action=ResolutionAction.SKIP_INVOICE,
+                        row=row,
+                        details={
+                            "invoice_candidates": [incoming],
+                            "candidate_columns": tuple(candidate_columns),
+                        },
+                    )
+                )
+            continue
+        current = worksheet.cell(row, column).value if row is not None else None
+        if _invoice_key(current) == _invoice_key(incoming):
+            continue
+        if _invoice_text(current) is None:
+            item.invoice_differences[field] = (current, incoming)
+            continue
+        if action is ResolutionAction.OVERWRITE:
+            item.invoice_differences[field] = (current, incoming)
+            continue
+        if action in {
+            ResolutionAction.KEEP_EXISTING,
+            ResolutionAction.SKIP_INVOICE,
+            ResolutionAction.SKIP,
+        }:
+            continue
+        item.invoice_differences[field] = (current, incoming)
+        conflicts.append(
+            _invoice_conflict(
+                item=item,
+                worksheet=worksheet,
+                field=field,
+                conflict_type=ConflictType.INVOICE_VALUE_CONFLICT,
+                message="Ô Số HĐ đang có giá trị khác với Số HĐ từ BK.",
+                allowed_actions=(
+                    ResolutionAction.KEEP_EXISTING,
+                    ResolutionAction.OVERWRITE,
+                ),
+                default_action=ResolutionAction.KEEP_EXISTING,
+                row=row,
+                column=column,
+                current_value=current,
+                details={"invoice_candidates": [incoming]},
+            )
+        )
+    return conflicts
+
+
 def _analyze_profile_target(
     worksheet: Any,
     profile: PaymentSheetProfile,
     items: list[PaymentSyncItem],
     item_errors: Mapping[str, str],
+    *,
+    selected_rows: Mapping[str, int] | None = None,
 ) -> list[PaymentSyncConflict]:
     resolved = profile.resolve(worksheet)
     exact, by_sqt, by_container = _profile_target_index(worksheet, resolved)
@@ -1711,13 +2148,22 @@ def _analyze_profile_target(
                 )
             )
             continue
-        matches = exact.get((item.sqt, item.container), ())
+        selected_row = (selected_rows or {}).get(item.item_id)
+        if selected_row is not None:
+            if not (resolved.data_start_row <= selected_row < resolved.total_row):
+                raise PaymentSyncError("Dòng Thanh toán được chọn nằm ngoài vùng dữ liệu.")
+            matches = (selected_row,)
+            item.write_identity = True
+        else:
+            matches = exact.get((item.sqt, item.container), ())
         if len(matches) == 1:
             row = matches[0]
             item.target_row = row
             differences: dict[str, tuple[Any, Any]] = {}
             clear_fields: list[str] = []
             for field in profile.managed_fields:
+                if field not in resolved.columns:
+                    continue
                 cell = worksheet.cell(row, resolved.columns[field])
                 try:
                     current = evaluator.value(cell)
@@ -1725,10 +2171,21 @@ def _analyze_profile_target(
                     current = cell.value
                 incoming = item.values[field]
                 if not _has_money(incoming) and _has_money(current):
-                    clear_fields.append(field)
+                    amount_action = item.amount_actions.get(field)
+                    if amount_action is ResolutionAction.OVERWRITE:
+                        differences[field] = (current, None)
+                    elif amount_action not in {
+                        ResolutionAction.KEEP_EXISTING,
+                        ResolutionAction.SKIP,
+                    }:
+                        clear_fields.append(field)
                 elif _has_money(incoming) and not _numeric_equal(current, incoming):
                     differences[field] = (current, incoming)
             item.differences = differences
+            invoice_conflicts = _analyze_item_invoices(
+                worksheet, resolved, item, row=row
+            )
+            conflicts.extend(invoice_conflicts)
             if clear_fields:
                 item.status = "CONFLICT"
                 conflicts.append(
@@ -1758,7 +2215,16 @@ def _analyze_profile_target(
                     )
                 )
             else:
-                item.status = "UPDATE" if differences else "UNCHANGED"
+                item.status = (
+                    "UPDATE"
+                    if differences
+                    or item.invoice_differences
+                    or any(
+                        action is ResolutionAction.OVERWRITE
+                        for action in item.amount_actions.values()
+                    )
+                    else "UNCHANGED"
+                )
             continue
         candidates = sorted(
             set(by_sqt.get(item.sqt, ())) | set(by_container.get(item.container, ()))
@@ -1793,6 +2259,9 @@ def _analyze_profile_target(
             )
         else:
             item.status = "NEW"
+            conflicts.extend(
+                _analyze_item_invoices(worksheet, resolved, item, row=None)
+            )
     return conflicts
 
 
@@ -1901,9 +2370,10 @@ def _write_profile_item(
     timestamp: datetime,
     write_identity: bool,
     clear_fields: set[str] | None = None,
-) -> bool:
+) -> tuple[bool, set[str]]:
     clear_fields = clear_fields or set()
     changed = False
+    invoice_written: set[str] = set()
     if write_identity:
         for field, incoming in (("sqt", item.sqt), ("container", item.container)):
             cell = worksheet.cell(row, resolved.columns[field])
@@ -1914,6 +2384,8 @@ def _write_profile_item(
                 cell.value = incoming
                 changed = True
     for field in profile.managed_fields:
+        if field not in resolved.columns:
+            continue
         cell = worksheet.cell(row, resolved.columns[field])
         incoming = item.values[field]
         if not _has_money(incoming):
@@ -1925,11 +2397,35 @@ def _write_profile_item(
             cell.value = incoming
             cell.number_format = "#,##0"
             changed = True
+    for field, (_before, planned_invoice) in item.invoice_differences.items():
+        column = resolved.invoice_columns.get(field)
+        if column is None:
+            continue
+        action = item.invoice_actions.get(field)
+        if action in {
+            ResolutionAction.KEEP_EXISTING,
+            ResolutionAction.SKIP_INVOICE,
+            ResolutionAction.SKIP,
+        }:
+            continue
+        incoming = item.selected_invoices.get(field) or planned_invoice
+        incoming = _invoice_text(incoming)
+        if incoming is None:
+            continue
+        cell = worksheet.cell(row, column)
+        if _invoice_key(cell.value) == _invoice_key(incoming):
+            continue
+        if _invoice_text(cell.value) is not None and action is not ResolutionAction.OVERWRITE:
+            continue
+        cell.value = incoming
+        cell.number_format = "@"
+        invoice_written.add(field)
+        changed = True
     if changed:
         date_cell = worksheet.cell(row, resolved.columns["date"])
         date_cell.value = timestamp
         date_cell.number_format = DATE_NUMBER_FORMAT
-    return changed
+    return changed, invoice_written
 
 
 def _package_has_vba(path: str | Path) -> bool:
@@ -2638,6 +3134,147 @@ class PaymentSyncService:
             if target_book is not None:
                 target_book.close()
 
+    def refine(
+        self,
+        plan: PaymentSyncPlan,
+        resolutions: Mapping[str, Any] | None,
+        *,
+        progress_callback: ProgressCallback = None,
+    ) -> PaymentSyncPlan:
+        """Áp dụng lựa chọn dòng/Số HĐ rồi phân tích lại trước khi ghi."""
+
+        resolved_values = dict(resolutions or {})
+        self.gateway.assert_unchanged(
+            plan.source_path, plan.source_fingerprint, label="File BK"
+        )
+        self.gateway.assert_unchanged(
+            plan.target_path, plan.target_fingerprint, label="File Thanh toán"
+        )
+        refined_items = copy.deepcopy(plan.items)
+        items_by_id = {item.item_id: item for item in refined_items}
+        selected_rows: dict[str, int] = {}
+        for conflict in plan.conflicts:
+            value = resolved_values.get(conflict.conflict_id)
+            action = _resolution_action(value, conflict.default_action)
+            if action in {ResolutionAction.CANCEL, ResolutionAction.CANCEL_ALL}:
+                raise PaymentSyncError("Người dùng đã hủy toàn bộ đồng bộ Thanh toán.")
+            item = items_by_id[conflict.item_id]
+            field = str(conflict.details.get("field", ""))
+            if action is ResolutionAction.SELECT_ROW:
+                selected_row = _resolution_value(value, "selected_row")
+                if selected_row is None:
+                    raise PaymentSyncError("Xung đột chưa được chọn dòng đích.")
+                selected_row = int(selected_row)
+                valid_rows = {candidate.row for candidate in conflict.row_candidates}
+                if valid_rows and selected_row not in valid_rows:
+                    raise PaymentSyncError("Dòng Thanh toán được chọn không hợp lệ.")
+                selected_rows[item.item_id] = selected_row
+            elif conflict.conflict_type is ConflictType.MULTIPLE_SOURCE_INVOICES:
+                selected_invoice = _resolution_value(value, "selected_invoice")
+                if _invoice_key(selected_invoice) not in {
+                    _invoice_key(candidate)
+                    for candidate in item.invoice_candidates.get(field, ())
+                }:
+                    raise PaymentSyncError("Số HĐ được chọn không hợp lệ.")
+                item.selected_invoices[field] = str(selected_invoice)
+            elif conflict.conflict_type in {
+                ConflictType.INVOICE_VALUE_CONFLICT,
+                ConflictType.INVOICE_COLUMN_MISSING,
+            }:
+                item.invoice_actions[field] = action
+            elif conflict.conflict_type is ConflictType.PAYMENT_CLEAR_VALUE:
+                clear_fields = tuple(conflict.details.get("clear_fields", ()))
+                if action is ResolutionAction.SKIP:
+                    item.skip_item = True
+                else:
+                    for clear_field in clear_fields:
+                        item.amount_actions[str(clear_field)] = action
+            elif action in {
+                ResolutionAction.SKIP,
+                ResolutionAction.SKIP_INVALID,
+            }:
+                item.skip_item = True
+
+        _progress(progress_callback, "Đang kiểm tra lại dòng và Số HĐ đã chọn…")
+        target_book = self.gateway.load(plan.target_path, read_only=False)
+        try:
+            parsed = self.months.parse_target_sheet(plan.source_sheet)
+            if parsed is None:
+                raise PaymentSyncError("Tên sheet BK trong kế hoạch không hợp lệ.")
+            month, year = parsed
+            targets: dict[str, PaymentTargetPlan] = {}
+            for target_type in ("HP", "NAM"):
+                original = plan.targets[target_type]
+                profile = PAYMENT_PROFILES[target_type]
+                if original.sheet_to_create:
+                    if original.sheet_name not in target_book.sheetnames:
+                        if original.template_sheet is None:
+                            raise PaymentSyncError(
+                                f"Không tìm thấy sheet {target_type} mẫu"
+                            )
+                        _copy_profile_sheet(
+                            target_book,
+                            month_service=self.months,
+                            profile=profile,
+                            month=month,
+                            year=year,
+                            target_name=original.sheet_name,
+                            template_name=original.template_sheet,
+                        )
+                elif original.sheet_name not in target_book.sheetnames:
+                    raise PaymentSyncError(
+                        f"Không tìm thấy sheet {original.sheet_name}; hãy phân tích lại."
+                    )
+                target_items = [
+                    item for item in refined_items if item.target_type == target_type
+                ]
+                conflicts = _analyze_profile_target(
+                    target_book[original.sheet_name],
+                    profile,
+                    target_items,
+                    {},
+                    selected_rows={
+                        item_id: row
+                        for item_id, row in selected_rows.items()
+                        if items_by_id[item_id].target_type == target_type
+                    },
+                )
+                targets[target_type] = PaymentTargetPlan(
+                    target_type=target_type,
+                    sheet_name=original.sheet_name,
+                    items=target_items,
+                    conflicts=conflicts,
+                    sheet_to_create=original.sheet_to_create,
+                    template_sheet=original.template_sheet,
+                )
+        finally:
+            target_book.close()
+        refined = PaymentSyncPlan(
+            source_path=plan.source_path,
+            target_path=plan.target_path,
+            source_fingerprint=plan.source_fingerprint,
+            target_fingerprint=plan.target_fingerprint,
+            source_sheet=plan.source_sheet,
+            targets=targets,
+            normalization_required=plan.normalization_required,
+            normalization_sheet_count=plan.normalization_sheet_count,
+            source_vba_present=plan.source_vba_present,
+            target_vba_present=plan.target_vba_present,
+            run_id=plan.run_id,
+        )
+        self._update_run(
+            plan.run_id,
+            status=(
+                ExcelRunStatus.WAITING_USER
+                if refined.requires_user_input
+                else ExcelRunStatus.ANALYZING
+            ),
+            sheet_name=refined.selected_sheet,
+            changed_items=refined.update_count + refined.new_count,
+            conflict_count=refined.conflict_count,
+        )
+        return refined
+
     def apply(
         self,
         plan: PaymentSyncPlan,
@@ -2652,9 +3289,19 @@ class PaymentSyncService:
             if selected_raw is not None
             else {item.item_id for item in plan.new_rows}
         )
-        skipped_ids: set[str] = set()
+        skipped_ids: set[str] = {
+            item.item_id for item in plan.items if item.skip_item
+        }
         selected_targets: dict[str, int] = {}
         clear_fields: dict[str, set[str]] = defaultdict(set)
+        for item in plan.items:
+            clear_fields[item.item_id].update(
+                field
+                for field, action in item.amount_actions.items()
+                if action is ResolutionAction.OVERWRITE
+                and not _has_money(item.values.get(field))
+            )
+        all_plan_items = {item.item_id: item for item in plan.items}
         for conflict in plan.conflicts:
             value = resolved_values.get(conflict.conflict_id)
             action = _resolution_action(value, conflict.default_action)
@@ -2673,6 +3320,22 @@ class PaymentSyncService:
                 if row is None:
                     raise PaymentSyncError("Xung đột chưa được chọn dòng đích.")
                 selected_targets[conflict.item_id] = int(row)
+            elif conflict.conflict_type is ConflictType.MULTIPLE_SOURCE_INVOICES:
+                selected_invoice = _resolution_value(value, "selected_invoice")
+                field = str(conflict.details.get("field", ""))
+                item = all_plan_items[conflict.item_id]
+                if _invoice_key(selected_invoice) not in {
+                    _invoice_key(candidate)
+                    for candidate in item.invoice_candidates.get(field, ())
+                }:
+                    raise PaymentSyncError("Số HĐ được chọn không hợp lệ.")
+                item.selected_invoices[field] = str(selected_invoice)
+            elif conflict.conflict_type in {
+                ConflictType.INVOICE_VALUE_CONFLICT,
+                ConflictType.INVOICE_COLUMN_MISSING,
+            }:
+                field = str(conflict.details.get("field", ""))
+                all_plan_items[conflict.item_id].invoice_actions[field] = action
             else:
                 skipped_ids.add(conflict.item_id)
 
@@ -2690,6 +3353,10 @@ class PaymentSyncService:
         timestamp = self.clock().replace(tzinfo=None, microsecond=0)
         target_results: dict[str, PaymentTargetResult] = {}
         written: dict[str, dict[str, int]] = {"HP": {}, "NAM": {}}
+        invoice_written: dict[str, dict[str, set[str]]] = {
+            "HP": defaultdict(set),
+            "NAM": defaultdict(set),
+        }
         try:
             _progress(progress_callback, "Đang tạo bản làm việc an toàn…")
             source_working = self.backups.create_working_copy(
@@ -2760,17 +3427,19 @@ class PaymentSyncService:
                     for item in target_plan.update_rows:
                         if item.item_id in skipped_ids or item.target_row is None:
                             continue
-                        if _write_profile_item(
+                        changed, invoices = _write_profile_item(
                             worksheet,
                             row=item.target_row,
                             item=item,
                             profile=profile,
                             resolved=profile_resolved,
                             timestamp=timestamp,
-                            write_identity=False,
-                        ):
+                            write_identity=item.write_identity,
+                        )
+                        if changed:
                             updated += 1
                             written[target_type][item.item_id] = item.target_row
+                            invoice_written[target_type][item.item_id].update(invoices)
                     clear_conflict_items = {
                         conflict.item_id
                         for conflict in target_plan.conflicts
@@ -2780,18 +3449,20 @@ class PaymentSyncService:
                         item = all_items[item_id]
                         if item_id in skipped_ids or item.target_row is None:
                             continue
-                        if _write_profile_item(
+                        changed, invoices = _write_profile_item(
                             worksheet,
                             row=item.target_row,
                             item=item,
                             profile=profile,
                             resolved=profile_resolved,
                             timestamp=timestamp,
-                            write_identity=False,
+                            write_identity=item.write_identity,
                             clear_fields=clear_fields.get(item_id, set()),
-                        ):
+                        )
+                        if changed:
                             updated += 1
                             written[target_type][item_id] = item.target_row
+                            invoice_written[target_type][item_id].update(invoices)
                         else:
                             effective_unchanged += 1
                     for item_id, row in selected_targets.items():
@@ -2802,7 +3473,7 @@ class PaymentSyncService:
                             or item_id in skipped_ids
                         ):
                             continue
-                        if _write_profile_item(
+                        changed, invoices = _write_profile_item(
                             worksheet,
                             row=row,
                             item=item,
@@ -2810,13 +3481,15 @@ class PaymentSyncService:
                             resolved=profile_resolved,
                             timestamp=timestamp,
                             write_identity=True,
-                        ):
+                        )
+                        if changed:
                             updated += 1
                             written[target_type][item_id] = row
+                            invoice_written[target_type][item_id].update(invoices)
                     for item, row in zip(
                         new_items, blank_rows[: len(new_items)], strict=True
                     ):
-                        if _write_profile_item(
+                        changed, invoices = _write_profile_item(
                             worksheet,
                             row=row,
                             item=item,
@@ -2824,9 +3497,11 @@ class PaymentSyncService:
                             resolved=profile_resolved,
                             timestamp=timestamp,
                             write_identity=True,
-                        ):
+                        )
+                        if changed:
                             inserted += 1
                             written[target_type][item.item_id] = row
+                            invoice_written[target_type][item.item_id].update(invoices)
                     skipped = len(
                         {
                             item.item_id
@@ -2845,6 +3520,10 @@ class PaymentSyncService:
                         unchanged_rows=target_plan.unchanged_count + effective_unchanged,
                         skipped_rows=skipped,
                         conflict_count=target_plan.conflict_count,
+                        invoice_written_cells=sum(
+                            len(fields)
+                            for fields in invoice_written[target_type].values()
+                        ),
                     )
                 calculation = getattr(target_book, "calculation", None)
                 if calculation is not None:
@@ -2862,6 +3541,7 @@ class PaymentSyncService:
                 target_working,
                 plan,
                 written=written,
+                invoice_written=invoice_written,
                 clear_fields=clear_fields,
                 timestamp=timestamp,
             )
@@ -2957,6 +3637,7 @@ class PaymentSyncService:
         plan: PaymentSyncPlan,
         *,
         written: Mapping[str, Mapping[str, int]],
+        invoice_written: Mapping[str, Mapping[str, set[str]]],
         clear_fields: Mapping[str, set[str]],
         timestamp: datetime,
     ) -> None:
@@ -2982,6 +3663,8 @@ class PaymentSyncService:
                     ) != item.container:
                         raise PaymentSyncError(f"Container dòng {row} không qua kiểm tra.")
                     for field in profile.managed_fields:
+                        if field not in profile_resolved.columns:
+                            continue
                         actual = worksheet.cell(row, profile_resolved.columns[field]).value
                         incoming = item.values[field]
                         if _has_money(incoming) and not _numeric_equal(actual, incoming):
@@ -2991,6 +3674,23 @@ class PaymentSyncService:
                         if field in clear_fields.get(item_id, set()) and _has_money(actual):
                             raise PaymentSyncError(
                                 f"Giá trị {field} dòng {row} chưa được xóa theo lựa chọn."
+                            )
+                    for field in invoice_written.get(target_type, {}).get(
+                        item_id, set()
+                    ):
+                        column = profile_resolved.invoice_columns.get(field)
+                        if column is None:
+                            raise PaymentSyncError(
+                                f"Cột Số HĐ của {field} không còn tồn tại khi verify."
+                            )
+                        actual_invoice = worksheet.cell(row, column).value
+                        expected_invoice = item.selected_invoices.get(field)
+                        if expected_invoice is None:
+                            difference = item.invoice_differences.get(field)
+                            expected_invoice = difference[1] if difference else None
+                        if _invoice_key(actual_invoice) != _invoice_key(expected_invoice):
+                            raise PaymentSyncError(
+                                f"Số HĐ {field} dòng {row} không qua kiểm tra."
                             )
                     if worksheet.cell(
                         row, profile_resolved.columns["date"]

@@ -1189,11 +1189,17 @@ class PaymentNewRowsDialog(QDialog):
             self._checkbox_items.append(checkbox)
             self.table.setItem(row, 0, checkbox)
             values = _value(source, "values", default={}) or {}
-            amounts = "; ".join(
-                f"{labels.get(key, key)}: {_format_amount(value)}"
-                for key, value in values.items()
-                if value not in (None, "", 0)
-            )
+            invoices = _value(source, "invoice_values", default={}) or {}
+            parts: list[str] = []
+            for key, value in values.items():
+                if value in (None, "", 0):
+                    continue
+                detail = f"{labels.get(key, key)}: {_format_amount(value)}"
+                invoice = _value(invoices, key, default=None)
+                if invoice not in (None, ""):
+                    detail += f" – Số HĐ: {invoice}"
+                parts.append(detail)
+            amounts = "; ".join(parts)
             cells = (
                 _value(source, "target_type", default="—"),
                 _value(source, "source_row"),
